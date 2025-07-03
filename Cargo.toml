@@ -1,7 +1,7 @@
 [package]
 name = "zellij-tools"
-version = "0.1.4"
-authors = ["Maddison Hellstrom <hi@maddison.io>", "Brooks J Rady <b.j.rady@gmail.com>"]
+version = "0.1.0"
+authors = ["Maddison Hellstrom <hi@maddison.io>"]
 edition = "2021"
 license = "MIT"
 rust-version = "1.84"
