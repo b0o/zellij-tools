@@ -1,0 +1,11 @@
+[package]
+name = "zellij-tools"
+version = "0.1.4"
+authors = ["Maddison Hellstrom <hi@maddison.io>", "Brooks J Rady <b.j.rady@gmail.com>"]
+edition = "2021"
+license = "MIT"
+rust-version = "1.84"
+
+[dependencies]
+zellij-tile = "0.42.2"
+zellij-tile-utils = "0.42.2"
