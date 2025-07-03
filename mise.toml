@@ -1,0 +1,8 @@
+[tools]
+rust = "1.84.0"
+
+[tasks.build]
+run = "cargo build --target=wasm32-wasip1"
+
+[tasks.build-release]
+run = "cargo build --release --target=wasm32-wasip1"

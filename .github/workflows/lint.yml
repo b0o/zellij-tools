@@ -1,0 +1,26 @@
+---
+on: push
+name: Test & Lint
+
+# Make sure CI fails on all warnings, including Clippy lints
+env:
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  clippy_check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4f647fc679bcd3b11499ccb42104547c83dabe96 # stable
+        with:
+          toolchain: "1.84.0"
+          target: wasm32-wasip1
+          components: clippy
+
+      - name: Run Clippy
+        uses: clechasseur/rs-clippy-check@24d66924f748522acf015e8642b7fb8cd81b4dbc # v3
+        with:
+          args: --all-features --target=wasm32-wasip1
+          toolchain: "1.84.0"
