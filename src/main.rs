@@ -175,11 +175,38 @@ impl State {
 }
 
 impl ZellijPlugin for State {
-    fn load(&mut self, _configuration: BTreeMap<String, String>) {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
+            PermissionType::RunCommands,
         ]);
+
+        subscribe(&[EventType::PaneUpdate]);
+
+        // Parse scratchpad configuration from JSON
+        if let Some(scratchpads_json) = configuration.get("scratchpads") {
+            match serde_json::from_str::<HashMap<String, ScratchpadConfig>>(scratchpads_json) {
+                Ok(configs) => {
+                    // Validate all scratchpad names
+                    for name in configs.keys() {
+                        if !is_valid_scratchpad_name(name) {
+                            eprintln!(
+                                "Warning: Invalid scratchpad name '{}', skipping",
+                                name
+                            );
+                        }
+                    }
+                    self.scratchpad_configs = configs
+                        .into_iter()
+                        .filter(|(name, _)| is_valid_scratchpad_name(name))
+                        .collect();
+                }
+                Err(e) => {
+                    eprintln!("Failed to parse scratchpads config: {}", e);
+                }
+            }
+        }
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
