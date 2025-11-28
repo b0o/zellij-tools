@@ -176,6 +176,40 @@ impl State {
         }
     }
 
+    fn get_hidden_floating_pane_ids(&self) -> HashSet<u32> {
+        self.pane_manifest
+            .values()
+            .flatten()
+            .filter(|p| p.is_floating && p.is_suppressed)
+            .map(|p| p.id)
+            .collect()
+    }
+
+    fn is_scratchpad_visible(&self, name: &str) -> bool {
+        if let Some(&pane_id) = self.scratchpad_panes.get(name) {
+            self.pane_manifest
+                .values()
+                .flatten()
+                .any(|p| p.id == pane_id && !p.is_suppressed)
+        } else {
+            false
+        }
+    }
+
+    fn get_focused_scratchpad(&self) -> Option<String> {
+        let focused_pane_id = self
+            .pane_manifest
+            .values()
+            .flatten()
+            .find(|p| p.is_focused)?
+            .id;
+
+        self.scratchpad_panes
+            .iter()
+            .find(|(_, &pane_id)| pane_id == focused_pane_id)
+            .map(|(name, _)| name.clone())
+    }
+
     fn handle_event(&self, event: &str, args: Vec<String>) -> Result<(), ParseError> {
         match event {
             "focus-pane" => {
