@@ -9,6 +9,15 @@ struct ScratchpadConfig {
     command: Vec<String>,
 }
 
+#[derive(Debug)]
+enum ScratchpadAction {
+    Toggle { name: Option<String> },
+    Show { name: String },
+    Hide { name: String },
+    Close { name: String },
+    Register { name: String, pane_id: u32 },
+}
+
 #[derive(Default)]
 struct State {
     // Pane tracking (from PaneUpdate events)
@@ -31,6 +40,7 @@ enum ParseError {
     WrongPlugin,
     UnknownEvent(String),
     InvalidArgs(String),
+    InvalidScratchpadName(String),
 }
 
 impl std::fmt::Display for ParseError {
@@ -42,8 +52,18 @@ impl std::fmt::Display for ParseError {
             ParseError::WrongPlugin => write!(f, "Message not intended for zellij-tools"),
             ParseError::UnknownEvent(event) => write!(f, "Unknown event: {}", event),
             ParseError::InvalidArgs(msg) => write!(f, "Invalid arguments: {}", msg),
+            ParseError::InvalidScratchpadName(name) => {
+                write!(f, "Invalid scratchpad name '{}': must match [a-zA-Z0-9_-]+", name)
+            }
         }
     }
+}
+
+fn is_valid_scratchpad_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 impl State {
@@ -65,6 +85,71 @@ impl State {
         };
 
         Ok((event.to_string(), args))
+    }
+
+    fn parse_scratchpad_action(&self, args: &[String]) -> Result<ScratchpadAction, ParseError> {
+        let action = args.first().map(|s| s.as_str()).unwrap_or("");
+
+        match action {
+            "toggle" => {
+                let name = args.get(1).cloned();
+                if let Some(ref n) = name {
+                    if !is_valid_scratchpad_name(n) {
+                        return Err(ParseError::InvalidScratchpadName(n.clone()));
+                    }
+                }
+                Ok(ScratchpadAction::Toggle { name })
+            }
+            "show" => {
+                let name = args.get(1).ok_or_else(|| {
+                    ParseError::InvalidArgs("show requires a scratchpad name".to_string())
+                })?;
+                if !is_valid_scratchpad_name(name) {
+                    return Err(ParseError::InvalidScratchpadName(name.clone()));
+                }
+                Ok(ScratchpadAction::Show { name: name.clone() })
+            }
+            "hide" => {
+                let name = args.get(1).ok_or_else(|| {
+                    ParseError::InvalidArgs("hide requires a scratchpad name".to_string())
+                })?;
+                if !is_valid_scratchpad_name(name) {
+                    return Err(ParseError::InvalidScratchpadName(name.clone()));
+                }
+                Ok(ScratchpadAction::Hide { name: name.clone() })
+            }
+            "close" => {
+                let name = args.get(1).ok_or_else(|| {
+                    ParseError::InvalidArgs("close requires a scratchpad name".to_string())
+                })?;
+                if !is_valid_scratchpad_name(name) {
+                    return Err(ParseError::InvalidScratchpadName(name.clone()));
+                }
+                Ok(ScratchpadAction::Close { name: name.clone() })
+            }
+            "register" => {
+                let name = args.get(1).ok_or_else(|| {
+                    ParseError::InvalidArgs("register requires a scratchpad name".to_string())
+                })?;
+                let pane_id_str = args.get(2).ok_or_else(|| {
+                    ParseError::InvalidArgs("register requires a pane_id".to_string())
+                })?;
+                let pane_id = pane_id_str.parse::<u32>().map_err(|e| {
+                    ParseError::InvalidArgs(format!("Invalid pane_id '{}': {}", pane_id_str, e))
+                })?;
+                if !is_valid_scratchpad_name(name) {
+                    return Err(ParseError::InvalidScratchpadName(name.clone()));
+                }
+                Ok(ScratchpadAction::Register {
+                    name: name.clone(),
+                    pane_id,
+                })
+            }
+            _ => Err(ParseError::InvalidArgs(format!(
+                "Unknown scratchpad action: {}",
+                action
+            ))),
+        }
     }
 
     fn handle_event(&self, event: &str, args: Vec<String>) -> Result<(), ParseError> {
