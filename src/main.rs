@@ -1,9 +1,27 @@
-use std::collections::BTreeMap;
+use indexmap::IndexSet;
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use zellij_tile::prelude::*;
 
+#[derive(Debug, Clone, Deserialize)]
+struct ScratchpadConfig {
+    command: Vec<String>,
+}
+
 #[derive(Default)]
-struct State {}
+struct State {
+    // Pane tracking (from PaneUpdate events)
+    pane_manifest: HashMap<usize, Vec<PaneInfo>>,
+
+    // Scratchpad configuration (from plugin load)
+    scratchpad_configs: HashMap<String, ScratchpadConfig>,
+
+    // Runtime scratchpad state
+    scratchpad_panes: HashMap<String, u32>,       // name -> pane_id (active scratchpads)
+    pending_registrations: HashSet<String>,        // spawned but not yet registered
+    focused_scratchpad_history: IndexSet<String>,  // most recent at end
+}
 
 register_plugin!(State);
 
