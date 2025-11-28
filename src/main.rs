@@ -152,6 +152,30 @@ impl State {
         }
     }
 
+    fn cleanup_closed_scratchpads(&mut self) {
+        // Collect all pane IDs that currently exist
+        let existing_pane_ids: HashSet<u32> = self
+            .pane_manifest
+            .values()
+            .flatten()
+            .map(|p| p.id)
+            .collect();
+
+        // Find scratchpads whose panes no longer exist
+        let closed_scratchpads: Vec<String> = self
+            .scratchpad_panes
+            .iter()
+            .filter(|(_, &pane_id)| !existing_pane_ids.contains(&pane_id))
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        // Remove closed scratchpads from tracking
+        for name in closed_scratchpads {
+            self.scratchpad_panes.remove(&name);
+            self.focused_scratchpad_history.shift_remove(&name);
+        }
+    }
+
     fn handle_event(&self, event: &str, args: Vec<String>) -> Result<(), ParseError> {
         match event {
             "focus-pane" => {
@@ -206,6 +230,17 @@ impl ZellijPlugin for State {
                     eprintln!("Failed to parse scratchpads config: {}", e);
                 }
             }
+        }
+    }
+
+    fn update(&mut self, event: Event) -> bool {
+        match event {
+            Event::PaneUpdate(pane_manifest) => {
+                self.pane_manifest = pane_manifest.panes;
+                self.cleanup_closed_scratchpads();
+                true
+            }
+            _ => false,
         }
     }
 
