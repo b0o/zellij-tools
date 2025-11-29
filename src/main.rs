@@ -25,7 +25,8 @@ enum ScratchpadAction {
     Show { name: String },
     Hide { name: String },
     Close { name: String },
-    Register { name: String, pane_id: u32 },
+    RegisterTab { name: String, tab: usize, pane_id: u32 },
+    RegisterSession { name: String, pane_id: u32 },
 }
 
 #[derive(Default)]
