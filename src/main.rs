@@ -210,7 +210,64 @@ impl State {
             .map(|(name, _)| name.clone())
     }
 
-    fn handle_event(&self, event: &str, args: Vec<String>) -> Result<(), ParseError> {
+    fn build_shim_command(&self, name: &str, config: &ScratchpadConfig) -> CommandToRun {
+        // Build: sh -c 'zellij pipe "zellij-tools::scratchpad::register::<name>::$ZELLIJ_PANE_ID" && exec "$@"' _ <cmd> <args...>
+        let mut args = vec![
+            "-c".to_string(),
+            format!(
+                r#"zellij pipe "zellij-tools::scratchpad::register::{}::$ZELLIJ_PANE_ID" && exec "$@""#,
+                name
+            ),
+            "_".to_string(), // $0 placeholder
+        ];
+        args.extend(config.command.clone());
+
+        CommandToRun::new_with_args("sh", args)
+    }
+
+    fn handle_scratchpad_show(&mut self, name: &str) {
+        // Check if scratchpad is configured
+        let config = match self.scratchpad_configs.get(name) {
+            Some(c) => c.clone(),
+            None => return, // Silent no-op for unknown scratchpad
+        };
+
+        // If not yet registered, spawn the pane
+        if !self.scratchpad_panes.contains_key(name) {
+            if self.pending_registrations.contains(name) {
+                return; // Already spawning
+            }
+
+            self.pending_registrations.insert(name.to_string());
+
+            let cmd = self.build_shim_command(name, &config);
+            let context = BTreeMap::new();
+            open_command_pane_floating(cmd, None, context);
+            return;
+        }
+
+        // Already registered - show the pane
+        let pane_id = *self.scratchpad_panes.get(name).unwrap();
+
+        // Capture which panes are currently hidden BEFORE showing
+        let hidden_before = self.get_hidden_floating_pane_ids();
+
+        // Show the scratchpad pane (this will show ALL floating panes as a side effect)
+        show_pane_with_id(PaneId::Terminal(pane_id), true);
+
+        // Re-hide all panes that were hidden before (except our scratchpad)
+        for hidden_pane_id in hidden_before {
+            if hidden_pane_id != pane_id {
+                hide_pane_with_id(PaneId::Terminal(hidden_pane_id));
+            }
+        }
+
+        // Update focus history
+        self.focused_scratchpad_history.shift_remove(name);
+        self.focused_scratchpad_history.insert(name.to_string());
+    }
+
+    fn handle_event(&mut self, event: &str, args: Vec<String>) -> Result<(), ParseError> {
         match event {
             "focus-pane" => {
                 if args.len() != 1 {
