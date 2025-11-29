@@ -284,10 +284,10 @@ impl State {
 
         if let Some(pane_id) = pane_id {
             // For session-scoped, also check it's on current tab
-            if self.get_scratchpad_scope(name) == Some(ScratchpadScope::Session) {
-                if self.get_pane_tab(pane_id) != Some(self.current_tab) {
-                    return false;
-                }
+            if self.get_scratchpad_scope(name) == Some(ScratchpadScope::Session)
+                && self.get_pane_tab(pane_id) != Some(self.current_tab)
+            {
+                return false;
             }
             self.pane_manifest
                 .values()
