@@ -325,13 +325,24 @@ impl State {
     }
 
     fn build_shim_command(&self, name: &str, config: &ScratchpadConfig) -> CommandToRun {
-        // Build: sh -c 'zellij pipe "zellij-tools::scratchpad::register::<name>::$ZELLIJ_PANE_ID" && exec "$@"' _ <cmd> <args...>
+        let register_msg = match config.scope {
+            ScratchpadScope::Session => {
+                format!(
+                    r#"zellij pipe "zellij-tools::scratchpad::register::session::{}::$ZELLIJ_PANE_ID""#,
+                    name
+                )
+            }
+            ScratchpadScope::Tab => {
+                format!(
+                    r#"zellij pipe "zellij-tools::scratchpad::register::tab::{}::{}::$ZELLIJ_PANE_ID""#,
+                    self.current_tab, name
+                )
+            }
+        };
+
         let mut args = vec![
             "-c".to_string(),
-            format!(
-                r#"zellij pipe "zellij-tools::scratchpad::register::{}::$ZELLIJ_PANE_ID" && exec "$@""#,
-                name
-            ),
+            format!(r#"{} && exec "$@""#, register_msg),
             "_".to_string(), // $0 placeholder
         ];
         args.extend(config.command.clone());
