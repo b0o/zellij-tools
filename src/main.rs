@@ -300,6 +300,49 @@ impl State {
         }
     }
 
+    fn handle_scratchpad_toggle(&mut self, name: Option<String>) {
+        let target_name = match name {
+            // Explicit name provided
+            Some(n) => n,
+            // No name - check if a scratchpad is focused
+            None => {
+                if let Some(focused) = self.get_focused_scratchpad() {
+                    focused
+                } else {
+                    // No focused scratchpad - use last from history
+                    match self.focused_scratchpad_history.last() {
+                        Some(last) => last.clone(),
+                        None => return, // No history - no-op
+                    }
+                }
+            }
+        };
+
+        // Check if configured
+        if !self.scratchpad_configs.contains_key(&target_name) {
+            return; // Silent no-op for unknown scratchpad
+        }
+
+        // Toggle based on current visibility
+        if self.is_scratchpad_visible(&target_name) {
+            self.handle_scratchpad_hide(&target_name);
+        } else {
+            self.handle_scratchpad_show(&target_name);
+        }
+    }
+
+    fn handle_scratchpad_action(&mut self, action: ScratchpadAction) {
+        match action {
+            ScratchpadAction::Toggle { name } => self.handle_scratchpad_toggle(name),
+            ScratchpadAction::Show { name } => self.handle_scratchpad_show(&name),
+            ScratchpadAction::Hide { name } => self.handle_scratchpad_hide(&name),
+            ScratchpadAction::Close { name } => self.handle_scratchpad_close(&name),
+            ScratchpadAction::Register { name, pane_id } => {
+                self.handle_scratchpad_register(&name, pane_id)
+            }
+        }
+    }
+
     fn handle_event(&mut self, event: &str, args: Vec<String>) -> Result<(), ParseError> {
         match event {
             "focus-pane" => {
@@ -315,6 +358,11 @@ impl State {
                     .map_err(|e| ParseError::InvalidArgs(format!("Invalid pane ID: {}", e)))?;
 
                 show_pane_with_id(pane_id, true);
+                Ok(())
+            }
+            "scratchpad" => {
+                let action = self.parse_scratchpad_action(&args)?;
+                self.handle_scratchpad_action(action);
                 Ok(())
             }
             _ => Err(ParseError::UnknownEvent(event.to_string())),
