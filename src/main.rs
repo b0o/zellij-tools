@@ -148,22 +148,61 @@ impl State {
                 Ok(ScratchpadAction::Close { name: name.clone() })
             }
             "register" => {
-                let name = args.get(1).ok_or_else(|| {
-                    ParseError::InvalidArgs("register requires a scratchpad name".to_string())
+                // Format: register::session::<name>::<pane_id>
+                // Format: register::tab::<tab>::<name>::<pane_id>
+                let scope = args.get(1).ok_or_else(|| {
+                    ParseError::InvalidArgs("register requires a scope (session or tab)".to_string())
                 })?;
-                let pane_id_str = args.get(2).ok_or_else(|| {
-                    ParseError::InvalidArgs("register requires a pane_id".to_string())
-                })?;
-                let pane_id = pane_id_str.parse::<u32>().map_err(|e| {
-                    ParseError::InvalidArgs(format!("Invalid pane_id '{}': {}", pane_id_str, e))
-                })?;
-                if !is_valid_scratchpad_name(name) {
-                    return Err(ParseError::InvalidScratchpadName(name.clone()));
+
+                match scope.as_str() {
+                    "session" => {
+                        let name = args.get(2).ok_or_else(|| {
+                            ParseError::InvalidArgs("register::session requires a name".to_string())
+                        })?;
+                        let pane_id_str = args.get(3).ok_or_else(|| {
+                            ParseError::InvalidArgs("register::session requires a pane_id".to_string())
+                        })?;
+                        let pane_id = pane_id_str.parse::<u32>().map_err(|e| {
+                            ParseError::InvalidArgs(format!("Invalid pane_id '{}': {}", pane_id_str, e))
+                        })?;
+                        if !is_valid_scratchpad_name(name) {
+                            return Err(ParseError::InvalidScratchpadName(name.clone()));
+                        }
+                        Ok(ScratchpadAction::RegisterSession {
+                            name: name.clone(),
+                            pane_id,
+                        })
+                    }
+                    "tab" => {
+                        let tab_str = args.get(2).ok_or_else(|| {
+                            ParseError::InvalidArgs("register::tab requires a tab index".to_string())
+                        })?;
+                        let tab = tab_str.parse::<usize>().map_err(|e| {
+                            ParseError::InvalidArgs(format!("Invalid tab index '{}': {}", tab_str, e))
+                        })?;
+                        let name = args.get(3).ok_or_else(|| {
+                            ParseError::InvalidArgs("register::tab requires a name".to_string())
+                        })?;
+                        let pane_id_str = args.get(4).ok_or_else(|| {
+                            ParseError::InvalidArgs("register::tab requires a pane_id".to_string())
+                        })?;
+                        let pane_id = pane_id_str.parse::<u32>().map_err(|e| {
+                            ParseError::InvalidArgs(format!("Invalid pane_id '{}': {}", pane_id_str, e))
+                        })?;
+                        if !is_valid_scratchpad_name(name) {
+                            return Err(ParseError::InvalidScratchpadName(name.clone()));
+                        }
+                        Ok(ScratchpadAction::RegisterTab {
+                            name: name.clone(),
+                            tab,
+                            pane_id,
+                        })
+                    }
+                    _ => Err(ParseError::InvalidArgs(format!(
+                        "Unknown register scope: {}",
+                        scope
+                    ))),
                 }
-                Ok(ScratchpadAction::Register {
-                    name: name.clone(),
-                    pane_id,
-                })
             }
             _ => Err(ParseError::InvalidArgs(format!(
                 "Unknown scratchpad action: {}",
