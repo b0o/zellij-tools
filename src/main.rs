@@ -220,18 +220,35 @@ impl State {
             .map(|p| p.id)
             .collect();
 
-        // Find scratchpads whose panes no longer exist
-        let closed_scratchpads: Vec<String> = self
-            .scratchpad_panes
+        // Clean up tab-scoped scratchpads
+        let closed_tab_scratchpads: Vec<(String, usize)> = self
+            .tab_scratchpad_panes
+            .iter()
+            .filter(|(_, &pane_id)| !existing_pane_ids.contains(&pane_id))
+            .map(|((name, tab), _)| (name.clone(), *tab))
+            .collect();
+
+        for (name, tab) in closed_tab_scratchpads {
+            self.tab_scratchpad_panes.remove(&(name.clone(), tab));
+            if let Some(history) = self.focused_history.get_mut(&tab) {
+                history.shift_remove(&name);
+            }
+        }
+
+        // Clean up session-scoped scratchpads
+        let closed_session_scratchpads: Vec<String> = self
+            .session_scratchpad_panes
             .iter()
             .filter(|(_, &pane_id)| !existing_pane_ids.contains(&pane_id))
             .map(|(name, _)| name.clone())
             .collect();
 
-        // Remove closed scratchpads from tracking
-        for name in closed_scratchpads {
-            self.scratchpad_panes.remove(&name);
-            self.focused_scratchpad_history.shift_remove(&name);
+        for name in closed_session_scratchpads {
+            self.session_scratchpad_panes.remove(&name);
+            // Remove from ALL tab histories
+            for history in self.focused_history.values_mut() {
+                history.shift_remove(&name);
+            }
         }
     }
 
