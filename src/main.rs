@@ -34,13 +34,22 @@ struct State {
     // Pane tracking (from PaneUpdate events)
     pane_manifest: HashMap<usize, Vec<PaneInfo>>,
 
+    // Current tab (from TabUpdate events)
+    current_tab: usize,
+
     // Scratchpad configuration (from plugin load)
     scratchpad_configs: HashMap<String, ScratchpadConfig>,
 
-    // Runtime scratchpad state
-    scratchpad_panes: HashMap<String, u32>,       // name -> pane_id (active scratchpads)
-    pending_registrations: HashSet<String>,        // spawned but not yet registered
-    focused_scratchpad_history: IndexSet<String>,  // most recent at end
+    // Tab-scoped scratchpad state: (name, tab) -> pane_id
+    tab_scratchpad_panes: HashMap<(String, usize), u32>,
+    tab_pending_registrations: HashSet<(String, usize)>,
+
+    // Session-scoped scratchpad state: name -> pane_id
+    session_scratchpad_panes: HashMap<String, u32>,
+    session_pending_registrations: HashSet<String>,
+
+    // Unified focus history per tab (includes both scopes): tab -> names
+    focused_history: HashMap<usize, IndexSet<String>>,
 }
 
 register_plugin!(State);
