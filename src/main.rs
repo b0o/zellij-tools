@@ -212,7 +212,7 @@ impl State {
     }
 
     fn cleanup_closed_scratchpads(&mut self) {
-        // Collect all pane IDs that currently exist
+        // Collect all pane IDs that still exist in the manifest
         let existing_pane_ids: HashSet<u32> = self
             .pane_manifest
             .values()
@@ -220,7 +220,7 @@ impl State {
             .map(|p| p.id)
             .collect();
 
-        // Clean up tab-scoped scratchpads
+        // Clean up tab-scoped scratchpads whose panes no longer exist
         let closed_tab_scratchpads: Vec<(String, usize)> = self
             .tab_scratchpad_panes
             .iter()
@@ -235,7 +235,7 @@ impl State {
             }
         }
 
-        // Clean up session-scoped scratchpads
+        // Clean up session-scoped scratchpads whose panes no longer exist
         let closed_session_scratchpads: Vec<String> = self
             .session_scratchpad_panes
             .iter()
@@ -244,6 +244,53 @@ impl State {
             .collect();
 
         for name in closed_session_scratchpads {
+            self.session_scratchpad_panes.remove(&name);
+            // Remove from ALL tab histories
+            for history in self.focused_history.values_mut() {
+                history.shift_remove(&name);
+            }
+        }
+    }
+
+    /// Close scratchpad panes that have exited (ghost panes).
+    /// This handles the case where the command in a scratchpad exits but
+    /// Zellij keeps the pane open with "exited" status.
+    fn close_exited_scratchpads(&mut self) {
+        // Find all scratchpad panes that have exited
+        let exited_pane_ids: HashSet<u32> = self
+            .pane_manifest
+            .values()
+            .flatten()
+            .filter(|p| p.exited || p.is_held)
+            .map(|p| p.id)
+            .collect();
+
+        // Close exited tab-scoped scratchpads
+        let exited_tab_scratchpads: Vec<((String, usize), u32)> = self
+            .tab_scratchpad_panes
+            .iter()
+            .filter(|(_, &pane_id)| exited_pane_ids.contains(&pane_id))
+            .map(|((name, tab), &pane_id)| ((name.clone(), *tab), pane_id))
+            .collect();
+
+        for ((name, tab), pane_id) in exited_tab_scratchpads {
+            close_terminal_pane(pane_id);
+            self.tab_scratchpad_panes.remove(&(name.clone(), tab));
+            if let Some(history) = self.focused_history.get_mut(&tab) {
+                history.shift_remove(&name);
+            }
+        }
+
+        // Close exited session-scoped scratchpads
+        let exited_session_scratchpads: Vec<(String, u32)> = self
+            .session_scratchpad_panes
+            .iter()
+            .filter(|(_, &pane_id)| exited_pane_ids.contains(&pane_id))
+            .map(|(name, &pane_id)| (name.clone(), pane_id))
+            .collect();
+
+        for (name, pane_id) in exited_session_scratchpads {
+            close_terminal_pane(pane_id);
             self.session_scratchpad_panes.remove(&name);
             // Remove from ALL tab histories
             for history in self.focused_history.values_mut() {
@@ -273,7 +320,8 @@ impl State {
     }
 
     fn is_scratchpad_visible(&self, name: &str) -> bool {
-        let pane_id = match self.get_scratchpad_scope(name) {
+        let scope = self.get_scratchpad_scope(name);
+        let pane_id = match scope {
             Some(ScratchpadScope::Session) => self.session_scratchpad_panes.get(name).copied(),
             Some(ScratchpadScope::Tab) => self
                 .tab_scratchpad_panes
@@ -282,20 +330,38 @@ impl State {
             None => return false,
         };
 
-        if let Some(pane_id) = pane_id {
-            // For session-scoped, also check it's on current tab
-            if self.get_scratchpad_scope(name) == Some(ScratchpadScope::Session)
-                && self.get_pane_tab(pane_id) != Some(self.current_tab)
-            {
-                return false;
+        let Some(pane_id) = pane_id else {
+            return false;
+        };
+
+        // For tab-scoped: only check panes on current tab
+        // For session-scoped: check all tabs but verify it's on current tab
+        let panes_to_check: Box<dyn Iterator<Item = &PaneInfo>> = match scope {
+            Some(ScratchpadScope::Tab) => {
+                // Only check current tab's panes for tab-scoped scratchpads
+                Box::new(
+                    self.pane_manifest
+                        .get(&self.current_tab)
+                        .into_iter()
+                        .flatten(),
+                )
             }
-            self.pane_manifest
-                .values()
-                .flatten()
-                .any(|p| p.id == pane_id && !p.is_suppressed)
-        } else {
-            false
-        }
+            Some(ScratchpadScope::Session) => {
+                // Check all tabs for session-scoped
+                Box::new(self.pane_manifest.values().flatten())
+            }
+            None => return false,
+        };
+
+        panes_to_check.into_iter().any(|p| {
+            p.id == pane_id
+                && !p.is_suppressed
+                && !p.exited
+                && !p.is_held
+                // For session-scoped, also verify it's on the current tab
+                && (scope != Some(ScratchpadScope::Session)
+                    || self.get_pane_tab(pane_id) == Some(self.current_tab))
+        })
     }
 
     fn get_focused_scratchpad(&self) -> Option<String> {
@@ -620,6 +686,7 @@ impl ZellijPlugin for State {
         match event {
             Event::PaneUpdate(pane_manifest) => {
                 self.pane_manifest = pane_manifest.panes;
+                self.close_exited_scratchpads();
                 self.cleanup_closed_scratchpads();
                 true
             }
