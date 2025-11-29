@@ -623,6 +623,13 @@ impl ZellijPlugin for State {
                 self.cleanup_closed_scratchpads();
                 true
             }
+            Event::TabUpdate(tab_infos) => {
+                // Find the active tab
+                if let Some(active_tab) = tab_infos.iter().find(|t| t.active) {
+                    self.current_tab = active_tab.position;
+                }
+                false // No UI update needed
+            }
             _ => false,
         }
     }
