@@ -267,6 +267,39 @@ impl State {
         self.focused_scratchpad_history.insert(name.to_string());
     }
 
+    fn handle_scratchpad_hide(&mut self, name: &str) {
+        if let Some(&pane_id) = self.scratchpad_panes.get(name) {
+            hide_pane_with_id(PaneId::Terminal(pane_id));
+        }
+        // Silent no-op if not registered
+    }
+
+    fn handle_scratchpad_close(&mut self, name: &str) {
+        if let Some(pane_id) = self.scratchpad_panes.remove(name) {
+            close_terminal_pane(pane_id);
+            self.focused_scratchpad_history.shift_remove(name);
+        }
+        // Silent no-op if not registered
+    }
+
+    fn handle_scratchpad_register(&mut self, name: &str, pane_id: u32) {
+        self.pending_registrations.remove(name);
+        self.scratchpad_panes.insert(name.to_string(), pane_id);
+
+        // Update focus history (newly spawned scratchpad is now focused)
+        self.focused_scratchpad_history.shift_remove(name);
+        self.focused_scratchpad_history.insert(name.to_string());
+
+        // Re-hide any floating panes that should be hidden
+        // (The newly spawned pane showing may have revealed other floating panes)
+        let hidden_panes = self.get_hidden_floating_pane_ids();
+        for hidden_pane_id in hidden_panes {
+            if hidden_pane_id != pane_id {
+                hide_pane_with_id(PaneId::Terminal(hidden_pane_id));
+            }
+        }
+    }
+
     fn handle_event(&mut self, event: &str, args: Vec<String>) -> Result<(), ParseError> {
         match event {
             "focus-pane" => {
