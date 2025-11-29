@@ -4,9 +4,19 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use zellij_tile::prelude::*;
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ScratchpadScope {
+    #[default]
+    Tab,
+    Session,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ScratchpadConfig {
     command: Vec<String>,
+    #[serde(default)]
+    scope: ScratchpadScope,
 }
 
 #[derive(Debug)]
