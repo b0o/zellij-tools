@@ -306,10 +306,22 @@ impl State {
             .find(|p| p.is_focused)?
             .id;
 
-        self.scratchpad_panes
+        // Check session-scoped scratchpads
+        if let Some(name) = self
+            .session_scratchpad_panes
             .iter()
             .find(|(_, &pane_id)| pane_id == focused_pane_id)
             .map(|(name, _)| name.clone())
+        {
+            return Some(name);
+        }
+
+        // Check tab-scoped scratchpads (only on current tab)
+        self.tab_scratchpad_panes
+            .iter()
+            .filter(|((_, tab), _)| *tab == self.current_tab)
+            .find(|(_, &pane_id)| pane_id == focused_pane_id)
+            .map(|((name, _), _)| name.clone())
     }
 
     fn build_shim_command(&self, name: &str, config: &ScratchpadConfig) -> CommandToRun {
