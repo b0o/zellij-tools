@@ -273,7 +273,22 @@ impl State {
     }
 
     fn is_scratchpad_visible(&self, name: &str) -> bool {
-        if let Some(&pane_id) = self.scratchpad_panes.get(name) {
+        let pane_id = match self.get_scratchpad_scope(name) {
+            Some(ScratchpadScope::Session) => self.session_scratchpad_panes.get(name).copied(),
+            Some(ScratchpadScope::Tab) => self
+                .tab_scratchpad_panes
+                .get(&(name.to_string(), self.current_tab))
+                .copied(),
+            None => return false,
+        };
+
+        if let Some(pane_id) = pane_id {
+            // For session-scoped, also check it's on current tab
+            if self.get_scratchpad_scope(name) == Some(ScratchpadScope::Session) {
+                if self.get_pane_tab(pane_id) != Some(self.current_tab) {
+                    return false;
+                }
+            }
             self.pane_manifest
                 .values()
                 .flatten()
