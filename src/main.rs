@@ -235,6 +235,17 @@ impl State {
         }
     }
 
+    fn get_pane_tab(&self, pane_id: u32) -> Option<usize> {
+        self.pane_manifest
+            .iter()
+            .find(|(_, panes)| panes.iter().any(|p| p.id == pane_id))
+            .map(|(tab, _)| *tab)
+    }
+
+    fn get_scratchpad_scope(&self, name: &str) -> Option<ScratchpadScope> {
+        self.scratchpad_configs.get(name).map(|c| c.scope)
+    }
+
     fn get_hidden_floating_pane_ids(&self) -> HashSet<u32> {
         self.pane_manifest
             .values()
