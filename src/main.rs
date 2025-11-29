@@ -589,7 +589,7 @@ impl ZellijPlugin for State {
             PermissionType::RunCommands,
         ]);
 
-        subscribe(&[EventType::PaneUpdate]);
+        subscribe(&[EventType::PaneUpdate, EventType::TabUpdate]);
 
         // Parse scratchpad configuration from JSON
         if let Some(scratchpads_json) = configuration.get("scratchpads") {
