@@ -38,8 +38,9 @@ struct State {
     // Key is tab position (0-indexed), which changes when tabs are reordered
     pane_manifest: HashMap<usize, Vec<PaneInfo>>,
 
-    // Current tab position (from TabUpdate events)
+    // Current tab position and floating pane visibility (from TabUpdate events)
     current_tab_position: usize,
+    are_floating_panes_visible: bool,
 
     // Stable tab ID tracking:
     // - We assign each tab a stable ID when we first see it
@@ -66,6 +67,11 @@ struct State {
     // Focus history: (name, stable_tab_id) -> last focus timestamp
     focus_counter: u64,
     scratchpad_focus_times: HashMap<(String, StableTabId), u64>,
+
+    // Track scratchpads we've just shown/focused (cleared on next PaneUpdate)
+    // This handles the race condition where we show a pane but haven't received
+    // the PaneUpdate with the updated is_focused state yet.
+    just_shown_scratchpad: Option<u32>, // pane_id
 }
 
 register_plugin!(State);
@@ -482,15 +488,26 @@ impl State {
             .collect()
     }
 
-    fn is_scratchpad_visible(&self, name: &str) -> bool {
-        let scope = self.get_scratchpad_scope(name);
-        let pane_id = match scope {
+    /// Get the pane_id for a scratchpad by name (checking both tab and session scope)
+    fn get_scratchpad_pane_id(&self, name: &str) -> Option<u32> {
+        match self.get_scratchpad_scope(name) {
             Some(ScratchpadScope::Session) => self.session_scratchpad_panes.get(name).copied(),
             Some(ScratchpadScope::Tab) => self.get_tab_scratchpad_pane(name),
-            None => return false,
-        };
+            None => None,
+        }
+    }
 
-        let Some(pane_id) = pane_id else {
+    fn is_scratchpad_visible(&self, name: &str) -> bool {
+        // If floating panes are not visible (tiled layer is focused), no scratchpad is visible
+        if !self.are_floating_panes_visible {
+            eprintln!(
+                "[DEBUG] is_scratchpad_visible({}): floating layer not visible, returning false",
+                name
+            );
+            return false;
+        }
+
+        let Some(pane_id) = self.get_scratchpad_pane_id(name) else {
             eprintln!("[DEBUG] is_scratchpad_visible({}): no pane_id found, returning false", name);
             return false;
         };
@@ -514,12 +531,63 @@ impl State {
         result
     }
 
+    fn is_scratchpad_focused(&self, name: &str) -> bool {
+        let Some(pane_id) = self.get_scratchpad_pane_id(name) else {
+            eprintln!("[DEBUG] is_scratchpad_focused({}): no pane_id, returning false", name);
+            return false;
+        };
+
+        // If floating panes are not visible, the floating layer doesn't have focus
+        if !self.are_floating_panes_visible {
+            eprintln!(
+                "[DEBUG] is_scratchpad_focused({}): floating layer not visible, returning false",
+                name
+            );
+            return false;
+        }
+
+        // Check if we just showed this pane (haven't received PaneUpdate yet)
+        if self.just_shown_scratchpad == Some(pane_id) {
+            eprintln!(
+                "[DEBUG] is_scratchpad_focused({}): pane_id={} was just shown, returning true",
+                name, pane_id
+            );
+            return true;
+        }
+
+        // Get our scratchpad pane info - must be floating (scratchpads are floating panes)
+        let scratchpad_pane = self
+            .pane_manifest
+            .values()
+            .flatten()
+            .find(|p| p.id == pane_id && p.is_floating);
+
+        let Some(scratchpad) = scratchpad_pane else {
+            eprintln!("[DEBUG] is_scratchpad_focused({}): pane {} not found as floating in manifest, returning false", name, pane_id);
+            return false;
+        };
+
+        eprintln!(
+            "[DEBUG] is_scratchpad_focused({}): pane_id={}, is_focused={}, are_floating_panes_visible={}",
+            name, pane_id, scratchpad.is_focused, self.are_floating_panes_visible
+        );
+
+        // Floating layer is visible, so check if our pane is focused within that layer
+        scratchpad.is_focused
+    }
+
     fn get_focused_scratchpad(&self) -> Option<String> {
+        // If floating layer isn't visible, no scratchpad can be focused
+        if !self.are_floating_panes_visible {
+            return None;
+        }
+
+        // Find the focused floating pane (scratchpads are floating)
         let focused_pane_id = self
             .pane_manifest
             .values()
             .flatten()
-            .find(|p| p.is_focused)?
+            .find(|p| p.is_floating && p.is_focused)?
             .id;
 
         // Check session-scoped scratchpads
@@ -537,6 +605,41 @@ impl State {
             .iter()
             .find(|(_, &pane_id)| pane_id == focused_pane_id)
             .map(|((name, _), _)| name.clone())
+    }
+
+    /// Update focus tracking for the currently focused scratchpad (if any).
+    /// This should be called on every PaneUpdate to track focus changes
+    /// that happen outside of our plugin's actions (e.g., user clicking on a scratchpad).
+    fn update_focused_scratchpad_tracking(&mut self) {
+        // If floating layer isn't visible, no scratchpad can be focused
+        if !self.are_floating_panes_visible {
+            return;
+        }
+
+        // Find the focused floating pane
+        let focused_pane = self
+            .pane_manifest
+            .values()
+            .flatten()
+            .find(|p| p.is_floating && p.is_focused);
+
+        let Some(focused) = focused_pane else {
+            return;
+        };
+
+        let focused_pane_id = focused.id;
+
+        // Check if this is a tab-scoped scratchpad and update its focus time
+        if let Some((key, _)) = self
+            .tab_scratchpad_panes
+            .iter()
+            .find(|(_, &pane_id)| pane_id == focused_pane_id)
+        {
+            let key = key.clone();
+            self.focus_counter += 1;
+            self.scratchpad_focus_times.insert(key, self.focus_counter);
+        }
+        // Note: session-scoped scratchpads don't track per-tab focus times
     }
 
     fn build_shim_command(&self, name: &str, config: &ScratchpadConfig) -> CommandToRun {
@@ -659,6 +762,9 @@ impl State {
         // Show the scratchpad pane (this will show ALL floating panes as a side effect)
         show_pane_with_id(PaneId::Terminal(pane_id), true);
 
+        // Track that we just showed this pane (for focus detection before PaneUpdate arrives)
+        self.just_shown_scratchpad = Some(pane_id);
+
         // Re-hide all panes that were hidden before (except our scratchpad)
         for hidden_pane_id in hidden_before {
             if hidden_pane_id != pane_id {
@@ -678,6 +784,9 @@ impl State {
 
         // Show the scratchpad pane (this will show ALL floating panes as a side effect)
         show_pane_with_id(PaneId::Terminal(pane_id), true);
+
+        // Track that we just showed this pane (for focus detection before PaneUpdate arrives)
+        self.just_shown_scratchpad = Some(pane_id);
 
         // Re-hide all panes that were hidden before (except our scratchpad)
         for hidden_pane_id in hidden_before {
@@ -772,6 +881,9 @@ impl State {
         );
         self.tab_scratchpad_panes.insert(key.clone(), pane_id);
 
+        // Track that we just showed this pane (newly spawned panes are focused)
+        self.just_shown_scratchpad = Some(pane_id);
+
         // Update focus tracking
         self.focus_counter += 1;
         self.scratchpad_focus_times.insert(key, self.focus_counter);
@@ -788,6 +900,9 @@ impl State {
     fn handle_scratchpad_register_session(&mut self, name: &str, pane_id: u32) {
         self.session_pending_registrations.remove(name);
         self.session_scratchpad_panes.insert(name.to_string(), pane_id);
+
+        // Track that we just showed this pane (newly spawned panes are focused)
+        self.just_shown_scratchpad = Some(pane_id);
 
         // Re-hide any floating panes that should be hidden
         let hidden_panes = self.get_hidden_floating_pane_ids();
@@ -845,13 +960,23 @@ impl State {
             return; // Silent no-op for unknown scratchpad
         }
 
-        // Toggle based on current visibility
+        // Toggle based on current visibility and focus state
+        // - If visible AND focused → hide it
+        // - If visible but NOT focused → focus it (show without hiding)
+        // - If not visible → show it
         let visible = self.is_scratchpad_visible(&target_name);
-        eprintln!("[DEBUG]   visible={}, will {}", visible, if visible { "hide" } else { "show" });
+        let focused = self.is_scratchpad_focused(&target_name);
+        eprintln!(
+            "[DEBUG]   visible={}, focused={}, will {}",
+            visible,
+            focused,
+            if visible && focused { "hide" } else { "show/focus" }
+        );
 
-        if visible {
+        if visible && focused {
             self.handle_scratchpad_hide(&target_name);
         } else {
+            // Either not visible (show it) or visible but not focused (focus it)
             self.handle_scratchpad_show(&target_name);
         }
     }
@@ -937,16 +1062,25 @@ impl ZellijPlugin for State {
         match event {
             Event::PaneUpdate(pane_manifest) => {
                 self.pane_manifest = pane_manifest.panes;
+                // Clear the "just shown" tracking since we now have fresh state
+                self.just_shown_scratchpad = None;
                 // Update stable tab mapping FIRST, before other operations
                 self.update_stable_tab_mapping();
+                // Track focus changes that happen outside of our plugin's actions
+                self.update_focused_scratchpad_tracking();
                 self.close_exited_scratchpads();
                 self.cleanup_closed_scratchpads();
                 true
             }
             Event::TabUpdate(tab_infos) => {
-                // Find the active tab
+                // Find the active tab and update state
                 if let Some(active_tab) = tab_infos.iter().find(|t| t.active) {
+                    eprintln!(
+                        "[DEBUG] TabUpdate: position={}, are_floating_panes_visible={}",
+                        active_tab.position, active_tab.are_floating_panes_visible
+                    );
                     self.current_tab_position = active_tab.position;
+                    self.are_floating_panes_visible = active_tab.are_floating_panes_visible;
                 }
                 false // No UI update needed
             }
