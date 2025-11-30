@@ -258,11 +258,7 @@ impl State {
             .map(|(&pane_id, &stable_id)| (pane_id, stable_id))
             .collect();
 
-        for (pane_id, stable_id) in &closed_refs {
-            eprintln!(
-                "[DEBUG] Reference pane {} was closed (was for stable_tab_id={})",
-                pane_id, stable_id
-            );
+        for (pane_id, _stable_id) in &closed_refs {
             self.reference_pane_to_tab.remove(pane_id);
         }
 
@@ -271,17 +267,13 @@ impl State {
         self.stable_tab_to_position.clear();
         for (&pane_id, &stable_id) in &self.reference_pane_to_tab {
             if let Some(&tab_position) = pane_to_current_tab.get(&pane_id) {
-                eprintln!(
-                    "[DEBUG] Reference pane {} (stable_tab_id={}) is now at position {}",
-                    pane_id, stable_id, tab_position
-                );
                 self.stable_tab_to_position.insert(stable_id, tab_position);
             }
         }
 
         // For closed reference panes, try to find a replacement on the same stable tab
         // We need to find another tiled pane that's on the same position the stable ID was at
-        for (closed_pane_id, stable_id) in &closed_refs {
+        for (_closed_pane_id, stable_id) in &closed_refs {
             // Skip if this stable ID already got reassigned (shouldn't happen but be safe)
             if self.stable_tab_to_position.contains_key(stable_id) {
                 continue;
@@ -303,10 +295,6 @@ impl State {
 
                 if let Some(&new_ref_pane) = tiled_panes.first() {
                     // Assign this orphaned stable ID to this tab with a new reference pane
-                    eprintln!(
-                        "[DEBUG] Reassigning stable_tab_id={} (lost pane {}) to position {} with new reference_pane={}",
-                        stable_id, closed_pane_id, tab_position, new_ref_pane
-                    );
                     self.reference_pane_to_tab.insert(new_ref_pane, *stable_id);
                     self.stable_tab_to_position.insert(*stable_id, tab_position);
                     break; // Only reassign to one tab
@@ -329,19 +317,11 @@ impl State {
                 .collect();
 
             if tiled_panes.is_empty() {
-                eprintln!(
-                    "[DEBUG] Tab position {} has no tiled panes, skipping",
-                    tab_position
-                );
                 continue;
             }
 
             let new_id = self.next_stable_tab_id;
             self.next_stable_tab_id += 1;
-            eprintln!(
-                "[DEBUG] Assigned new stable_tab_id={} to tab_position={} via reference_pane={}",
-                new_id, tab_position, tiled_panes[0]
-            );
             self.reference_pane_to_tab.insert(tiled_panes[0], new_id);
             self.stable_tab_to_position.insert(new_id, tab_position);
         }
@@ -405,10 +385,6 @@ impl State {
             .collect();
 
         for ((name, stable_id), pane_id) in orphaned_scratchpads {
-            eprintln!(
-                "[DEBUG] Closing orphaned scratchpad: name={}, stable_tab_id={}, pane_id={}",
-                name, stable_id, pane_id
-            );
             close_terminal_pane(pane_id);
             self.tab_scratchpad_panes.remove(&(name.clone(), stable_id));
             self.scratchpad_focus_times.remove(&(name, stable_id));
@@ -457,9 +433,40 @@ impl State {
     }
 
     fn get_pane_tab(&self, pane_id: u32) -> Option<usize> {
+        // Priority order for finding the "real" pane location:
+        // 1. Floating + not suppressed (visible floating - ideal state)
+        // 2. Floating + suppressed (hidden floating - shouldn't happen but handle it)
+        // 3. Suppressed (hidden pane - the real one we want to show/move)
+        // 4. Any entry (ghost - non-floating, non-suppressed artifact)
+        //
+        // This matters because:
+        // - Session scratchpads are meant to be floating
+        // - Ghost entries (is_floating=false, is_suppressed=false) appear on other tabs
+        // - When hidden, real pane is is_floating=false, is_suppressed=true
+        // - HashMap iteration order is non-deterministic
+
+        // Priority 1: visible floating
         self.pane_manifest
             .iter()
-            .find(|(_, panes)| panes.iter().any(|p| p.id == pane_id))
+            .find(|(_, panes)| panes.iter().any(|p| p.id == pane_id && p.is_floating && !p.is_suppressed))
+            .or_else(|| {
+                // Priority 2: suppressed floating
+                self.pane_manifest
+                    .iter()
+                    .find(|(_, panes)| panes.iter().any(|p| p.id == pane_id && p.is_floating && p.is_suppressed))
+            })
+            .or_else(|| {
+                // Priority 3: suppressed (hidden pane, even if not floating)
+                self.pane_manifest
+                    .iter()
+                    .find(|(_, panes)| panes.iter().any(|p| p.id == pane_id && p.is_suppressed))
+            })
+            .or_else(|| {
+                // Priority 4: any entry (likely a ghost)
+                self.pane_manifest
+                    .iter()
+                    .find(|(_, panes)| panes.iter().any(|p| p.id == pane_id))
+            })
             .map(|(tab, _)| *tab)
     }
 
@@ -471,12 +478,7 @@ impl State {
     fn get_tab_scratchpad_pane(&self, name: &str) -> Option<u32> {
         let stable_tab_id = self.get_current_stable_tab_id()?;
         let key = (name.to_string(), stable_tab_id);
-        let pane_id = self.tab_scratchpad_panes.get(&key).copied();
-        eprintln!(
-            "[DEBUG]   get_tab_scratchpad_pane: name={}, stable_tab_id={}, pane_id={:?}",
-            name, stable_tab_id, pane_id
-        );
-        pane_id
+        self.tab_scratchpad_panes.get(&key).copied()
     }
 
     fn get_hidden_floating_pane_ids(&self) -> HashSet<u32> {
@@ -500,80 +502,44 @@ impl State {
     fn is_scratchpad_visible(&self, name: &str) -> bool {
         // If floating panes are not visible (tiled layer is focused), no scratchpad is visible
         if !self.are_floating_panes_visible {
-            eprintln!(
-                "[DEBUG] is_scratchpad_visible({}): floating layer not visible, returning false",
-                name
-            );
             return false;
         }
 
         let Some(pane_id) = self.get_scratchpad_pane_id(name) else {
-            eprintln!("[DEBUG] is_scratchpad_visible({}): no pane_id found, returning false", name);
             return false;
         };
 
         // Check that the pane is visible (not suppressed, not exited) on current tab
         // We specifically check for floating panes since scratchpads are floating
-        let panes_on_tab = self.pane_manifest.get(&self.current_tab_position);
-        eprintln!(
-            "[DEBUG] is_scratchpad_visible({}): pane_id={}, current_tab_position={}, panes_on_tab={:?}",
-            name,
-            pane_id,
-            self.current_tab_position,
-            panes_on_tab.map(|p| p.iter().map(|pi| (pi.id, pi.is_floating, pi.is_suppressed, pi.exited, pi.is_held)).collect::<Vec<_>>())
-        );
-
-        let result = panes_on_tab
+        self.pane_manifest
+            .get(&self.current_tab_position)
             .into_iter()
             .flatten()
-            .any(|p| p.id == pane_id && p.is_floating && !p.is_suppressed && !p.exited && !p.is_held);
-        eprintln!("[DEBUG] is_scratchpad_visible({}): result={}", name, result);
-        result
+            .any(|p| p.id == pane_id && p.is_floating && !p.is_suppressed && !p.exited && !p.is_held)
     }
 
     fn is_scratchpad_focused(&self, name: &str) -> bool {
         let Some(pane_id) = self.get_scratchpad_pane_id(name) else {
-            eprintln!("[DEBUG] is_scratchpad_focused({}): no pane_id, returning false", name);
             return false;
         };
 
         // If floating panes are not visible, the floating layer doesn't have focus
         if !self.are_floating_panes_visible {
-            eprintln!(
-                "[DEBUG] is_scratchpad_focused({}): floating layer not visible, returning false",
-                name
-            );
             return false;
         }
 
         // Check if we just showed this pane (haven't received PaneUpdate yet)
         if self.just_shown_scratchpad == Some(pane_id) {
-            eprintln!(
-                "[DEBUG] is_scratchpad_focused({}): pane_id={} was just shown, returning true",
-                name, pane_id
-            );
             return true;
         }
 
         // Get our scratchpad pane info - must be floating (scratchpads are floating panes)
-        let scratchpad_pane = self
-            .pane_manifest
+        self.pane_manifest
             .values()
             .flatten()
-            .find(|p| p.id == pane_id && p.is_floating);
-
-        let Some(scratchpad) = scratchpad_pane else {
-            eprintln!("[DEBUG] is_scratchpad_focused({}): pane {} not found as floating in manifest, returning false", name, pane_id);
-            return false;
-        };
-
-        eprintln!(
-            "[DEBUG] is_scratchpad_focused({}): pane_id={}, is_focused={}, are_floating_panes_visible={}",
-            name, pane_id, scratchpad.is_focused, self.are_floating_panes_visible
-        );
-
-        // Floating layer is visible, so check if our pane is focused within that layer
-        scratchpad.is_focused
+            .find(|p| p.id == pane_id && p.is_floating)
+            .map(|p| p.is_focused)
+            .unwrap_or(false)
     }
 
     fn get_focused_scratchpad(&self) -> Option<String> {
@@ -677,55 +643,28 @@ impl State {
     }
 
     fn handle_tab_scratchpad_show(&mut self, name: &str, config: &ScratchpadConfig) {
-        let stable_tab_id = match self.get_current_stable_tab_id() {
-            Some(id) => id,
-            None => {
-                eprintln!("[DEBUG] handle_tab_scratchpad_show: no stable_tab_id for current position, skipping");
-                return;
-            }
+        let Some(stable_tab_id) = self.get_current_stable_tab_id() else {
+            return;
         };
-
-        eprintln!(
-            "[DEBUG] handle_tab_scratchpad_show: name={}, stable_tab_id={}, current_tab_position={}",
-            name, stable_tab_id, self.current_tab_position
-        );
-        eprintln!(
-            "[DEBUG]   tab_scratchpad_panes: {:?}",
-            self.tab_scratchpad_panes
-        );
-        eprintln!(
-            "[DEBUG]   tab_pending_registrations: {:?}",
-            self.tab_pending_registrations
-        );
 
         // Check if there's already a scratchpad with this name on the current tab
         let existing_pane_id = self.get_tab_scratchpad_pane(name);
-        eprintln!(
-            "[DEBUG]   existing_pane_id for (name={}, stable_tab_id={}): {:?}",
-            name, stable_tab_id, existing_pane_id
-        );
 
         // If not yet registered on this tab, spawn the pane
         if existing_pane_id.is_none() {
             let pending_key = (name.to_string(), stable_tab_id);
             if self.tab_pending_registrations.contains(&pending_key) {
-                eprintln!("[DEBUG]   Already pending, returning");
                 return; // Already spawning on this tab
             }
 
-            eprintln!("[DEBUG]   Spawning new pane");
             self.tab_pending_registrations.insert(pending_key);
-
             let cmd = self.build_shim_command(name, config);
-            let context = BTreeMap::new();
-            open_command_pane_floating(cmd, None, context);
+            open_command_pane_floating(cmd, None, BTreeMap::new());
             return;
         }
 
         // Already registered - show the pane
-        let pane_id = existing_pane_id.unwrap();
-        eprintln!("[DEBUG]   Showing existing pane_id={}", pane_id);
-        self.show_scratchpad_pane(name, pane_id, stable_tab_id);
+        self.show_scratchpad_pane(name, existing_pane_id.unwrap(), stable_tab_id);
     }
 
     fn handle_session_scratchpad_show(&mut self, name: &str, config: &ScratchpadConfig) {
@@ -736,10 +675,8 @@ impl State {
             }
 
             self.session_pending_registrations.insert(name.to_string());
-
             let cmd = self.build_shim_command(name, config);
-            let context = BTreeMap::new();
-            open_command_pane_floating(cmd, None, context);
+            open_command_pane_floating(cmd, None, BTreeMap::new());
             return;
         }
 
@@ -747,9 +684,41 @@ impl State {
         let pane_id = *self.session_scratchpad_panes.get(name).unwrap();
         let pane_tab = self.get_pane_tab(pane_id);
 
-        // If on different tab, move it to current tab
+        // If on different tab, we need to show it first (to make it floating),
+        // then move it to the current tab.
+        //
+        // Why: Zellij's suppress_pane() removes panes from floating_panes into
+        // suppressed_panes. When break_panes_to_tab_with_index() moves a pane,
+        // it checks pane_id_is_floating() which only looks in floating_panes.
+        // A suppressed pane returns false, so it gets added as tiled on the target tab.
+        //
+        // Solution: show_pane_with_id(_, true) unsuppresses as floating.
+        // Then break_panes_to_tab_with_index() sees it as floating and preserves that.
         if pane_tab != Some(self.current_tab_position) {
-            break_panes_to_tab_with_index(&[PaneId::Terminal(pane_id)], self.current_tab_position, false);
+            // Check if target tab has a ghost entry for this pane
+            // Ghosts are is_floating=false, is_suppressed=false entries
+            let target_has_ghost = self
+                .pane_manifest
+                .get(&self.current_tab_position)
+                .map(|panes| panes.iter().any(|p| p.id == pane_id && !p.is_floating && !p.is_suppressed))
+                .unwrap_or(false);
+
+            if target_has_ghost {
+                // Target tab has a ghost - Zellij's move will fail
+                // Fallback: just show the pane on its current tab (user gets switched there)
+                show_pane_with_id(PaneId::Terminal(pane_id), true);
+                return;
+            }
+
+            // Show the pane (unsuppresses as floating, but switches us to its tab)
+            show_pane_with_id(PaneId::Terminal(pane_id), true);
+            // Move the pane to current tab AND switch focus back to current tab
+            break_panes_to_tab_with_index(&[PaneId::Terminal(pane_id)], self.current_tab_position, true);
+            // Toggle to floating (in case it became tiled during move)
+            toggle_pane_embed_or_eject_for_pane_id(PaneId::Terminal(pane_id));
+            // Show the pane
+            self.show_scratchpad_pane_session(name, pane_id);
+            return;
         }
 
         self.show_scratchpad_pane_session(name, pane_id);
@@ -794,20 +763,18 @@ impl State {
                 hide_pane_with_id(PaneId::Terminal(hidden_pane_id));
             }
         }
-        // Session-scoped scratchpads don't track focus per-tab
     }
 
     fn handle_scratchpad_hide(&mut self, name: &str) {
         let pane_id = match self.get_scratchpad_scope(name) {
             Some(ScratchpadScope::Session) => self.session_scratchpad_panes.get(name).copied(),
             Some(ScratchpadScope::Tab) => self.get_tab_scratchpad_pane(name),
-            None => return, // Unknown scratchpad
+            None => return,
         };
 
         if let Some(pane_id) = pane_id {
             hide_pane_with_id(PaneId::Terminal(pane_id));
         }
-        // Silent no-op if not registered
     }
 
     fn handle_scratchpad_close(&mut self, name: &str) {
@@ -831,15 +798,7 @@ impl State {
     }
 
     fn handle_scratchpad_register_tab(&mut self, name: &str, pane_id: u32) {
-        eprintln!(
-            "[DEBUG] handle_scratchpad_register_tab: name={}, pane_id={}",
-            name, pane_id
-        );
         let pane_tab_position = self.get_pane_tab(pane_id);
-        eprintln!(
-            "[DEBUG]   get_pane_tab({}) = {:?}, current_tab_position={}",
-            pane_id, pane_tab_position, self.current_tab_position
-        );
 
         // Find which stable tab ID this pane was intended for by looking at pending registrations
         let intended_stable_id = self
@@ -847,18 +806,16 @@ impl State {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, stable_id)| *stable_id);
-        eprintln!("[DEBUG]   intended_stable_id from pending: {:?}", intended_stable_id);
 
         // Get the current stable tab ID as fallback
         let target_stable_id = intended_stable_id.or_else(|| self.get_current_stable_tab_id());
         let Some(stable_tab_id) = target_stable_id else {
-            eprintln!("[DEBUG]   No stable_tab_id available, cannot register");
             return;
         };
 
         // Clear pending registration
-        eprintln!("[DEBUG]   Removing pending ({}, {})", name, stable_tab_id);
-        self.tab_pending_registrations.remove(&(name.to_string(), stable_tab_id));
+        self.tab_pending_registrations
+            .remove(&(name.to_string(), stable_tab_id));
 
         // Get the target tab position for this stable ID
         let target_tab_position = self.stable_tab_to_position.get(&stable_tab_id).copied();
@@ -866,19 +823,11 @@ impl State {
         // If the pane is on the wrong tab, move it to the intended tab
         if let (Some(actual_tab), Some(target_tab)) = (pane_tab_position, target_tab_position) {
             if actual_tab != target_tab {
-                eprintln!(
-                    "[DEBUG]   Moving pane from tab_position {} to tab_position {}",
-                    actual_tab, target_tab
-                );
                 break_panes_to_tab_with_index(&[PaneId::Terminal(pane_id)], target_tab, false);
             }
         }
 
         let key = (name.to_string(), stable_tab_id);
-        eprintln!(
-            "[DEBUG]   Inserting into tab_scratchpad_panes: {:?} -> {}",
-            key, pane_id
-        );
         self.tab_scratchpad_panes.insert(key.clone(), pane_id);
 
         // Track that we just showed this pane (newly spawned panes are focused)
@@ -926,37 +875,25 @@ impl State {
     }
 
     fn handle_scratchpad_toggle(&mut self, name: Option<String>) {
-        eprintln!("[DEBUG] handle_scratchpad_toggle: name={:?}, current_tab_position={}", name, self.current_tab_position);
-
         let target_name = match name {
             // Explicit name provided
             Some(n) => n,
             // No name - check if a scratchpad is focused
             None => {
                 if let Some(focused) = self.get_focused_scratchpad() {
-                    eprintln!("[DEBUG]   using focused scratchpad: {}", focused);
                     focused
                 } else {
                     // No focused scratchpad - use last from current tab's focus history
                     match self.get_last_focused_scratchpad_on_current_tab() {
-                        Some(last) => {
-                            eprintln!("[DEBUG]   using last focused: {}", last);
-                            last
-                        }
-                        None => {
-                            eprintln!("[DEBUG]   no history, returning");
-                            return; // No history - no-op
-                        }
+                        Some(last) => last,
+                        None => return, // No history - no-op
                     }
                 }
             }
         };
 
-        eprintln!("[DEBUG]   target_name={}", target_name);
-
         // Check if configured
         if !self.scratchpad_configs.contains_key(&target_name) {
-            eprintln!("[DEBUG]   not configured, returning");
             return; // Silent no-op for unknown scratchpad
         }
 
@@ -966,12 +903,6 @@ impl State {
         // - If not visible → show it
         let visible = self.is_scratchpad_visible(&target_name);
         let focused = self.is_scratchpad_focused(&target_name);
-        eprintln!(
-            "[DEBUG]   visible={}, focused={}, will {}",
-            visible,
-            focused,
-            if visible && focused { "hide" } else { "show/focus" }
-        );
 
         if visible && focused {
             self.handle_scratchpad_hide(&target_name);
@@ -1062,6 +993,7 @@ impl ZellijPlugin for State {
         match event {
             Event::PaneUpdate(pane_manifest) => {
                 self.pane_manifest = pane_manifest.panes;
+
                 // Clear the "just shown" tracking since we now have fresh state
                 self.just_shown_scratchpad = None;
                 // Update stable tab mapping FIRST, before other operations
@@ -1075,10 +1007,6 @@ impl ZellijPlugin for State {
             Event::TabUpdate(tab_infos) => {
                 // Find the active tab and update state
                 if let Some(active_tab) = tab_infos.iter().find(|t| t.active) {
-                    eprintln!(
-                        "[DEBUG] TabUpdate: position={}, are_floating_panes_visible={}",
-                        active_tab.position, active_tab.are_floating_panes_visible
-                    );
                     self.current_tab_position = active_tab.position;
                     self.are_floating_panes_visible = active_tab.are_floating_panes_visible;
                 }
