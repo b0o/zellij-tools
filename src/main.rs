@@ -1,8 +1,11 @@
-use indexmap::IndexSet;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use zellij_tile::prelude::*;
+
+/// A stable tab identifier that doesn't change when tabs are reordered.
+/// We use a monotonically increasing counter assigned when we first see a tab.
+type StableTabId = u64;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -25,31 +28,44 @@ enum ScratchpadAction {
     Show { name: String },
     Hide { name: String },
     Close { name: String },
-    RegisterTab { name: String, tab: usize, pane_id: u32 },
+    RegisterTab { name: String, pane_id: u32 },
     RegisterSession { name: String, pane_id: u32 },
 }
 
 #[derive(Default)]
 struct State {
     // Pane tracking (from PaneUpdate events)
+    // Key is tab position (0-indexed), which changes when tabs are reordered
     pane_manifest: HashMap<usize, Vec<PaneInfo>>,
 
-    // Current tab (from TabUpdate events)
-    current_tab: usize,
+    // Current tab position (from TabUpdate events)
+    current_tab_position: usize,
+
+    // Stable tab ID tracking:
+    // - We assign each tab a stable ID when we first see it
+    // - We identify tabs by finding a "reference pane" (any tiled pane) on that tab
+    // - When tabs are reordered, we can find the same tab by looking for its reference pane
+    next_stable_tab_id: StableTabId,
+    // reference_pane_id -> stable_tab_id (tiled panes that identify tabs)
+    reference_pane_to_tab: HashMap<u32, StableTabId>,
+    // stable_tab_id -> current position (updated on each PaneUpdate)
+    stable_tab_to_position: HashMap<StableTabId, usize>,
 
     // Scratchpad configuration (from plugin load)
     scratchpad_configs: HashMap<String, ScratchpadConfig>,
 
-    // Tab-scoped scratchpad state: (name, tab) -> pane_id
-    tab_scratchpad_panes: HashMap<(String, usize), u32>,
-    tab_pending_registrations: HashSet<(String, usize)>,
+    // Tab-scoped scratchpad state: (name, stable_tab_id) -> pane_id
+    tab_scratchpad_panes: HashMap<(String, StableTabId), u32>,
+    // Pending registrations: (name, stable_tab_id)
+    tab_pending_registrations: HashSet<(String, StableTabId)>,
 
     // Session-scoped scratchpad state: name -> pane_id
     session_scratchpad_panes: HashMap<String, u32>,
     session_pending_registrations: HashSet<String>,
 
-    // Unified focus history per tab (includes both scopes): tab -> names
-    focused_history: HashMap<usize, IndexSet<String>>,
+    // Focus history: (name, stable_tab_id) -> last focus timestamp
+    focus_counter: u64,
+    scratchpad_focus_times: HashMap<(String, StableTabId), u64>,
 }
 
 register_plugin!(State);
@@ -149,7 +165,7 @@ impl State {
             }
             "register" => {
                 // Format: register::session::<name>::<pane_id>
-                // Format: register::tab::<tab>::<name>::<pane_id>
+                // Format: register::tab::<name>::<pane_id>
                 let scope = args.get(1).ok_or_else(|| {
                     ParseError::InvalidArgs("register requires a scope (session or tab)".to_string())
                 })?;
@@ -174,16 +190,10 @@ impl State {
                         })
                     }
                     "tab" => {
-                        let tab_str = args.get(2).ok_or_else(|| {
-                            ParseError::InvalidArgs("register::tab requires a tab index".to_string())
-                        })?;
-                        let tab = tab_str.parse::<usize>().map_err(|e| {
-                            ParseError::InvalidArgs(format!("Invalid tab index '{}': {}", tab_str, e))
-                        })?;
-                        let name = args.get(3).ok_or_else(|| {
+                        let name = args.get(2).ok_or_else(|| {
                             ParseError::InvalidArgs("register::tab requires a name".to_string())
                         })?;
-                        let pane_id_str = args.get(4).ok_or_else(|| {
+                        let pane_id_str = args.get(3).ok_or_else(|| {
                             ParseError::InvalidArgs("register::tab requires a pane_id".to_string())
                         })?;
                         let pane_id = pane_id_str.parse::<u32>().map_err(|e| {
@@ -194,7 +204,6 @@ impl State {
                         }
                         Ok(ScratchpadAction::RegisterTab {
                             name: name.clone(),
-                            tab,
                             pane_id,
                         })
                     }
@@ -211,6 +220,135 @@ impl State {
         }
     }
 
+    /// Update stable tab ID mappings based on current pane_manifest.
+    /// This identifies tabs by finding reference panes (tiled panes) that we've seen before.
+    ///
+    /// Key insight: A reference pane keeps its stable ID even if it moves to a different
+    /// tab position. The stable ID follows the reference pane, not the position.
+    ///
+    /// The algorithm handles these edge cases:
+    /// 1. Reference pane moved to different tab position -> stable ID follows the pane
+    /// 2. Reference pane closed -> pick new reference pane from remaining tiled panes ON SAME TAB
+    /// 3. Tab closed entirely -> stable ID becomes orphaned, scratchpads keyed to it are stale
+    fn update_stable_tab_mapping(&mut self) {
+        // Build a map of pane_id -> current tab position for all tiled panes
+        let pane_to_current_tab: HashMap<u32, usize> = self
+            .pane_manifest
+            .iter()
+            .flat_map(|(&tab_pos, panes)| {
+                panes
+                    .iter()
+                    .filter(|p| !p.is_floating && !p.is_plugin)
+                    .map(move |p| (p.id, tab_pos))
+            })
+            .collect();
+
+        // Clean up reference panes that no longer exist (were closed)
+        let existing_pane_ids: HashSet<u32> = pane_to_current_tab.keys().copied().collect();
+        let closed_refs: Vec<(u32, StableTabId)> = self
+            .reference_pane_to_tab
+            .iter()
+            .filter(|(pane_id, _)| !existing_pane_ids.contains(pane_id))
+            .map(|(&pane_id, &stable_id)| (pane_id, stable_id))
+            .collect();
+
+        for (pane_id, stable_id) in &closed_refs {
+            eprintln!(
+                "[DEBUG] Reference pane {} was closed (was for stable_tab_id={})",
+                pane_id, stable_id
+            );
+            self.reference_pane_to_tab.remove(pane_id);
+        }
+
+        // Rebuild stable_tab_to_position based on where reference panes are NOW
+        // (stable ID follows the reference pane, even if position changed)
+        self.stable_tab_to_position.clear();
+        for (&pane_id, &stable_id) in &self.reference_pane_to_tab {
+            if let Some(&tab_position) = pane_to_current_tab.get(&pane_id) {
+                eprintln!(
+                    "[DEBUG] Reference pane {} (stable_tab_id={}) is now at position {}",
+                    pane_id, stable_id, tab_position
+                );
+                self.stable_tab_to_position.insert(stable_id, tab_position);
+            }
+        }
+
+        // For closed reference panes, try to find a replacement on the same stable tab
+        // We need to find another tiled pane that's on the same position the stable ID was at
+        for (closed_pane_id, stable_id) in &closed_refs {
+            // Skip if this stable ID already got reassigned (shouldn't happen but be safe)
+            if self.stable_tab_to_position.contains_key(stable_id) {
+                continue;
+            }
+
+            // Find tabs that don't have a stable ID yet
+            for (&tab_position, panes) in &self.pane_manifest {
+                // Skip if this position already has a stable ID
+                if self.stable_tab_to_position.values().any(|&pos| pos == tab_position) {
+                    continue;
+                }
+
+                // Get tiled panes on this tab
+                let tiled_panes: Vec<u32> = panes
+                    .iter()
+                    .filter(|p| !p.is_floating && !p.is_plugin)
+                    .map(|p| p.id)
+                    .collect();
+
+                if let Some(&new_ref_pane) = tiled_panes.first() {
+                    // Assign this orphaned stable ID to this tab with a new reference pane
+                    eprintln!(
+                        "[DEBUG] Reassigning stable_tab_id={} (lost pane {}) to position {} with new reference_pane={}",
+                        stable_id, closed_pane_id, tab_position, new_ref_pane
+                    );
+                    self.reference_pane_to_tab.insert(new_ref_pane, *stable_id);
+                    self.stable_tab_to_position.insert(*stable_id, tab_position);
+                    break; // Only reassign to one tab
+                }
+            }
+        }
+
+        // Finally, assign new stable IDs to any tabs that still don't have one
+        for (&tab_position, panes) in &self.pane_manifest {
+            // Skip if this position already has a stable ID
+            if self.stable_tab_to_position.values().any(|&pos| pos == tab_position) {
+                continue;
+            }
+
+            // Get tiled panes on this tab
+            let tiled_panes: Vec<u32> = panes
+                .iter()
+                .filter(|p| !p.is_floating && !p.is_plugin)
+                .map(|p| p.id)
+                .collect();
+
+            if tiled_panes.is_empty() {
+                eprintln!(
+                    "[DEBUG] Tab position {} has no tiled panes, skipping",
+                    tab_position
+                );
+                continue;
+            }
+
+            let new_id = self.next_stable_tab_id;
+            self.next_stable_tab_id += 1;
+            eprintln!(
+                "[DEBUG] Assigned new stable_tab_id={} to tab_position={} via reference_pane={}",
+                new_id, tab_position, tiled_panes[0]
+            );
+            self.reference_pane_to_tab.insert(tiled_panes[0], new_id);
+            self.stable_tab_to_position.insert(new_id, tab_position);
+        }
+    }
+
+    /// Get the stable tab ID for the current tab position
+    fn get_current_stable_tab_id(&self) -> Option<StableTabId> {
+        self.stable_tab_to_position
+            .iter()
+            .find(|(_, &pos)| pos == self.current_tab_position)
+            .map(|(&id, _)| id)
+    }
+
     fn cleanup_closed_scratchpads(&mut self) {
         // Collect all pane IDs that still exist in the manifest
         let existing_pane_ids: HashSet<u32> = self
@@ -221,18 +359,16 @@ impl State {
             .collect();
 
         // Clean up tab-scoped scratchpads whose panes no longer exist
-        let closed_tab_scratchpads: Vec<(String, usize)> = self
+        let closed_tab_keys: Vec<(String, StableTabId)> = self
             .tab_scratchpad_panes
             .iter()
             .filter(|(_, &pane_id)| !existing_pane_ids.contains(&pane_id))
-            .map(|((name, tab), _)| (name.clone(), *tab))
+            .map(|(key, _)| key.clone())
             .collect();
 
-        for (name, tab) in closed_tab_scratchpads {
-            self.tab_scratchpad_panes.remove(&(name.clone(), tab));
-            if let Some(history) = self.focused_history.get_mut(&tab) {
-                history.shift_remove(&name);
-            }
+        for key in closed_tab_keys {
+            self.tab_scratchpad_panes.remove(&key);
+            self.scratchpad_focus_times.remove(&key);
         }
 
         // Clean up session-scoped scratchpads whose panes no longer exist
@@ -245,10 +381,31 @@ impl State {
 
         for name in closed_session_scratchpads {
             self.session_scratchpad_panes.remove(&name);
-            // Remove from ALL tab histories
-            for history in self.focused_history.values_mut() {
-                history.shift_remove(&name);
-            }
+        }
+
+        // Clean up stale pending registrations for tabs that no longer exist
+        let existing_stable_ids: HashSet<StableTabId> =
+            self.stable_tab_to_position.keys().copied().collect();
+        self.tab_pending_registrations
+            .retain(|(_, stable_id)| existing_stable_ids.contains(stable_id));
+
+        // Close scratchpad panes whose stable tab IDs are orphaned (tab was closed)
+        // These scratchpads are no longer associated with any tab
+        let orphaned_scratchpads: Vec<((String, StableTabId), u32)> = self
+            .tab_scratchpad_panes
+            .iter()
+            .filter(|((_, stable_id), _)| !existing_stable_ids.contains(stable_id))
+            .map(|(key, &pane_id)| (key.clone(), pane_id))
+            .collect();
+
+        for ((name, stable_id), pane_id) in orphaned_scratchpads {
+            eprintln!(
+                "[DEBUG] Closing orphaned scratchpad: name={}, stable_tab_id={}, pane_id={}",
+                name, stable_id, pane_id
+            );
+            close_terminal_pane(pane_id);
+            self.tab_scratchpad_panes.remove(&(name.clone(), stable_id));
+            self.scratchpad_focus_times.remove(&(name, stable_id));
         }
     }
 
@@ -266,19 +423,17 @@ impl State {
             .collect();
 
         // Close exited tab-scoped scratchpads
-        let exited_tab_scratchpads: Vec<((String, usize), u32)> = self
+        let exited_tab_keys: Vec<((String, StableTabId), u32)> = self
             .tab_scratchpad_panes
             .iter()
             .filter(|(_, &pane_id)| exited_pane_ids.contains(&pane_id))
-            .map(|((name, tab), &pane_id)| ((name.clone(), *tab), pane_id))
+            .map(|(key, &pane_id)| (key.clone(), pane_id))
             .collect();
 
-        for ((name, tab), pane_id) in exited_tab_scratchpads {
+        for (key, pane_id) in exited_tab_keys {
             close_terminal_pane(pane_id);
-            self.tab_scratchpad_panes.remove(&(name.clone(), tab));
-            if let Some(history) = self.focused_history.get_mut(&tab) {
-                history.shift_remove(&name);
-            }
+            self.tab_scratchpad_panes.remove(&key);
+            self.scratchpad_focus_times.remove(&key);
         }
 
         // Close exited session-scoped scratchpads
@@ -292,10 +447,6 @@ impl State {
         for (name, pane_id) in exited_session_scratchpads {
             close_terminal_pane(pane_id);
             self.session_scratchpad_panes.remove(&name);
-            // Remove from ALL tab histories
-            for history in self.focused_history.values_mut() {
-                history.shift_remove(&name);
-            }
         }
     }
 
@@ -308,6 +459,18 @@ impl State {
 
     fn get_scratchpad_scope(&self, name: &str) -> Option<ScratchpadScope> {
         self.scratchpad_configs.get(name).map(|c| c.scope)
+    }
+
+    /// Find a tab-scoped scratchpad's pane_id by name on the current tab (using stable ID)
+    fn get_tab_scratchpad_pane(&self, name: &str) -> Option<u32> {
+        let stable_tab_id = self.get_current_stable_tab_id()?;
+        let key = (name.to_string(), stable_tab_id);
+        let pane_id = self.tab_scratchpad_panes.get(&key).copied();
+        eprintln!(
+            "[DEBUG]   get_tab_scratchpad_pane: name={}, stable_tab_id={}, pane_id={:?}",
+            name, stable_tab_id, pane_id
+        );
+        pane_id
     }
 
     fn get_hidden_floating_pane_ids(&self) -> HashSet<u32> {
@@ -323,45 +486,32 @@ impl State {
         let scope = self.get_scratchpad_scope(name);
         let pane_id = match scope {
             Some(ScratchpadScope::Session) => self.session_scratchpad_panes.get(name).copied(),
-            Some(ScratchpadScope::Tab) => self
-                .tab_scratchpad_panes
-                .get(&(name.to_string(), self.current_tab))
-                .copied(),
+            Some(ScratchpadScope::Tab) => self.get_tab_scratchpad_pane(name),
             None => return false,
         };
 
         let Some(pane_id) = pane_id else {
+            eprintln!("[DEBUG] is_scratchpad_visible({}): no pane_id found, returning false", name);
             return false;
         };
 
-        // For tab-scoped: only check panes on current tab
-        // For session-scoped: check all tabs but verify it's on current tab
-        let panes_to_check: Box<dyn Iterator<Item = &PaneInfo>> = match scope {
-            Some(ScratchpadScope::Tab) => {
-                // Only check current tab's panes for tab-scoped scratchpads
-                Box::new(
-                    self.pane_manifest
-                        .get(&self.current_tab)
-                        .into_iter()
-                        .flatten(),
-                )
-            }
-            Some(ScratchpadScope::Session) => {
-                // Check all tabs for session-scoped
-                Box::new(self.pane_manifest.values().flatten())
-            }
-            None => return false,
-        };
+        // Check that the pane is visible (not suppressed, not exited) on current tab
+        // We specifically check for floating panes since scratchpads are floating
+        let panes_on_tab = self.pane_manifest.get(&self.current_tab_position);
+        eprintln!(
+            "[DEBUG] is_scratchpad_visible({}): pane_id={}, current_tab_position={}, panes_on_tab={:?}",
+            name,
+            pane_id,
+            self.current_tab_position,
+            panes_on_tab.map(|p| p.iter().map(|pi| (pi.id, pi.is_floating, pi.is_suppressed, pi.exited, pi.is_held)).collect::<Vec<_>>())
+        );
 
-        panes_to_check.into_iter().any(|p| {
-            p.id == pane_id
-                && !p.is_suppressed
-                && !p.exited
-                && !p.is_held
-                // For session-scoped, also verify it's on the current tab
-                && (scope != Some(ScratchpadScope::Session)
-                    || self.get_pane_tab(pane_id) == Some(self.current_tab))
-        })
+        let result = panes_on_tab
+            .into_iter()
+            .flatten()
+            .any(|p| p.id == pane_id && p.is_floating && !p.is_suppressed && !p.exited && !p.is_held);
+        eprintln!("[DEBUG] is_scratchpad_visible({}): result={}", name, result);
+        result
     }
 
     fn get_focused_scratchpad(&self) -> Option<String> {
@@ -382,29 +532,23 @@ impl State {
             return Some(name);
         }
 
-        // Check tab-scoped scratchpads (only on current tab)
+        // Check tab-scoped scratchpads
         self.tab_scratchpad_panes
             .iter()
-            .filter(|((_, tab), _)| *tab == self.current_tab)
             .find(|(_, &pane_id)| pane_id == focused_pane_id)
             .map(|((name, _), _)| name.clone())
     }
 
     fn build_shim_command(&self, name: &str, config: &ScratchpadConfig) -> CommandToRun {
-        let register_msg = match config.scope {
-            ScratchpadScope::Session => {
-                format!(
-                    r#"zellij pipe "zellij-tools::scratchpad::register::session::{}::$ZELLIJ_PANE_ID""#,
-                    name
-                )
-            }
-            ScratchpadScope::Tab => {
-                format!(
-                    r#"zellij pipe "zellij-tools::scratchpad::register::tab::{}::{}::$ZELLIJ_PANE_ID""#,
-                    self.current_tab, name
-                )
-            }
+        // Both scopes use the same format now - we derive tab from pane_manifest
+        let scope_str = match config.scope {
+            ScratchpadScope::Session => "session",
+            ScratchpadScope::Tab => "tab",
         };
+        let register_msg = format!(
+            r#"zellij pipe "zellij-tools::scratchpad::register::{}::{}::$ZELLIJ_PANE_ID""#,
+            scope_str, name
+        );
 
         let mut args = vec![
             "-c".to_string(),
@@ -430,15 +574,44 @@ impl State {
     }
 
     fn handle_tab_scratchpad_show(&mut self, name: &str, config: &ScratchpadConfig) {
-        let key = (name.to_string(), self.current_tab);
+        let stable_tab_id = match self.get_current_stable_tab_id() {
+            Some(id) => id,
+            None => {
+                eprintln!("[DEBUG] handle_tab_scratchpad_show: no stable_tab_id for current position, skipping");
+                return;
+            }
+        };
 
-        // If not yet registered, spawn the pane
-        if !self.tab_scratchpad_panes.contains_key(&key) {
-            if self.tab_pending_registrations.contains(&key) {
-                return; // Already spawning
+        eprintln!(
+            "[DEBUG] handle_tab_scratchpad_show: name={}, stable_tab_id={}, current_tab_position={}",
+            name, stable_tab_id, self.current_tab_position
+        );
+        eprintln!(
+            "[DEBUG]   tab_scratchpad_panes: {:?}",
+            self.tab_scratchpad_panes
+        );
+        eprintln!(
+            "[DEBUG]   tab_pending_registrations: {:?}",
+            self.tab_pending_registrations
+        );
+
+        // Check if there's already a scratchpad with this name on the current tab
+        let existing_pane_id = self.get_tab_scratchpad_pane(name);
+        eprintln!(
+            "[DEBUG]   existing_pane_id for (name={}, stable_tab_id={}): {:?}",
+            name, stable_tab_id, existing_pane_id
+        );
+
+        // If not yet registered on this tab, spawn the pane
+        if existing_pane_id.is_none() {
+            let pending_key = (name.to_string(), stable_tab_id);
+            if self.tab_pending_registrations.contains(&pending_key) {
+                eprintln!("[DEBUG]   Already pending, returning");
+                return; // Already spawning on this tab
             }
 
-            self.tab_pending_registrations.insert(key);
+            eprintln!("[DEBUG]   Spawning new pane");
+            self.tab_pending_registrations.insert(pending_key);
 
             let cmd = self.build_shim_command(name, config);
             let context = BTreeMap::new();
@@ -447,8 +620,9 @@ impl State {
         }
 
         // Already registered - show the pane
-        let pane_id = *self.tab_scratchpad_panes.get(&(name.to_string(), self.current_tab)).unwrap();
-        self.show_scratchpad_pane(name, pane_id);
+        let pane_id = existing_pane_id.unwrap();
+        eprintln!("[DEBUG]   Showing existing pane_id={}", pane_id);
+        self.show_scratchpad_pane(name, pane_id, stable_tab_id);
     }
 
     fn handle_session_scratchpad_show(&mut self, name: &str, config: &ScratchpadConfig) {
@@ -471,14 +645,14 @@ impl State {
         let pane_tab = self.get_pane_tab(pane_id);
 
         // If on different tab, move it to current tab
-        if pane_tab != Some(self.current_tab) {
-            break_panes_to_tab_with_index(&[PaneId::Terminal(pane_id)], self.current_tab, false);
+        if pane_tab != Some(self.current_tab_position) {
+            break_panes_to_tab_with_index(&[PaneId::Terminal(pane_id)], self.current_tab_position, false);
         }
 
-        self.show_scratchpad_pane(name, pane_id);
+        self.show_scratchpad_pane_session(name, pane_id);
     }
 
-    fn show_scratchpad_pane(&mut self, name: &str, pane_id: u32) {
+    fn show_scratchpad_pane(&mut self, name: &str, pane_id: u32, stable_tab_id: StableTabId) {
         // Capture which panes are currently hidden BEFORE showing
         let hidden_before = self.get_hidden_floating_pane_ids();
 
@@ -492,19 +666,32 @@ impl State {
             }
         }
 
-        // Update focus history for current tab
-        let history = self.focused_history.entry(self.current_tab).or_default();
-        history.shift_remove(name);
-        history.insert(name.to_string());
+        // Update focus tracking (monotonic counter for recency)
+        self.focus_counter += 1;
+        let key = (name.to_string(), stable_tab_id);
+        self.scratchpad_focus_times.insert(key, self.focus_counter);
+    }
+
+    fn show_scratchpad_pane_session(&mut self, _name: &str, pane_id: u32) {
+        // Capture which panes are currently hidden BEFORE showing
+        let hidden_before = self.get_hidden_floating_pane_ids();
+
+        // Show the scratchpad pane (this will show ALL floating panes as a side effect)
+        show_pane_with_id(PaneId::Terminal(pane_id), true);
+
+        // Re-hide all panes that were hidden before (except our scratchpad)
+        for hidden_pane_id in hidden_before {
+            if hidden_pane_id != pane_id {
+                hide_pane_with_id(PaneId::Terminal(hidden_pane_id));
+            }
+        }
+        // Session-scoped scratchpads don't track focus per-tab
     }
 
     fn handle_scratchpad_hide(&mut self, name: &str) {
         let pane_id = match self.get_scratchpad_scope(name) {
             Some(ScratchpadScope::Session) => self.session_scratchpad_panes.get(name).copied(),
-            Some(ScratchpadScope::Tab) => self
-                .tab_scratchpad_panes
-                .get(&(name.to_string(), self.current_tab))
-                .copied(),
+            Some(ScratchpadScope::Tab) => self.get_tab_scratchpad_pane(name),
             None => return, // Unknown scratchpad
         };
 
@@ -519,18 +706,14 @@ impl State {
             Some(ScratchpadScope::Session) => {
                 if let Some(pane_id) = self.session_scratchpad_panes.remove(name) {
                     close_terminal_pane(pane_id);
-                    // Remove from all tab histories
-                    for history in self.focused_history.values_mut() {
-                        history.shift_remove(name);
-                    }
                 }
             }
             Some(ScratchpadScope::Tab) => {
-                let key = (name.to_string(), self.current_tab);
-                if let Some(pane_id) = self.tab_scratchpad_panes.remove(&key) {
-                    close_terminal_pane(pane_id);
-                    if let Some(history) = self.focused_history.get_mut(&self.current_tab) {
-                        history.shift_remove(name);
+                if let Some(stable_tab_id) = self.get_current_stable_tab_id() {
+                    let key = (name.to_string(), stable_tab_id);
+                    if let Some(pane_id) = self.tab_scratchpad_panes.remove(&key) {
+                        close_terminal_pane(pane_id);
+                        self.scratchpad_focus_times.remove(&key);
                     }
                 }
             }
@@ -538,14 +721,60 @@ impl State {
         }
     }
 
-    fn handle_scratchpad_register_tab(&mut self, name: &str, tab: usize, pane_id: u32) {
-        self.tab_pending_registrations.remove(&(name.to_string(), tab));
-        self.tab_scratchpad_panes.insert((name.to_string(), tab), pane_id);
+    fn handle_scratchpad_register_tab(&mut self, name: &str, pane_id: u32) {
+        eprintln!(
+            "[DEBUG] handle_scratchpad_register_tab: name={}, pane_id={}",
+            name, pane_id
+        );
+        let pane_tab_position = self.get_pane_tab(pane_id);
+        eprintln!(
+            "[DEBUG]   get_pane_tab({}) = {:?}, current_tab_position={}",
+            pane_id, pane_tab_position, self.current_tab_position
+        );
 
-        // Update focus history (newly spawned scratchpad is now focused)
-        let history = self.focused_history.entry(tab).or_default();
-        history.shift_remove(name);
-        history.insert(name.to_string());
+        // Find which stable tab ID this pane was intended for by looking at pending registrations
+        let intended_stable_id = self
+            .tab_pending_registrations
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, stable_id)| *stable_id);
+        eprintln!("[DEBUG]   intended_stable_id from pending: {:?}", intended_stable_id);
+
+        // Get the current stable tab ID as fallback
+        let target_stable_id = intended_stable_id.or_else(|| self.get_current_stable_tab_id());
+        let Some(stable_tab_id) = target_stable_id else {
+            eprintln!("[DEBUG]   No stable_tab_id available, cannot register");
+            return;
+        };
+
+        // Clear pending registration
+        eprintln!("[DEBUG]   Removing pending ({}, {})", name, stable_tab_id);
+        self.tab_pending_registrations.remove(&(name.to_string(), stable_tab_id));
+
+        // Get the target tab position for this stable ID
+        let target_tab_position = self.stable_tab_to_position.get(&stable_tab_id).copied();
+
+        // If the pane is on the wrong tab, move it to the intended tab
+        if let (Some(actual_tab), Some(target_tab)) = (pane_tab_position, target_tab_position) {
+            if actual_tab != target_tab {
+                eprintln!(
+                    "[DEBUG]   Moving pane from tab_position {} to tab_position {}",
+                    actual_tab, target_tab
+                );
+                break_panes_to_tab_with_index(&[PaneId::Terminal(pane_id)], target_tab, false);
+            }
+        }
+
+        let key = (name.to_string(), stable_tab_id);
+        eprintln!(
+            "[DEBUG]   Inserting into tab_scratchpad_panes: {:?} -> {}",
+            key, pane_id
+        );
+        self.tab_scratchpad_panes.insert(key.clone(), pane_id);
+
+        // Update focus tracking
+        self.focus_counter += 1;
+        self.scratchpad_focus_times.insert(key, self.focus_counter);
 
         // Re-hide any floating panes that should be hidden
         let hidden_panes = self.get_hidden_floating_pane_ids();
@@ -560,11 +789,6 @@ impl State {
         self.session_pending_registrations.remove(name);
         self.session_scratchpad_panes.insert(name.to_string(), pane_id);
 
-        // Update focus history for current tab
-        let history = self.focused_history.entry(self.current_tab).or_default();
-        history.shift_remove(name);
-        history.insert(name.to_string());
-
         // Re-hide any floating panes that should be hidden
         let hidden_panes = self.get_hidden_floating_pane_ids();
         for hidden_pane_id in hidden_panes {
@@ -574,31 +798,58 @@ impl State {
         }
     }
 
+    /// Get the most recently focused scratchpad on the current tab
+    fn get_last_focused_scratchpad_on_current_tab(&self) -> Option<String> {
+        let stable_tab_id = self.get_current_stable_tab_id()?;
+
+        // Find the scratchpad with the highest focus time on current stable tab
+        self.scratchpad_focus_times
+            .iter()
+            .filter(|((_, sid), _)| *sid == stable_tab_id)
+            .max_by_key(|(_, &focus_time)| focus_time)
+            .map(|((name, _), _)| name.clone())
+    }
+
     fn handle_scratchpad_toggle(&mut self, name: Option<String>) {
+        eprintln!("[DEBUG] handle_scratchpad_toggle: name={:?}, current_tab_position={}", name, self.current_tab_position);
+
         let target_name = match name {
             // Explicit name provided
             Some(n) => n,
             // No name - check if a scratchpad is focused
             None => {
                 if let Some(focused) = self.get_focused_scratchpad() {
+                    eprintln!("[DEBUG]   using focused scratchpad: {}", focused);
                     focused
                 } else {
-                    // No focused scratchpad - use last from current tab's history
-                    match self.focused_history.get(&self.current_tab).and_then(|h| h.last()) {
-                        Some(last) => last.clone(),
-                        None => return, // No history - no-op
+                    // No focused scratchpad - use last from current tab's focus history
+                    match self.get_last_focused_scratchpad_on_current_tab() {
+                        Some(last) => {
+                            eprintln!("[DEBUG]   using last focused: {}", last);
+                            last
+                        }
+                        None => {
+                            eprintln!("[DEBUG]   no history, returning");
+                            return; // No history - no-op
+                        }
                     }
                 }
             }
         };
 
+        eprintln!("[DEBUG]   target_name={}", target_name);
+
         // Check if configured
         if !self.scratchpad_configs.contains_key(&target_name) {
+            eprintln!("[DEBUG]   not configured, returning");
             return; // Silent no-op for unknown scratchpad
         }
 
         // Toggle based on current visibility
-        if self.is_scratchpad_visible(&target_name) {
+        let visible = self.is_scratchpad_visible(&target_name);
+        eprintln!("[DEBUG]   visible={}, will {}", visible, if visible { "hide" } else { "show" });
+
+        if visible {
             self.handle_scratchpad_hide(&target_name);
         } else {
             self.handle_scratchpad_show(&target_name);
@@ -611,8 +862,8 @@ impl State {
             ScratchpadAction::Show { name } => self.handle_scratchpad_show(&name),
             ScratchpadAction::Hide { name } => self.handle_scratchpad_hide(&name),
             ScratchpadAction::Close { name } => self.handle_scratchpad_close(&name),
-            ScratchpadAction::RegisterTab { name, tab, pane_id } => {
-                self.handle_scratchpad_register_tab(&name, tab, pane_id)
+            ScratchpadAction::RegisterTab { name, pane_id } => {
+                self.handle_scratchpad_register_tab(&name, pane_id)
             }
             ScratchpadAction::RegisterSession { name, pane_id } => {
                 self.handle_scratchpad_register_session(&name, pane_id)
@@ -686,6 +937,8 @@ impl ZellijPlugin for State {
         match event {
             Event::PaneUpdate(pane_manifest) => {
                 self.pane_manifest = pane_manifest.panes;
+                // Update stable tab mapping FIRST, before other operations
+                self.update_stable_tab_mapping();
                 self.close_exited_scratchpads();
                 self.cleanup_closed_scratchpads();
                 true
@@ -693,7 +946,7 @@ impl ZellijPlugin for State {
             Event::TabUpdate(tab_infos) => {
                 // Find the active tab
                 if let Some(active_tab) = tab_infos.iter().find(|t| t.active) {
-                    self.current_tab = active_tab.position;
+                    self.current_tab_position = active_tab.position;
                 }
                 false // No UI update needed
             }
