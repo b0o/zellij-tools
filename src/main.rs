@@ -95,7 +95,11 @@ impl std::fmt::Display for ParseError {
             ParseError::UnknownEvent(event) => write!(f, "Unknown event: {}", event),
             ParseError::InvalidArgs(msg) => write!(f, "Invalid arguments: {}", msg),
             ParseError::InvalidScratchpadName(name) => {
-                write!(f, "Invalid scratchpad name '{}': must match [a-zA-Z0-9_-]+", name)
+                write!(
+                    f,
+                    "Invalid scratchpad name '{}': must match [a-zA-Z0-9_-]+",
+                    name
+                )
             }
         }
     }
@@ -173,7 +177,9 @@ impl State {
                 // Format: register::session::<name>::<pane_id>
                 // Format: register::tab::<name>::<pane_id>
                 let scope = args.get(1).ok_or_else(|| {
-                    ParseError::InvalidArgs("register requires a scope (session or tab)".to_string())
+                    ParseError::InvalidArgs(
+                        "register requires a scope (session or tab)".to_string(),
+                    )
                 })?;
 
                 match scope.as_str() {
@@ -182,10 +188,15 @@ impl State {
                             ParseError::InvalidArgs("register::session requires a name".to_string())
                         })?;
                         let pane_id_str = args.get(3).ok_or_else(|| {
-                            ParseError::InvalidArgs("register::session requires a pane_id".to_string())
+                            ParseError::InvalidArgs(
+                                "register::session requires a pane_id".to_string(),
+                            )
                         })?;
                         let pane_id = pane_id_str.parse::<u32>().map_err(|e| {
-                            ParseError::InvalidArgs(format!("Invalid pane_id '{}': {}", pane_id_str, e))
+                            ParseError::InvalidArgs(format!(
+                                "Invalid pane_id '{}': {}",
+                                pane_id_str, e
+                            ))
                         })?;
                         if !is_valid_scratchpad_name(name) {
                             return Err(ParseError::InvalidScratchpadName(name.clone()));
@@ -203,7 +214,10 @@ impl State {
                             ParseError::InvalidArgs("register::tab requires a pane_id".to_string())
                         })?;
                         let pane_id = pane_id_str.parse::<u32>().map_err(|e| {
-                            ParseError::InvalidArgs(format!("Invalid pane_id '{}': {}", pane_id_str, e))
+                            ParseError::InvalidArgs(format!(
+                                "Invalid pane_id '{}': {}",
+                                pane_id_str, e
+                            ))
                         })?;
                         if !is_valid_scratchpad_name(name) {
                             return Err(ParseError::InvalidScratchpadName(name.clone()));
@@ -282,7 +296,11 @@ impl State {
             // Find tabs that don't have a stable ID yet
             for (&tab_position, panes) in &self.pane_manifest {
                 // Skip if this position already has a stable ID
-                if self.stable_tab_to_position.values().any(|&pos| pos == tab_position) {
+                if self
+                    .stable_tab_to_position
+                    .values()
+                    .any(|&pos| pos == tab_position)
+                {
                     continue;
                 }
 
@@ -305,7 +323,11 @@ impl State {
         // Finally, assign new stable IDs to any tabs that still don't have one
         for (&tab_position, panes) in &self.pane_manifest {
             // Skip if this position already has a stable ID
-            if self.stable_tab_to_position.values().any(|&pos| pos == tab_position) {
+            if self
+                .stable_tab_to_position
+                .values()
+                .any(|&pos| pos == tab_position)
+            {
                 continue;
             }
 
@@ -448,12 +470,18 @@ impl State {
         // Priority 1: visible floating
         self.pane_manifest
             .iter()
-            .find(|(_, panes)| panes.iter().any(|p| p.id == pane_id && p.is_floating && !p.is_suppressed))
+            .find(|(_, panes)| {
+                panes
+                    .iter()
+                    .any(|p| p.id == pane_id && p.is_floating && !p.is_suppressed)
+            })
             .or_else(|| {
                 // Priority 2: suppressed floating
-                self.pane_manifest
-                    .iter()
-                    .find(|(_, panes)| panes.iter().any(|p| p.id == pane_id && p.is_floating && p.is_suppressed))
+                self.pane_manifest.iter().find(|(_, panes)| {
+                    panes
+                        .iter()
+                        .any(|p| p.id == pane_id && p.is_floating && p.is_suppressed)
+                })
             })
             .or_else(|| {
                 // Priority 3: suppressed (hidden pane, even if not floating)
@@ -515,7 +543,9 @@ impl State {
             .get(&self.current_tab_position)
             .into_iter()
             .flatten()
-            .any(|p| p.id == pane_id && p.is_floating && !p.is_suppressed && !p.exited && !p.is_held)
+            .any(|p| {
+                p.id == pane_id && p.is_floating && !p.is_suppressed && !p.exited && !p.is_held
+            })
     }
 
     fn is_scratchpad_focused(&self, name: &str) -> bool {
@@ -700,7 +730,11 @@ impl State {
             let target_has_ghost = self
                 .pane_manifest
                 .get(&self.current_tab_position)
-                .map(|panes| panes.iter().any(|p| p.id == pane_id && !p.is_floating && !p.is_suppressed))
+                .map(|panes| {
+                    panes
+                        .iter()
+                        .any(|p| p.id == pane_id && !p.is_floating && !p.is_suppressed)
+                })
                 .unwrap_or(false);
 
             if target_has_ghost {
@@ -713,7 +747,11 @@ impl State {
             // Show the pane (unsuppresses as floating, but switches us to its tab)
             show_pane_with_id(PaneId::Terminal(pane_id), true);
             // Move the pane to current tab AND switch focus back to current tab
-            break_panes_to_tab_with_index(&[PaneId::Terminal(pane_id)], self.current_tab_position, true);
+            break_panes_to_tab_with_index(
+                &[PaneId::Terminal(pane_id)],
+                self.current_tab_position,
+                false,
+            );
             // Toggle to floating (in case it became tiled during move)
             toggle_pane_embed_or_eject_for_pane_id(PaneId::Terminal(pane_id));
             // Show the pane
@@ -848,7 +886,8 @@ impl State {
 
     fn handle_scratchpad_register_session(&mut self, name: &str, pane_id: u32) {
         self.session_pending_registrations.remove(name);
-        self.session_scratchpad_panes.insert(name.to_string(), pane_id);
+        self.session_scratchpad_panes
+            .insert(name.to_string(), pane_id);
 
         // Track that we just showed this pane (newly spawned panes are focused)
         self.just_shown_scratchpad = Some(pane_id);
@@ -956,6 +995,8 @@ impl State {
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
+        eprintln!("load: {:?}", configuration);
+
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -971,10 +1012,7 @@ impl ZellijPlugin for State {
                     // Validate all scratchpad names
                     for name in configs.keys() {
                         if !is_valid_scratchpad_name(name) {
-                            eprintln!(
-                                "Warning: Invalid scratchpad name '{}', skipping",
-                                name
-                            );
+                            eprintln!("Warning: Invalid scratchpad name '{}', skipping", name);
                         }
                     }
                     self.scratchpad_configs = configs
@@ -992,6 +1030,7 @@ impl ZellijPlugin for State {
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::PaneUpdate(pane_manifest) => {
+                eprintln!("PaneUpdate: {:?}", pane_manifest);
                 self.pane_manifest = pane_manifest.panes;
 
                 // Clear the "just shown" tracking since we now have fresh state
@@ -1002,18 +1041,20 @@ impl ZellijPlugin for State {
                 self.update_focused_scratchpad_tracking();
                 self.close_exited_scratchpads();
                 self.cleanup_closed_scratchpads();
-                true
             }
             Event::TabUpdate(tab_infos) => {
+                eprintln!("TabUpdate: {:?}", tab_infos);
                 // Find the active tab and update state
                 if let Some(active_tab) = tab_infos.iter().find(|t| t.active) {
                     self.current_tab_position = active_tab.position;
                     self.are_floating_panes_visible = active_tab.are_floating_panes_visible;
+                } else {
+                    eprintln!("Warning: No active tab found");
                 }
-                false // No UI update needed
             }
-            _ => false,
-        }
+            _ => (),
+        };
+        false
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
