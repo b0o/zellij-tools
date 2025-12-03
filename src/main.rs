@@ -752,8 +752,6 @@ impl State {
                 self.current_tab_position,
                 false,
             );
-            // Toggle to floating (in case it became tiled during move)
-            toggle_pane_embed_or_eject_for_pane_id(PaneId::Terminal(pane_id));
             // Show the pane
             self.show_scratchpad_pane_session(name, pane_id);
             return;
