@@ -5,3 +5,6 @@ build:
 
 build-release:
     cargo build --release --target={{target}}
+
+fmt:
+    dprint fmt
