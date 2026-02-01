@@ -1,7 +1,8 @@
 mod config;
 
 pub use config::{
-    is_valid_scratchpad_name, parse_scratchpad_action, ScratchpadAction, ScratchpadConfig,
+    is_valid_scratchpad_name, parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadAction,
+    ScratchpadConfig,
 };
 
 use std::collections::{HashMap, HashSet};
