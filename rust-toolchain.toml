@@ -1,3 +1,10 @@
 [toolchain]
-channel = "1.84.0"
-targets = [ "wasm32-wasi" ]
+channel = "stable"
+components = [
+  "clippy",
+  "llvm-tools-preview",
+  "rust-analyzer",
+  "rust-src",
+  "rustfmt",
+]
+targets = ["wasm32-wasip1"]
