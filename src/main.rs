@@ -4,8 +4,8 @@ use zellij_tile::prelude::*;
 
 use zellij_tools::message::{parse_message, ParseError};
 use zellij_tools::scratchpad::{
-    is_valid_scratchpad_name, parse_scratchpad_action, ScratchpadCommand, ScratchpadConfig,
-    ScratchpadContext, ScratchpadManager,
+    parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadCommand, ScratchpadContext,
+    ScratchpadManager,
 };
 use zellij_tools::stable_tabs::StableTabTracker;
 
@@ -109,21 +109,11 @@ impl ZellijPlugin for State {
 
         subscribe(&[EventType::PaneUpdate, EventType::TabUpdate]);
 
-        // Parse scratchpad configuration from JSON
-        if let Some(scratchpads_json) = configuration.get("scratchpads") {
-            match serde_json::from_str::<HashMap<String, ScratchpadConfig>>(scratchpads_json) {
+        // Parse scratchpad configuration from KDL
+        if let Some(scratchpads_kdl) = configuration.get("scratchpads") {
+            match parse_scratchpads_kdl(scratchpads_kdl) {
                 Ok(configs) => {
-                    // Validate and filter scratchpad names
-                    for name in configs.keys() {
-                        if !is_valid_scratchpad_name(name) {
-                            eprintln!("Warning: Invalid scratchpad name '{}', skipping", name);
-                        }
-                    }
-                    let valid_configs: HashMap<String, ScratchpadConfig> = configs
-                        .into_iter()
-                        .filter(|(name, _)| is_valid_scratchpad_name(name))
-                        .collect();
-                    self.scratchpad = Some(ScratchpadManager::new(valid_configs));
+                    self.scratchpad = Some(ScratchpadManager::new(configs));
                 }
                 Err(e) => {
                     eprintln!("Failed to parse scratchpads config: {}", e);

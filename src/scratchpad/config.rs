@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 use crate::message::ParseError;
@@ -91,6 +93,47 @@ pub fn parse_scratchpad_action(args: &[String]) -> Result<ScratchpadAction, Pars
             action
         ))),
     }
+}
+
+/// Parse scratchpad configurations from KDL format
+pub fn parse_scratchpads_kdl(input: &str) -> Result<HashMap<String, ScratchpadConfig>, String> {
+    use kdl::KdlDocument;
+
+    let doc: KdlDocument = input
+        .parse()
+        .map_err(|e| format!("KDL parse error: {}", e))?;
+
+    let mut configs = HashMap::new();
+
+    for node in doc.nodes() {
+        let name = node.name().value().to_string();
+
+        if !is_valid_scratchpad_name(&name) {
+            return Err(format!("Invalid scratchpad name: '{}'", name));
+        }
+
+        // Look for command child node
+        let command = node
+            .children()
+            .and_then(|c| c.get("command"))
+            .map(|cmd_node| {
+                cmd_node
+                    .entries()
+                    .iter()
+                    .filter_map(|e| e.value().as_string())
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if command.is_empty() {
+            return Err(format!("Scratchpad '{}' has no command", name));
+        }
+
+        configs.insert(name, ScratchpadConfig { command });
+    }
+
+    Ok(configs)
 }
 
 #[cfg(test)]
@@ -212,5 +255,46 @@ mod tests {
     fn parse_unknown_action() {
         let result = parse_scratchpad_action(&args(&["unknown"]));
         assert!(matches!(result, Err(ParseError::InvalidArgs(_))));
+    }
+
+    // parse_scratchpads_kdl tests
+    #[test]
+    fn parse_kdl_single_scratchpad() {
+        let input = r#"term { command "nu"; }"#;
+        let configs = parse_scratchpads_kdl(input).unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs["term"].command, vec!["nu"]);
+    }
+
+    #[test]
+    fn parse_kdl_multi_arg_command() {
+        let input = r#"claude { command "direnv" "exec" "." "claude-bun"; }"#;
+        let configs = parse_scratchpads_kdl(input).unwrap();
+        assert_eq!(
+            configs["claude"].command,
+            vec!["direnv", "exec", ".", "claude-bun"]
+        );
+    }
+
+    #[test]
+    fn parse_kdl_multiple_scratchpads() {
+        let input = r#"
+            term { command "nu"; }
+            htop { command "htop"; }
+        "#;
+        let configs = parse_scratchpads_kdl(input).unwrap();
+        assert_eq!(configs.len(), 2);
+    }
+
+    #[test]
+    fn parse_kdl_error_on_missing_command() {
+        let input = r#"term { }"#;
+        assert!(parse_scratchpads_kdl(input).is_err());
+    }
+
+    #[test]
+    fn parse_kdl_error_on_invalid_name() {
+        let input = r#"my pad { command "nu"; }"#;
+        assert!(parse_scratchpads_kdl(input).is_err());
     }
 }
