@@ -53,6 +53,9 @@
           buildInputs = [
             rust
             pkgs.just
+            pkgs.curl
+            pkgs.pkg-config
+            pkgs.openssl
           ];
         };
 

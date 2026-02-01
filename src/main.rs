@@ -1,17 +1,13 @@
-mod message;
-mod scratchpad;
-mod stable_tabs;
-
 use std::collections::{BTreeMap, HashMap};
 
 use zellij_tile::prelude::*;
 
-use message::{parse_message, ParseError};
-use scratchpad::{
+use zellij_tools::message::{parse_message, ParseError};
+use zellij_tools::scratchpad::{
     is_valid_scratchpad_name, parse_scratchpad_action, ScratchpadCommand, ScratchpadConfig,
     ScratchpadContext, ScratchpadManager,
 };
-use stable_tabs::StableTabTracker;
+use zellij_tools::stable_tabs::StableTabTracker;
 
 #[derive(Default)]
 struct State {

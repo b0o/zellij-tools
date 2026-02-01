@@ -470,3 +470,309 @@ impl ScratchpadManager {
         commands
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_pane(id: u32, is_floating: bool, is_focused: bool) -> PaneInfo {
+        PaneInfo {
+            id,
+            is_floating,
+            is_focused,
+            ..Default::default()
+        }
+    }
+
+    fn make_floating_pane(id: u32, is_focused: bool) -> PaneInfo {
+        make_pane(id, true, is_focused)
+    }
+
+    fn make_config(cmd: &str) -> ScratchpadConfig {
+        ScratchpadConfig {
+            command: vec![cmd.to_string()],
+        }
+    }
+
+    fn make_configs(names: &[&str]) -> HashMap<String, ScratchpadConfig> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), make_config("bash")))
+            .collect()
+    }
+
+    fn make_context<'a>(
+        pane_manifest: &'a HashMap<usize, Vec<PaneInfo>>,
+        current_tab: usize,
+        stable_tab_id: Option<StableTabId>,
+        floating_visible: bool,
+        stable_tab_to_position: &'a HashMap<StableTabId, usize>,
+    ) -> ScratchpadContext<'a> {
+        ScratchpadContext {
+            pane_manifest,
+            current_tab_position: current_tab,
+            current_stable_tab_id: stable_tab_id,
+            are_floating_panes_visible: floating_visible,
+            stable_tab_to_position,
+        }
+    }
+
+    #[test]
+    fn show_unconfigured_scratchpad_is_noop() {
+        let mut manager = ScratchpadManager::new(HashMap::new());
+        let manifest = HashMap::new();
+        let positions = HashMap::new();
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Show {
+                name: "unknown".to_string(),
+            },
+            &ctx,
+        );
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn show_new_scratchpad_opens_floating() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+        let manifest = HashMap::new();
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Show {
+                name: "term".to_string(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            ScratchpadCommand::OpenFloating { .. }
+        ));
+    }
+
+    #[test]
+    fn show_existing_scratchpad_shows_pane() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        // Register the scratchpad first
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+
+        // Now show it
+        let commands = manager.handle_action(
+            ScratchpadAction::Show {
+                name: "term".to_string(),
+            },
+            &ctx,
+        );
+
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, ScratchpadCommand::ShowPane { pane_id: 42 })));
+    }
+
+    #[test]
+    fn hide_scratchpad_hides_pane() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Hide {
+                name: "term".to_string(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            ScratchpadCommand::HidePane { pane_id: 42 }
+        ));
+    }
+
+    #[test]
+    fn close_scratchpad_closes_pane() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Close {
+                name: "term".to_string(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            ScratchpadCommand::ClosePane { pane_id: 42 }
+        ));
+    }
+
+    #[test]
+    fn toggle_hidden_scratchpad_shows_it() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        // Register with suppressed (hidden) pane
+        let mut manifest = HashMap::new();
+        let mut pane = make_floating_pane(42, false);
+        pane.is_suppressed = true;
+        manifest.insert(0, vec![pane]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+        manager.clear_just_shown(); // Simulate PaneUpdate
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Toggle {
+                name: Some("term".to_string()),
+            },
+            &ctx,
+        );
+
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, ScratchpadCommand::ShowPane { pane_id: 42 })));
+    }
+
+    #[test]
+    fn toggle_visible_focused_scratchpad_hides_it() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Toggle {
+                name: Some("term".to_string()),
+            },
+            &ctx,
+        );
+
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, ScratchpadCommand::HidePane { pane_id: 42 })));
+    }
+
+    #[test]
+    fn on_pane_update_closes_exited_scratchpads() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        // Register scratchpad
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+
+        // Pane has exited
+        let mut exited_pane = make_floating_pane(42, false);
+        exited_pane.exited = true;
+        manifest.insert(0, vec![exited_pane]);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        let commands = manager.on_pane_update(&ctx, &HashSet::new());
+
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, ScratchpadCommand::ClosePane { pane_id: 42 })));
+    }
+
+    #[test]
+    fn on_pane_update_closes_orphaned_tab_scratchpads() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+
+        // Tab 0 is now orphaned
+        let mut orphaned = HashSet::new();
+        orphaned.insert(0);
+
+        let commands = manager.on_pane_update(&ctx, &orphaned);
+
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, ScratchpadCommand::ClosePane { pane_id: 42 })));
+    }
+}

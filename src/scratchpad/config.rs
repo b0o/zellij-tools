@@ -92,3 +92,125 @@ pub fn parse_scratchpad_action(args: &[String]) -> Result<ScratchpadAction, Pars
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // is_valid_scratchpad_name tests
+    #[test]
+    fn valid_name_alphanumeric() {
+        assert!(is_valid_scratchpad_name("terminal1"));
+    }
+
+    #[test]
+    fn valid_name_with_underscore() {
+        assert!(is_valid_scratchpad_name("my_scratchpad"));
+    }
+
+    #[test]
+    fn valid_name_with_hyphen() {
+        assert!(is_valid_scratchpad_name("my-scratchpad"));
+    }
+
+    #[test]
+    fn invalid_name_empty() {
+        assert!(!is_valid_scratchpad_name(""));
+    }
+
+    #[test]
+    fn invalid_name_with_space() {
+        assert!(!is_valid_scratchpad_name("my pad"));
+    }
+
+    #[test]
+    fn invalid_name_with_special_chars() {
+        assert!(!is_valid_scratchpad_name("my@pad"));
+    }
+
+    // parse_scratchpad_action tests
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_toggle_no_name() {
+        let action = parse_scratchpad_action(&args(&["toggle"])).unwrap();
+        assert!(matches!(action, ScratchpadAction::Toggle { name: None }));
+    }
+
+    #[test]
+    fn parse_toggle_with_name() {
+        let action = parse_scratchpad_action(&args(&["toggle", "mypad"])).unwrap();
+        assert!(matches!(
+            action,
+            ScratchpadAction::Toggle { name: Some(n) } if n == "mypad"
+        ));
+    }
+
+    #[test]
+    fn parse_show() {
+        let action = parse_scratchpad_action(&args(&["show", "mypad"])).unwrap();
+        assert!(matches!(
+            action,
+            ScratchpadAction::Show { name } if name == "mypad"
+        ));
+    }
+
+    #[test]
+    fn parse_show_missing_name() {
+        let result = parse_scratchpad_action(&args(&["show"]));
+        assert!(matches!(result, Err(ParseError::InvalidArgs(_))));
+    }
+
+    #[test]
+    fn parse_hide() {
+        let action = parse_scratchpad_action(&args(&["hide", "mypad"])).unwrap();
+        assert!(matches!(
+            action,
+            ScratchpadAction::Hide { name } if name == "mypad"
+        ));
+    }
+
+    #[test]
+    fn parse_close() {
+        let action = parse_scratchpad_action(&args(&["close", "mypad"])).unwrap();
+        assert!(matches!(
+            action,
+            ScratchpadAction::Close { name } if name == "mypad"
+        ));
+    }
+
+    #[test]
+    fn parse_register() {
+        let action = parse_scratchpad_action(&args(&["register", "mypad", "42"])).unwrap();
+        assert!(matches!(
+            action,
+            ScratchpadAction::Register { name, pane_id } if name == "mypad" && pane_id == 42
+        ));
+    }
+
+    #[test]
+    fn parse_register_missing_pane_id() {
+        let result = parse_scratchpad_action(&args(&["register", "mypad"]));
+        assert!(matches!(result, Err(ParseError::InvalidArgs(_))));
+    }
+
+    #[test]
+    fn parse_register_invalid_pane_id() {
+        let result = parse_scratchpad_action(&args(&["register", "mypad", "notanumber"]));
+        assert!(matches!(result, Err(ParseError::InvalidArgs(_))));
+    }
+
+    #[test]
+    fn parse_invalid_name() {
+        let result = parse_scratchpad_action(&args(&["show", "my pad"]));
+        assert!(matches!(result, Err(ParseError::InvalidScratchpadName(_))));
+    }
+
+    #[test]
+    fn parse_unknown_action() {
+        let result = parse_scratchpad_action(&args(&["unknown"]));
+        assert!(matches!(result, Err(ParseError::InvalidArgs(_))));
+    }
+}
