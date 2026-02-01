@@ -58,3 +58,47 @@ pub fn parse_message(payload: &str) -> Result<Message, ParseError> {
         args,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_message_with_no_args() {
+        let msg = parse_message("zellij-tools::focus-pane").unwrap();
+        assert_eq!(msg.event, "focus-pane");
+        assert!(msg.args.is_empty());
+    }
+
+    #[test]
+    fn parse_message_with_one_arg() {
+        let msg = parse_message("zellij-tools::scratchpad::toggle").unwrap();
+        assert_eq!(msg.event, "scratchpad");
+        assert_eq!(msg.args, vec!["toggle"]);
+    }
+
+    #[test]
+    fn parse_message_with_multiple_args() {
+        let msg = parse_message("zellij-tools::scratchpad::register::mypad::123").unwrap();
+        assert_eq!(msg.event, "scratchpad");
+        assert_eq!(msg.args, vec!["register", "mypad", "123"]);
+    }
+
+    #[test]
+    fn parse_message_wrong_plugin() {
+        let result = parse_message("other-plugin::event");
+        assert!(matches!(result, Err(ParseError::WrongPlugin)));
+    }
+
+    #[test]
+    fn parse_message_invalid_format_no_event() {
+        let result = parse_message("zellij-tools");
+        assert!(matches!(result, Err(ParseError::InvalidFormat)));
+    }
+
+    #[test]
+    fn parse_message_invalid_format_empty() {
+        let result = parse_message("");
+        assert!(matches!(result, Err(ParseError::InvalidFormat)));
+    }
+}

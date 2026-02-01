@@ -144,3 +144,127 @@ impl StableTabTracker {
         orphaned
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_pane(id: u32, is_floating: bool, is_plugin: bool) -> PaneInfo {
+        PaneInfo {
+            id,
+            is_floating,
+            is_plugin,
+            ..Default::default()
+        }
+    }
+
+    fn make_tiled_pane(id: u32) -> PaneInfo {
+        make_pane(id, false, false)
+    }
+
+    fn make_floating_pane(id: u32) -> PaneInfo {
+        make_pane(id, true, false)
+    }
+
+    #[test]
+    fn new_tab_gets_stable_id() {
+        let mut tracker = StableTabTracker::default();
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_tiled_pane(100)]);
+
+        let orphaned = tracker.update(&manifest);
+
+        assert!(orphaned.is_empty());
+        assert_eq!(tracker.get_stable_id(0), Some(0));
+    }
+
+    #[test]
+    fn multiple_tabs_get_different_ids() {
+        let mut tracker = StableTabTracker::default();
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_tiled_pane(100)]);
+        manifest.insert(1, vec![make_tiled_pane(200)]);
+
+        tracker.update(&manifest);
+
+        let id0 = tracker.get_stable_id(0);
+        let id1 = tracker.get_stable_id(1);
+        assert!(id0.is_some());
+        assert!(id1.is_some());
+        assert_ne!(id0, id1);
+    }
+
+    #[test]
+    fn stable_id_follows_pane_when_tabs_reorder() {
+        let mut tracker = StableTabTracker::default();
+
+        // Initial: tab 0 has pane 100, tab 1 has pane 200
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_tiled_pane(100)]);
+        manifest.insert(1, vec![make_tiled_pane(200)]);
+        tracker.update(&manifest);
+
+        let original_id_for_pane100 = tracker.get_stable_id(0).unwrap();
+
+        // Tabs reordered: pane 100 now at position 1, pane 200 at position 0
+        manifest.clear();
+        manifest.insert(0, vec![make_tiled_pane(200)]);
+        manifest.insert(1, vec![make_tiled_pane(100)]);
+        tracker.update(&manifest);
+
+        // Stable ID should follow the pane, not the position
+        assert_eq!(tracker.get_stable_id(1), Some(original_id_for_pane100));
+    }
+
+    #[test]
+    fn floating_panes_ignored_for_reference() {
+        let mut tracker = StableTabTracker::default();
+        let mut manifest = HashMap::new();
+        // Tab with only floating panes should not get a stable ID
+        manifest.insert(0, vec![make_floating_pane(100)]);
+
+        tracker.update(&manifest);
+
+        assert_eq!(tracker.get_stable_id(0), None);
+    }
+
+    #[test]
+    fn tab_closed_returns_orphaned_id() {
+        let mut tracker = StableTabTracker::default();
+
+        // Two tabs
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_tiled_pane(100)]);
+        manifest.insert(1, vec![make_tiled_pane(200)]);
+        tracker.update(&manifest);
+
+        let id_for_tab1 = tracker.get_stable_id(1).unwrap();
+
+        // Close tab 1 (remove pane 200)
+        manifest.remove(&1);
+        let orphaned = tracker.update(&manifest);
+
+        assert!(orphaned.contains(&id_for_tab1));
+    }
+
+    #[test]
+    fn reference_pane_closed_picks_new_reference() {
+        let mut tracker = StableTabTracker::default();
+
+        // Tab with two tiled panes
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_tiled_pane(100), make_tiled_pane(101)]);
+        tracker.update(&manifest);
+
+        let original_stable_id = tracker.get_stable_id(0).unwrap();
+
+        // Close the reference pane (100), but 101 remains
+        manifest.insert(0, vec![make_tiled_pane(101)]);
+        let orphaned = tracker.update(&manifest);
+
+        // Should not be orphaned - picked new reference
+        assert!(orphaned.is_empty());
+        // Same stable ID for the tab
+        assert_eq!(tracker.get_stable_id(0), Some(original_stable_id));
+    }
+}
