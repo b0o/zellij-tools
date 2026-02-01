@@ -4,8 +4,8 @@ use zellij_tile::prelude::*;
 
 use zellij_tools::message::{parse_message, ParseError};
 use zellij_tools::scratchpad::{
-    parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadCommand, ScratchpadContext,
-    ScratchpadManager,
+    delete_state_file, load_state, parse_scratchpad_action, parse_scratchpads_kdl, save_state,
+    ScratchpadCommand, ScratchpadContext, ScratchpadManager,
 };
 use zellij_tools::stable_tabs::StableTabTracker;
 
@@ -107,13 +107,34 @@ impl ZellijPlugin for State {
             PermissionType::RunCommands,
         ]);
 
-        subscribe(&[EventType::PaneUpdate, EventType::TabUpdate]);
+        subscribe(&[
+            EventType::PaneUpdate,
+            EventType::TabUpdate,
+            EventType::ConfigWasWrittenToDisk,
+        ]);
+
+        // Try to restore state from previous session
+        let ids = get_plugin_ids();
+        let restored_state = load_state(ids.zellij_pid);
+        delete_state_file(ids.zellij_pid);
 
         // Parse scratchpad configuration from KDL
         if let Some(scratchpads_kdl) = configuration.get("scratchpads") {
             match parse_scratchpads_kdl(scratchpads_kdl) {
                 Ok(configs) => {
-                    self.scratchpad = Some(ScratchpadManager::new(configs));
+                    let mut manager = ScratchpadManager::new(configs);
+
+                    // Restore state from previous session if available
+                    if let Some(state) = restored_state {
+                        eprintln!("Restoring scratchpad state from previous session");
+                        let commands = manager.restore_state(state);
+                        // Execute commands to show orphaned panes
+                        self.scratchpad = Some(manager);
+                        self.execute_scratchpad_commands(commands);
+                        return;
+                    }
+
+                    self.scratchpad = Some(manager);
                 }
                 Err(e) => {
                     eprintln!("Failed to parse scratchpads config: {}", e);
@@ -147,6 +168,20 @@ impl ZellijPlugin for State {
                     self.are_floating_panes_visible = active_tab.are_floating_panes_visible;
                 } else {
                     eprintln!("Warning: No active tab found");
+                }
+            }
+            Event::ConfigWasWrittenToDisk => {
+                eprintln!("ConfigWasWrittenToDisk: saving state and reloading plugin");
+                if let Some(ref scratchpad) = self.scratchpad {
+                    let state = scratchpad.persisted_state();
+                    let ids = get_plugin_ids();
+                    if let Err(e) = save_state(&state, ids.zellij_pid) {
+                        eprintln!("Failed to save state: {}", e);
+                    }
+                    reload_plugin_with_id(ids.plugin_id);
+                } else {
+                    // No scratchpad manager, just reload
+                    reload_plugin_with_id(get_plugin_ids().plugin_id);
                 }
             }
             _ => (),

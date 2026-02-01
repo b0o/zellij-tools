@@ -1,9 +1,11 @@
 mod config;
+mod persistence;
 
 pub use config::{
     is_valid_scratchpad_name, parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadAction,
     ScratchpadConfig,
 };
+pub use persistence::{delete_state_file, load_state, save_state, PersistedState};
 
 use std::collections::{HashMap, HashSet};
 use zellij_tile::prelude::{CommandToRun, PaneInfo};
@@ -47,6 +49,8 @@ pub struct ScratchpadManager {
     focus_times: HashMap<(String, StableTabId), u64>,
     /// Track scratchpad we just showed (for focus detection before PaneUpdate)
     just_shown: Option<u32>,
+    /// Scratchpads that were removed from config but still have active panes
+    orphaned: HashSet<(String, StableTabId)>,
 }
 
 impl ScratchpadManager {
@@ -58,12 +62,118 @@ impl ScratchpadManager {
             focus_counter: 0,
             focus_times: HashMap::new(),
             just_shown: None,
+            orphaned: HashSet::new(),
         }
     }
 
     /// Clear the "just shown" tracking (call on PaneUpdate)
     pub fn clear_just_shown(&mut self) {
         self.just_shown = None;
+    }
+
+    /// Reconcile state with new configuration after a config reload.
+    /// Returns commands to show orphaned panes.
+    pub fn reconcile_config(
+        &mut self,
+        new_configs: HashMap<String, ScratchpadConfig>,
+    ) -> Vec<ScratchpadCommand> {
+        let mut commands = Vec::new();
+
+        // Find scratchpads that were removed from config but have active panes
+        let removed_names: HashSet<&String> = self
+            .configs
+            .keys()
+            .filter(|name| !new_configs.contains_key(*name))
+            .collect();
+
+        for ((name, stable_id), &pane_id) in &self.panes {
+            if removed_names.contains(name) {
+                let key = (name.clone(), *stable_id);
+                if !self.orphaned.contains(&key) {
+                    // Show the pane so user can see it
+                    commands.push(ScratchpadCommand::ShowPane { pane_id });
+                    self.orphaned.insert(key);
+                    eprintln!(
+                        "Scratchpad '{}' removed from config but has active panes",
+                        name
+                    );
+                }
+            }
+        }
+
+        // Un-orphan scratchpads that were re-added to config
+        let readded: Vec<(String, StableTabId)> = self
+            .orphaned
+            .iter()
+            .filter(|(name, _)| new_configs.contains_key(name))
+            .cloned()
+            .collect();
+
+        for key in readded {
+            self.orphaned.remove(&key);
+            eprintln!(
+                "Scratchpad '{}' re-added to config, resuming management",
+                key.0
+            );
+        }
+
+        self.configs = new_configs;
+        commands
+    }
+
+    /// Check if a scratchpad is orphaned (removed from config but has active panes)
+    fn is_orphaned(&self, name: &str, stable_tab_id: StableTabId) -> bool {
+        self.orphaned.contains(&(name.to_string(), stable_tab_id))
+    }
+
+    /// Extract state that should be persisted across reloads.
+    pub fn persisted_state(&self) -> PersistedState {
+        PersistedState {
+            panes: self
+                .panes
+                .iter()
+                .map(|((name, stable_id), &pane_id)| ((name.clone(), *stable_id), pane_id))
+                .collect(),
+            focus_times: self
+                .focus_times
+                .iter()
+                .map(|((name, stable_id), &time)| ((name.clone(), *stable_id), time))
+                .collect(),
+            focus_counter: self.focus_counter,
+        }
+    }
+
+    /// Restore state from a previous session.
+    /// Returns commands to show orphaned panes (panes whose scratchpad names are not in current config).
+    pub fn restore_state(&mut self, state: PersistedState) -> Vec<ScratchpadCommand> {
+        self.panes = state
+            .panes
+            .into_iter()
+            .map(|((name, stable_id), pane_id)| ((name, stable_id), pane_id))
+            .collect();
+        self.focus_times = state
+            .focus_times
+            .into_iter()
+            .map(|((name, stable_id), time)| ((name, stable_id), time))
+            .collect();
+        self.focus_counter = state.focus_counter;
+
+        // Detect orphaned scratchpads - panes whose names aren't in current config
+        let mut commands = Vec::new();
+        for ((name, stable_id), &pane_id) in &self.panes {
+            if !self.configs.contains_key(name) {
+                let key = (name.clone(), *stable_id);
+                if !self.orphaned.contains(&key) {
+                    commands.push(ScratchpadCommand::ShowPane { pane_id });
+                    self.orphaned.insert(key);
+                    eprintln!(
+                        "Scratchpad '{}' removed from config but has active panes",
+                        name
+                    );
+                }
+            }
+        }
+        commands
     }
 
     /// Handle a scratchpad action, returns commands to execute
@@ -136,6 +246,13 @@ impl ScratchpadManager {
             return Vec::new();
         }
 
+        // No-op for orphaned scratchpads
+        if let Some(stable_tab_id) = ctx.current_stable_tab_id {
+            if self.is_orphaned(&target_name, stable_tab_id) {
+                return Vec::new();
+            }
+        }
+
         let visible = self.is_visible(&target_name, ctx);
         let focused = self.is_focused(&target_name, ctx);
 
@@ -156,6 +273,11 @@ impl ScratchpadManager {
             return Vec::new();
         };
 
+        // No-op for orphaned scratchpads
+        if self.is_orphaned(name, stable_tab_id) {
+            return Vec::new();
+        }
+
         let existing_pane_id = self.get_pane(name, ctx);
 
         if existing_pane_id.is_none() {
@@ -174,6 +296,13 @@ impl ScratchpadManager {
     }
 
     fn handle_hide(&mut self, name: &str, ctx: &ScratchpadContext) -> Vec<ScratchpadCommand> {
+        // No-op for orphaned scratchpads
+        if let Some(stable_tab_id) = ctx.current_stable_tab_id {
+            if self.is_orphaned(name, stable_tab_id) {
+                return Vec::new();
+            }
+        }
+
         if let Some(pane_id) = self.get_pane(name, ctx) {
             vec![ScratchpadCommand::HidePane { pane_id }]
         } else {
@@ -430,6 +559,7 @@ impl ScratchpadManager {
             commands.push(ScratchpadCommand::ClosePane { pane_id });
             self.panes.remove(&key);
             self.focus_times.remove(&key);
+            self.orphaned.remove(&key);
         }
         commands
     }
@@ -448,6 +578,7 @@ impl ScratchpadManager {
         for key in closed_keys {
             self.panes.remove(&key);
             self.focus_times.remove(&key);
+            self.orphaned.remove(&key);
         }
     }
 
@@ -455,7 +586,7 @@ impl ScratchpadManager {
         &mut self,
         orphaned_tabs: &HashSet<StableTabId>,
     ) -> Vec<ScratchpadCommand> {
-        let orphaned: Vec<((String, StableTabId), u32)> = self
+        let orphaned_tab_panes: Vec<((String, StableTabId), u32)> = self
             .panes
             .iter()
             .filter(|((_, stable_id), _)| orphaned_tabs.contains(stable_id))
@@ -463,10 +594,12 @@ impl ScratchpadManager {
             .collect();
 
         let mut commands = Vec::new();
-        for ((name, stable_id), pane_id) in orphaned {
+        for ((name, stable_id), pane_id) in orphaned_tab_panes {
             commands.push(ScratchpadCommand::ClosePane { pane_id });
-            self.panes.remove(&(name.clone(), stable_id));
-            self.focus_times.remove(&(name, stable_id));
+            let key = (name, stable_id);
+            self.panes.remove(&key);
+            self.focus_times.remove(&key);
+            self.orphaned.remove(&key);
         }
         commands
     }
@@ -775,5 +908,161 @@ mod tests {
         assert!(commands
             .iter()
             .any(|c| matches!(c, ScratchpadCommand::ClosePane { pane_id: 42 })));
+    }
+
+    #[test]
+    fn persisted_state_roundtrip() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term", "htop"]));
+
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        manifest.insert(1, vec![make_floating_pane(99, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        positions.insert(1, 1);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        // Register two scratchpads
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+        let ctx = make_context(&manifest, 1, Some(1), true, &positions);
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "htop".to_string(),
+                pane_id: 99,
+            },
+            &ctx,
+        );
+
+        // Get persisted state
+        let state = manager.persisted_state();
+        assert_eq!(state.panes.len(), 2);
+        assert_eq!(state.focus_times.len(), 2);
+        assert!(state.focus_counter >= 2);
+
+        // Create new manager and restore
+        let mut new_manager = ScratchpadManager::new(make_configs(&["term", "htop"]));
+        let commands = new_manager.restore_state(state);
+
+        // No orphans since configs match
+        assert!(commands.is_empty());
+
+        // Verify state was restored
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+        assert!(new_manager.get_pane("term", &ctx).is_some());
+    }
+
+    #[test]
+    fn restore_state_detects_orphans() {
+        // Create a manager with only "term" config, but state has "htop" pane
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        let state = PersistedState {
+            panes: vec![
+                (("term".to_string(), 0), 42),
+                (("htop".to_string(), 0), 99), // This will be orphaned
+            ],
+            focus_times: vec![(("term".to_string(), 0), 1), (("htop".to_string(), 0), 2)],
+            focus_counter: 2,
+        };
+
+        let commands = manager.restore_state(state);
+
+        // Should have command to show orphaned htop pane
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            ScratchpadCommand::ShowPane { pane_id: 99 }
+        ));
+    }
+
+    #[test]
+    fn reconcile_config_detects_orphans() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term", "htop"]));
+
+        let mut manifest = HashMap::new();
+        manifest.insert(
+            0,
+            vec![make_floating_pane(42, true), make_floating_pane(99, false)],
+        );
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        // Register both
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "htop".to_string(),
+                pane_id: 99,
+            },
+            &ctx,
+        );
+
+        // Reconcile with config that only has "term"
+        let commands = manager.reconcile_config(make_configs(&["term"]));
+
+        // Should show htop pane since it was removed from config
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            ScratchpadCommand::ShowPane { pane_id: 99 }
+        ));
+
+        // Toggle on htop should be a no-op now
+        let commands = manager.handle_action(
+            ScratchpadAction::Toggle {
+                name: Some("htop".to_string()),
+            },
+            &ctx,
+        );
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn reconcile_config_unorphans_readded_scratchpad() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term", "htop"]));
+
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(99, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        // Register htop
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "htop".to_string(),
+                pane_id: 99,
+            },
+            &ctx,
+        );
+
+        // Remove htop from config (orphan it)
+        manager.reconcile_config(make_configs(&["term"]));
+
+        // Re-add htop to config
+        manager.reconcile_config(make_configs(&["term", "htop"]));
+
+        // Toggle on htop should work again
+        let commands = manager.handle_action(
+            ScratchpadAction::Toggle {
+                name: Some("htop".to_string()),
+            },
+            &ctx,
+        );
+        // Should try to hide since it's visible and focused
+        assert!(!commands.is_empty());
     }
 }
