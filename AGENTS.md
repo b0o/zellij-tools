@@ -38,6 +38,42 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 }
 ```
 
+## Architecture
+
+### Modules
+
+- `src/main.rs` - Plugin entry point, event handling, zellij integration
+- `src/config.rs` - Configuration resolution (environment reading, path resolution)
+- `src/scratchpad/` - Scratchpad management (toggle, show, hide floating terminals)
+- `src/message.rs` - Pipe message parsing
+- `src/stable_tabs.rs` - Stable tab ID tracking across tab reorders
+
+### Key Features
+
+**Scratchpads**: Floating terminal panes that can be toggled on/off. They follow you across tabs and persist state.
+
+**External Config Hot-Reload**: Scratchpad definitions can be loaded from an external KDL file that is polled for changes. This allows editing scratchpads without restarting zellij.
+
+### How External Config Works
+
+1. On plugin load, if `include` option is set, store the raw path
+2. Request `FullHdAccess` permission to access the filesystem
+3. On permission granted, mount `/` to `/host` via `change_host_folder("/")`
+4. On `HostFolderChanged`, read environment variables from `/host/proc/self/environ`
+5. Resolve the include path using `ZELLIJ_CONFIG_DIR`, `XDG_CONFIG_HOME`, or `HOME`
+6. Read the external config file from `/host/<resolved_path>`
+7. Start a timer to poll for changes (default: 2000ms)
+
+### WASI Sandbox Notes
+
+Zellij plugins run in a WASI sandbox with limited filesystem access:
+- `/host` - Mapped to a host directory via `change_host_folder()`
+- `/data` - Plugin data directory (persists across plugin instances)
+- `/tmp` - Temporary directory
+
+Environment variables are NOT directly accessible. Read them from `/host/proc/self/environ` after mounting `/` to `/host`.
+
 ## Building
 
 - To build, use `just build-release`
+- To run tests, use `cargo test --lib`
