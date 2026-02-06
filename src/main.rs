@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use zellij_tile::prelude::*;
 
 use zellij_tools::config::resolve_include_path;
+use zellij_tools::focus::FocusTracker;
 use zellij_tools::message::{parse_message, ParseError};
 use zellij_tools::scratchpad::{
     parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadCommand, ScratchpadContext,
@@ -23,6 +24,7 @@ struct State {
     // Managers
     tab_tracker: StableTabTracker,
     scratchpad: Option<ScratchpadManager>,
+    focus_tracker: FocusTracker,
 
     // Raw include path from config (resolved after /host is mounted)
     raw_include: Option<String>,
