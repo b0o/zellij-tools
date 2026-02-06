@@ -187,6 +187,15 @@ impl State {
                 }
                 Ok(())
             }
+            "unsubscribe-focus" => {
+                if message.args.is_empty() {
+                    return Err(ParseError::InvalidArgs(
+                        "unsubscribe-focus requires pipe_id argument".to_string(),
+                    ));
+                }
+                self.focus_tracker.unsubscribe(&message.args[0]);
+                Ok(())
+            }
             _ => Err(ParseError::UnknownEvent(message.event)),
         }
     }
