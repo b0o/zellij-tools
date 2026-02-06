@@ -209,14 +209,28 @@ impl State {
     }
 
     fn find_focused_pane(&self) -> Option<(u32, bool)> {
-        for panes in self.pane_manifest.values() {
-            for pane in panes {
-                if pane.is_focused {
-                    return Some((pane.id, pane.is_plugin));
+        let mut focused_tiled: Option<(u32, bool)> = None;
+        let mut focused_floating: Option<(u32, bool)> = None;
+
+        for pane in self.pane_manifest.values().flatten() {
+            if pane.is_focused {
+                if pane.is_floating {
+                    focused_floating = Some((pane.id, pane.is_plugin));
+                } else {
+                    focused_tiled = Some((pane.id, pane.is_plugin));
                 }
             }
         }
-        None
+
+        // When floating panes are visible, a focused floating pane takes
+        // precedence. The tiled pane underneath may still have is_focused=true
+        // (it's the "focused tiled pane"), but the floating pane is what the
+        // user is actually interacting with.
+        if self.are_floating_panes_visible {
+            focused_floating.or(focused_tiled)
+        } else {
+            focused_tiled.or(focused_floating)
+        }
     }
 }
 
