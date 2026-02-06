@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use zellij_tile::prelude::*;
 
 use zellij_tools::config::resolve_include_path;
-use zellij_tools::focus::FocusTracker;
+use zellij_tools::events::{EventStream, PaneInfo as EventPaneInfo};
 use zellij_tools::message::{parse_message, ParseError};
 use zellij_tools::scratchpad::{
     parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadCommand, ScratchpadContext,
@@ -24,7 +24,7 @@ struct State {
     // Managers
     tab_tracker: StableTabTracker,
     scratchpad: Option<ScratchpadManager>,
-    focus_tracker: FocusTracker,
+    event_stream: EventStream,
 
     // Raw include path from config (resolved after /host is mounted)
     raw_include: Option<String>,
@@ -164,71 +164,38 @@ impl State {
                 }
                 Ok(())
             }
-            "subscribe-focus" => {
+            "subscribe" => {
                 let cli_pipe_id = match &pipe_message.source {
                     PipeSource::Cli(id) => id.clone(),
                     _ => {
                         return Err(ParseError::InvalidArgs(
-                            "subscribe-focus only works from CLI pipes".to_string(),
+                            "subscribe only works from CLI pipes".to_string(),
                         ))
                     }
                 };
 
-                let pane_filter = if message.args.is_empty() {
-                    None
-                } else {
-                    Some(message.args[0].parse::<u32>().map_err(|_| {
-                        ParseError::InvalidArgs(format!("Invalid pane ID: {}", message.args[0]))
-                    })?)
-                };
-
-                if let Some(event) = self
-                    .focus_tracker
-                    .subscribe(cli_pipe_id.clone(), pane_filter)
-                {
-                    self.emit_focus_event(&cli_pipe_id, &event.to_json());
+                let initial_events = self.event_stream.subscribe(cli_pipe_id.clone());
+                for event in &initial_events {
+                    self.emit_event(&cli_pipe_id, &event.to_json());
                 }
                 Ok(())
             }
-            "unsubscribe-focus" => {
+            "unsubscribe" => {
                 if message.args.is_empty() {
                     return Err(ParseError::InvalidArgs(
-                        "unsubscribe-focus requires pipe_id argument".to_string(),
+                        "unsubscribe requires pipe_id argument".to_string(),
                     ));
                 }
-                self.focus_tracker.unsubscribe(&message.args[0]);
+                self.event_stream.unsubscribe(&message.args[0]);
                 Ok(())
             }
             _ => Err(ParseError::UnknownEvent(message.event)),
         }
     }
 
-    fn emit_focus_event(&self, pipe_id: &str, json: &str) {
+    fn emit_event(&self, pipe_id: &str, json: &str) {
         // Append newline so CLI can read line-by-line with BufReader::lines()
         cli_pipe_output(pipe_id, &format!("{}\n", json));
-    }
-
-    fn find_focused_pane(&self) -> Option<(u32, bool)> {
-        let mut focused_tiled: Option<(u32, bool)> = None;
-        let mut focused_floating: Option<(u32, bool)> = None;
-
-        for pane in self.pane_manifest.values().flatten() {
-            // Skip suppressed (hidden) panes — they may retain is_focused=true
-            // even after being hidden (e.g., scratchpads toggled off)
-            if pane.is_focused && !pane.is_suppressed {
-                if pane.is_floating {
-                    focused_floating = Some((pane.id, pane.is_plugin));
-                } else {
-                    focused_tiled = Some((pane.id, pane.is_plugin));
-                }
-            }
-        }
-
-        // A focused, non-suppressed floating pane always takes precedence —
-        // it's the pane the user is actually interacting with. Don't rely on
-        // are_floating_panes_visible from TabUpdate since it may be stale
-        // when PaneUpdate arrives.
-        focused_floating.or(focused_tiled)
     }
 }
 
@@ -281,14 +248,26 @@ impl ZellijPlugin for State {
             Event::PaneUpdate(pane_manifest) => {
                 self.pane_manifest = pane_manifest.panes;
 
-                // Track focus changes and emit events.
+                // Convert pane manifest into EventStream's PaneInfo format
+                // and emit any detected changes (focus, open, close).
                 // Note: cli_pipe_output calls are buffered by zellij and only
                 // flushed on the next pipe() call. The CLI sends periodic
                 // heartbeats to trigger the flush.
-                let focused = self.find_focused_pane();
-                let events = self.focus_tracker.on_focus_change(focused);
+                let event_panes: Vec<EventPaneInfo> = self
+                    .pane_manifest
+                    .values()
+                    .flatten()
+                    .map(|p| EventPaneInfo {
+                        id: p.id,
+                        is_focused: p.is_focused,
+                        is_floating: p.is_floating,
+                        is_suppressed: p.is_suppressed,
+                        is_plugin: p.is_plugin,
+                    })
+                    .collect();
+                let events = self.event_stream.on_pane_update(&event_panes);
                 for (pipe_id, json) in &events {
-                    self.emit_focus_event(pipe_id, json);
+                    self.emit_event(pipe_id, json);
                 }
 
                 // Update stable tab mapping and get orphaned tabs

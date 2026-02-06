@@ -29,31 +29,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Subscribe to events from the zellij-tools plugin
-    Subscribe {
-        #[command(subcommand)]
-        event: SubscribeEvent,
-    },
+    /// Subscribe to the event stream from the zellij-tools plugin
+    Subscribe,
 }
 
-#[derive(Subcommand)]
-enum SubscribeEvent {
-    /// Subscribe to pane focus change events
-    PaneFocus {
-        /// Only receive events for this specific pane ID
-        #[arg(long)]
-        pane: Option<u32>,
-    },
-}
+fn subscribe(plugin: &str) -> std::io::Result<()> {
+    let pipe_name = format!("zellij-tools-events-{}", uuid::Uuid::new_v4());
 
-fn subscribe_pane_focus(pane_filter: Option<u32>, plugin: &str) -> std::io::Result<()> {
-    let pipe_name = format!("zellij-tools-focus-{}", uuid::Uuid::new_v4());
-
-    // Build subscribe message
-    let subscribe_msg = match pane_filter {
-        Some(pane_id) => format!("zellij-tools::subscribe-focus::{}", pane_id),
-        None => "zellij-tools::subscribe-focus".to_string(),
-    };
+    let subscribe_msg = "zellij-tools::subscribe".to_string();
 
     // Spawn zellij pipe with subscribe message as positional payload.
     let mut child = Command::new("zellij")
@@ -93,7 +76,7 @@ fn subscribe_pane_focus(pane_filter: Option<u32>, plugin: &str) -> std::io::Resu
                 "--plugin",
                 &plugin_clone,
                 "--",
-                &format!("zellij-tools::unsubscribe-focus::{}", pipe_name_clone),
+                &format!("zellij-tools::unsubscribe::{}", pipe_name_clone),
             ])
             .status();
         r.store(false, Ordering::SeqCst);
@@ -155,13 +138,11 @@ fn main() {
     let plugin = resolve_plugin(cli.plugin.as_deref());
 
     match cli.command {
-        Commands::Subscribe { event } => match event {
-            SubscribeEvent::PaneFocus { pane } => {
-                if let Err(e) = subscribe_pane_focus(pane, &plugin) {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
+        Commands::Subscribe => {
+            if let Err(e) = subscribe(&plugin) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
             }
-        },
+        }
     }
 }
