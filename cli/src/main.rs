@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const PLUGIN_PATH: &str = "file:~/.config/zellij/plugins/zellij-tools.wasm";
 
@@ -53,10 +53,14 @@ fn subscribe_pane_focus(pane_filter: Option<u32>) -> std::io::Result<()> {
     let mut stdin = child.stdin.take().expect("Failed to open stdin");
     let stdout = child.stdout.take().expect("Failed to open stdout");
 
+    // Wrap child in Arc<Mutex> so Ctrl+C handler can kill it
+    let child = Arc::new(Mutex::new(child));
+
     // Set up Ctrl+C handler
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     let pipe_name_clone = pipe_name.clone();
+    let child_clone = Arc::clone(&child);
 
     ctrlc::set_handler(move || {
         eprintln!("\nUnsubscribing...");
@@ -71,13 +75,18 @@ fn subscribe_pane_focus(pane_filter: Option<u32>) -> std::io::Result<()> {
             ])
             .status();
         r.store(false, Ordering::SeqCst);
+        // Kill child process to unblock reader.lines()
+        if let Ok(mut child) = child_clone.lock() {
+            let _ = child.kill();
+        }
     })
     .expect("Error setting Ctrl-C handler");
 
     // Send subscribe message
     writeln!(stdin, "{}", subscribe_msg)?;
     stdin.flush()?;
-    // Keep stdin open by not dropping it
+    // Keep stdin open to keep the pipe alive
+    let _keep_stdin = stdin;
 
     // Read and forward stdout
     let reader = BufReader::new(stdout);
@@ -88,14 +97,18 @@ fn subscribe_pane_focus(pane_filter: Option<u32>) -> std::io::Result<()> {
         match line {
             Ok(l) => println!("{}", l),
             Err(e) => {
-                eprintln!("Error reading: {}", e);
+                if running.load(Ordering::SeqCst) {
+                    eprintln!("Error reading: {}", e);
+                }
                 break;
             }
         }
     }
 
     // Cleanup
-    let _ = child.wait();
+    if let Ok(mut child) = child.lock() {
+        let _ = child.wait();
+    }
     Ok(())
 }
 

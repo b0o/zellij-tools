@@ -259,4 +259,14 @@ mod tests {
         assert_eq!(event.pane_id, 42);
         assert!(event.focused);
     }
+
+    #[test]
+    fn tracker_subscribe_with_non_matching_filter_returns_none() {
+        let mut tracker = FocusTracker::new();
+        tracker.on_focus_change(Some((42, false)));
+
+        // Subscribe with filter for pane 99, but focus is on pane 42
+        let event = tracker.subscribe("pipe-1".to_string(), Some(99));
+        assert!(event.is_none());
+    }
 }
