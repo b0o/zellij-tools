@@ -30,15 +30,23 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Subscribe to the event stream from the zellij-tools plugin
-    Subscribe,
+    Subscribe {
+        /// Include full object details in each event
+        #[arg(long)]
+        full: bool,
+    },
     /// Print the session tree (tabs, panes, stable IDs) as JSON
     Tree,
 }
 
-fn subscribe(plugin: &str) -> std::io::Result<()> {
+fn subscribe(plugin: &str, full: bool) -> std::io::Result<()> {
     let pipe_name = format!("zellij-tools-events-{}", uuid::Uuid::new_v4());
 
-    let subscribe_msg = "zellij-tools::subscribe".to_string();
+    let subscribe_msg = if full {
+        "zellij-tools::subscribe::full".to_string()
+    } else {
+        "zellij-tools::subscribe".to_string()
+    };
 
     // Spawn zellij pipe with subscribe message as positional payload.
     let mut child = Command::new("zellij")
@@ -191,7 +199,7 @@ fn main() {
     let plugin = resolve_plugin(cli.plugin.as_deref());
 
     let result = match cli.command {
-        Commands::Subscribe => subscribe(&plugin),
+        Commands::Subscribe { full } => subscribe(&plugin, full),
         Commands::Tree => tree(&plugin),
     };
 
