@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use zellij_tile::prelude::*;
 
 use zellij_tools::config::resolve_include_path;
-use zellij_tools::events::{EventStream, PaneInfo as EventPaneInfo};
+use zellij_tools::events::{EventStream, PaneInfo as EventPaneInfo, TabInfo as EventTabInfo};
 use zellij_tools::message::{parse_message, ParseError};
 use zellij_tools::scratchpad::{
     parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadCommand, ScratchpadContext,
@@ -305,6 +305,21 @@ impl ZellijPlugin for State {
                     self.current_tab_position = active_tab.position;
                     self.are_floating_panes_visible = active_tab.are_floating_panes_visible;
                 }
+
+                // Emit tab events (focus, create, close)
+                let event_tabs: Vec<EventTabInfo> = tab_infos
+                    .iter()
+                    .map(|t| EventTabInfo {
+                        position: t.position,
+                        name: t.name.clone(),
+                        active: t.active,
+                    })
+                    .collect();
+                let events = self.event_stream.on_tab_update(&event_tabs);
+                for (pipe_id, json) in &events {
+                    self.emit_event(pipe_id, json);
+                }
+
                 self.tab_infos = tab_infos;
             }
             Event::HostFolderChanged(_new_path) => {
