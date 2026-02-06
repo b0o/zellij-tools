@@ -306,13 +306,20 @@ impl ZellijPlugin for State {
                     self.are_floating_panes_visible = active_tab.are_floating_panes_visible;
                 }
 
-                // Emit tab events (focus, create, close)
+                // Emit tab events (focus, create, close, move)
                 let event_tabs: Vec<EventTabInfo> = tab_infos
                     .iter()
-                    .map(|t| EventTabInfo {
-                        position: t.position,
-                        name: t.name.clone(),
-                        active: t.active,
+                    .map(|t| {
+                        let stable_id = self
+                            .tab_tracker
+                            .get_stable_id(t.position)
+                            .unwrap_or(t.position as u64);
+                        EventTabInfo {
+                            stable_id,
+                            position: t.position,
+                            name: t.name.clone(),
+                            active: t.active,
+                        }
                     })
                     .collect();
                 let events = self.event_stream.on_tab_update(&event_tabs);
