@@ -203,6 +203,17 @@ impl State {
     fn emit_focus_event(&self, pipe_id: &str, json: &str) {
         cli_pipe_output(pipe_id, json);
     }
+
+    fn find_focused_pane(&self) -> Option<(u32, bool)> {
+        for panes in self.pane_manifest.values() {
+            for pane in panes {
+                if pane.is_focused {
+                    return Some((pane.id, pane.is_plugin));
+                }
+            }
+        }
+        None
+    }
 }
 
 impl ZellijPlugin for State {
@@ -252,6 +263,13 @@ impl ZellijPlugin for State {
         match event {
             Event::PaneUpdate(pane_manifest) => {
                 self.pane_manifest = pane_manifest.panes;
+
+                // Track focus changes and emit events
+                let focused = self.find_focused_pane();
+                let events = self.focus_tracker.on_focus_change(focused);
+                for (pipe_id, json) in events {
+                    self.emit_focus_event(&pipe_id, &json);
+                }
 
                 // Update stable tab mapping and get orphaned tabs
                 let orphaned_tabs = self.tab_tracker.update(&self.pane_manifest);
