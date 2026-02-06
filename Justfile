@@ -1,10 +1,12 @@
 target := "wasm32-wasip1"
 
+default: build-all-release
+
 build:
-    cargo build --target={{target}}
+    cargo build --target={{ target }}
 
 build-release:
-    cargo build --release --target={{target}}
+    cargo build --release --target={{ target }}
 
 build-cli:
     cargo build -p zellij-tools-cli
