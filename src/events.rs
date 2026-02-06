@@ -5,13 +5,17 @@ use serde::Serialize;
 /// An event emitted to subscribers.
 ///
 /// Serialized as an externally-tagged JSON object, e.g.:
-/// `{"pane_focused":{"pane_id":3}}`
+/// `{"PaneFocused":{"pane_id":3}}`
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum Event {
     PaneFocused { pane_id: u32 },
     PaneUnfocused { pane_id: u32 },
     PaneOpened { pane_id: u32, is_floating: bool },
     PaneClosed { pane_id: u32 },
+    TabFocused { position: usize, name: String },
+    TabUnfocused { position: usize, name: String },
+    TabCreated { position: usize, name: String },
+    TabClosed { position: usize, name: String },
 }
 
 impl Event {
@@ -38,14 +42,27 @@ impl Subscriber {
 /// Detects:
 /// - Pane focus changes (by comparing focused pane across PaneUpdate calls)
 /// - Pane open/close (by diffing the set of known pane IDs across PaneUpdate calls)
+/// - Tab focus changes (by comparing active tab across TabUpdate calls)
+/// - Tab create/close (by diffing the set of known tab positions across TabUpdate calls)
 #[derive(Debug, Default)]
 pub struct EventStream {
     /// Active subscribers keyed by pipe ID
     subscribers: HashMap<String, Subscriber>,
     /// Last known focused pane (pane_id, is_plugin)
-    last_focused: Option<(u32, bool)>,
+    last_focused_pane: Option<(u32, bool)>,
     /// Set of pane IDs we knew about last time
     known_panes: HashSet<u32>,
+    /// Last known active tab position
+    last_active_tab: Option<usize>,
+    /// Known tabs: position -> name
+    known_tabs: HashMap<usize, String>,
+}
+
+/// Information about a tab, used for diffing
+pub struct TabInfo {
+    pub position: usize,
+    pub name: String,
+    pub active: bool,
 }
 
 /// Information about a pane from the manifest, used for diffing
@@ -70,8 +87,18 @@ impl EventStream {
 
         let mut initial_events = Vec::new();
 
-        // Send current focus state
-        if let Some((pane_id, _)) = self.last_focused {
+        // Send current tab focus state
+        if let Some(pos) = self.last_active_tab {
+            if let Some(name) = self.known_tabs.get(&pos) {
+                initial_events.push(Event::TabFocused {
+                    position: pos,
+                    name: name.clone(),
+                });
+            }
+        }
+
+        // Send current pane focus state
+        if let Some((pane_id, _)) = self.last_focused_pane {
             initial_events.push(Event::PaneFocused { pane_id });
         }
 
@@ -98,12 +125,12 @@ impl EventStream {
     pub fn on_pane_update(&mut self, panes: &[PaneInfo]) -> Vec<(String, String)> {
         if !self.has_subscribers() {
             // Still update internal state even without subscribers
-            self.update_state(panes);
+            self.update_pane_state(panes);
             return vec![];
         }
 
         let events = self.compute_events(panes);
-        self.update_state(panes);
+        self.update_pane_state(panes);
 
         // Broadcast each event to all subscribers
         let mut output = Vec::new();
@@ -115,6 +142,105 @@ impl EventStream {
         }
 
         output
+    }
+
+    /// Process a tab update, returns events to broadcast to all subscribers.
+    pub fn on_tab_update(&mut self, tabs: &[TabInfo]) -> Vec<(String, String)> {
+        if !self.has_subscribers() {
+            self.update_tab_state(tabs);
+            return vec![];
+        }
+
+        let events = self.compute_tab_events(tabs);
+        self.update_tab_state(tabs);
+
+        let mut output = Vec::new();
+        for event in &events {
+            let json = event.to_json();
+            for sub in self.subscribers.values() {
+                output.push((sub.pipe_id.clone(), json.clone()));
+            }
+        }
+
+        output
+    }
+
+    /// Compute tab events by diffing old vs new tab state
+    fn compute_tab_events(&self, tabs: &[TabInfo]) -> Vec<Event> {
+        let mut events = Vec::new();
+
+        let new_positions: HashSet<usize> = tabs.iter().map(|t| t.position).collect();
+        let old_positions: HashSet<usize> = self.known_tabs.keys().copied().collect();
+
+        // Created tabs (in new but not old)
+        for tab in tabs {
+            if !old_positions.contains(&tab.position) {
+                events.push(Event::TabCreated {
+                    position: tab.position,
+                    name: tab.name.clone(),
+                });
+            }
+        }
+
+        // Closed tabs (in old but not new)
+        for &old_pos in &old_positions {
+            if !new_positions.contains(&old_pos) {
+                let name = self.known_tabs.get(&old_pos).cloned().unwrap_or_default();
+                events.push(Event::TabClosed {
+                    position: old_pos,
+                    name,
+                });
+            }
+        }
+
+        // Focus changes
+        let new_active = tabs.iter().find(|t| t.active).map(|t| t.position);
+
+        match (self.last_active_tab, new_active) {
+            (Some(old_pos), Some(new_pos)) if old_pos != new_pos => {
+                let old_name = self.known_tabs.get(&old_pos).cloned().unwrap_or_default();
+                events.push(Event::TabUnfocused {
+                    position: old_pos,
+                    name: old_name,
+                });
+                let new_name = tabs
+                    .iter()
+                    .find(|t| t.position == new_pos)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                events.push(Event::TabFocused {
+                    position: new_pos,
+                    name: new_name,
+                });
+            }
+            (Some(old_pos), None) => {
+                let old_name = self.known_tabs.get(&old_pos).cloned().unwrap_or_default();
+                events.push(Event::TabUnfocused {
+                    position: old_pos,
+                    name: old_name,
+                });
+            }
+            (None, Some(new_pos)) => {
+                let new_name = tabs
+                    .iter()
+                    .find(|t| t.position == new_pos)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                events.push(Event::TabFocused {
+                    position: new_pos,
+                    name: new_name,
+                });
+            }
+            _ => {}
+        }
+
+        events
+    }
+
+    /// Update internal tab state
+    fn update_tab_state(&mut self, tabs: &[TabInfo]) {
+        self.known_tabs = tabs.iter().map(|t| (t.position, t.name.clone())).collect();
+        self.last_active_tab = tabs.iter().find(|t| t.active).map(|t| t.position);
     }
 
     /// Compute the events that should be emitted for this pane update
@@ -145,7 +271,7 @@ impl EventStream {
         // 2. Detect focus changes
         let new_focused = Self::find_focused(panes);
 
-        match (self.last_focused, new_focused) {
+        match (self.last_focused_pane, new_focused) {
             (Some((old_id, _)), Some((new_id, _))) if old_id != new_id => {
                 events.push(Event::PaneUnfocused { pane_id: old_id });
                 events.push(Event::PaneFocused { pane_id: new_id });
@@ -162,10 +288,10 @@ impl EventStream {
         events
     }
 
-    /// Update internal state to match current pane manifest
-    fn update_state(&mut self, panes: &[PaneInfo]) {
+    /// Update internal pane state to match current pane manifest
+    fn update_pane_state(&mut self, panes: &[PaneInfo]) {
         self.known_panes = panes.iter().map(|p| p.id).collect();
-        self.last_focused = Self::find_focused(panes);
+        self.last_focused_pane = Self::find_focused(panes);
     }
 
     /// Find the focused pane from a list of panes.
@@ -392,6 +518,133 @@ mod tests {
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
         // Pane 1 (tiled) should be focused since pane 2 is suppressed
         assert!(jsons.contains(&r#"{"PaneFocused":{"pane_id":1}}"#));
+    }
+
+    // --- Tab event serialization ---
+
+    #[test]
+    fn event_tab_focused_serializes() {
+        let event = Event::TabFocused {
+            position: 0,
+            name: "tab1".to_string(),
+        };
+        assert_eq!(
+            event.to_json(),
+            r#"{"TabFocused":{"position":0,"name":"tab1"}}"#
+        );
+    }
+
+    #[test]
+    fn event_tab_created_serializes() {
+        let event = Event::TabCreated {
+            position: 2,
+            name: "new-tab".to_string(),
+        };
+        assert_eq!(
+            event.to_json(),
+            r#"{"TabCreated":{"position":2,"name":"new-tab"}}"#
+        );
+    }
+
+    #[test]
+    fn event_tab_closed_serializes() {
+        let event = Event::TabClosed {
+            position: 1,
+            name: "old-tab".to_string(),
+        };
+        assert_eq!(
+            event.to_json(),
+            r#"{"TabClosed":{"position":1,"name":"old-tab"}}"#
+        );
+    }
+
+    // --- Tab focus detection ---
+
+    fn make_tab(position: usize, name: &str, active: bool) -> TabInfo {
+        TabInfo {
+            position,
+            name: name.to_string(),
+            active,
+        }
+    }
+
+    #[test]
+    fn tab_focus_change_emits_events() {
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string());
+
+        // Initial: tab 0 active
+        let tabs = vec![make_tab(0, "tab1", true), make_tab(1, "tab2", false)];
+        stream.on_tab_update(&tabs);
+
+        // Switch to tab 1
+        let tabs = vec![make_tab(0, "tab1", false), make_tab(1, "tab2", true)];
+        let output = stream.on_tab_update(&tabs);
+
+        let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
+        assert!(jsons.contains(&r#"{"TabUnfocused":{"position":0,"name":"tab1"}}"#));
+        assert!(jsons.contains(&r#"{"TabFocused":{"position":1,"name":"tab2"}}"#));
+    }
+
+    #[test]
+    fn same_tab_focus_emits_nothing() {
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string());
+
+        let tabs = vec![make_tab(0, "tab1", true)];
+        stream.on_tab_update(&tabs);
+
+        let output = stream.on_tab_update(&tabs);
+        assert!(output.is_empty());
+    }
+
+    // --- Tab create/close detection ---
+
+    #[test]
+    fn new_tab_emits_created_event() {
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string());
+
+        let tabs = vec![make_tab(0, "tab1", true)];
+        stream.on_tab_update(&tabs);
+
+        // New tab appears
+        let tabs = vec![make_tab(0, "tab1", true), make_tab(1, "tab2", false)];
+        let output = stream.on_tab_update(&tabs);
+
+        let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
+        assert!(jsons.contains(&r#"{"TabCreated":{"position":1,"name":"tab2"}}"#));
+    }
+
+    #[test]
+    fn removed_tab_emits_closed_event() {
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string());
+
+        let tabs = vec![make_tab(0, "tab1", true), make_tab(1, "tab2", false)];
+        stream.on_tab_update(&tabs);
+
+        // Tab 1 disappears
+        let tabs = vec![make_tab(0, "tab1", true)];
+        let output = stream.on_tab_update(&tabs);
+
+        let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
+        assert!(jsons.contains(&r#"{"TabClosed":{"position":1,"name":"tab2"}}"#));
+    }
+
+    #[test]
+    fn subscribe_returns_current_active_tab() {
+        let mut stream = EventStream::new();
+
+        // Set up state with active tab
+        let tabs = vec![make_tab(0, "tab1", true)];
+        stream.on_tab_update(&tabs);
+
+        let events = stream.subscribe("pipe-1".to_string());
+        assert!(events.contains(&Event::TabFocused {
+            position: 0,
+            name: "tab1".to_string(),
+        }));
     }
 
     // --- Multiple subscribers ---
