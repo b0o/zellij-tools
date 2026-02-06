@@ -213,7 +213,9 @@ impl State {
         let mut focused_floating: Option<(u32, bool)> = None;
 
         for pane in self.pane_manifest.values().flatten() {
-            if pane.is_focused {
+            // Skip suppressed (hidden) panes — they may retain is_focused=true
+            // even after being hidden (e.g., scratchpads toggled off)
+            if pane.is_focused && !pane.is_suppressed {
                 if pane.is_floating {
                     focused_floating = Some((pane.id, pane.is_plugin));
                 } else {
@@ -222,15 +224,11 @@ impl State {
             }
         }
 
-        // When floating panes are visible, a focused floating pane takes
-        // precedence. The tiled pane underneath may still have is_focused=true
-        // (it's the "focused tiled pane"), but the floating pane is what the
-        // user is actually interacting with.
-        if self.are_floating_panes_visible {
-            focused_floating.or(focused_tiled)
-        } else {
-            focused_tiled.or(focused_floating)
-        }
+        // A focused, non-suppressed floating pane always takes precedence —
+        // it's the pane the user is actually interacting with. Don't rely on
+        // are_floating_panes_visible from TabUpdate since it may be stale
+        // when PaneUpdate arrives.
+        focused_floating.or(focused_tiled)
     }
 }
 
@@ -396,6 +394,11 @@ impl ZellijPlugin for State {
 
         match self.handle_event(&pipe_message) {
             Ok(()) => true,
+            Err(ParseError::WrongPlugin | ParseError::InvalidFormat) => {
+                // Silently ignore messages from other plugins (zjstatus, etc.)
+                // and keybind payloads that don't match our format.
+                false
+            }
             Err(e) => {
                 eprintln!("Error handling event: {}", e);
                 false
