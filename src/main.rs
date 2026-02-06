@@ -134,17 +134,20 @@ impl State {
         }
     }
 
-    fn handle_event(&mut self, event: &str, args: Vec<String>) -> Result<(), ParseError> {
-        match event {
+    fn handle_event(&mut self, pipe_message: &PipeMessage) -> Result<(), ParseError> {
+        let payload = pipe_message.payload.as_deref().unwrap_or("");
+        let message = parse_message(payload)?;
+
+        match message.event.as_str() {
             "focus-pane" => {
-                if args.len() != 1 {
+                if message.args.len() != 1 {
                     return Err(ParseError::InvalidArgs(format!(
                         "focus-pane requires 1 argument, got {}",
-                        args.len()
+                        message.args.len()
                     )));
                 }
 
-                let pane_id = args[0]
+                let pane_id = message.args[0]
                     .parse::<PaneId>()
                     .map_err(|e| ParseError::InvalidArgs(format!("Invalid pane ID: {}", e)))?;
 
@@ -152,7 +155,7 @@ impl State {
                 Ok(())
             }
             "scratchpad" => {
-                let action = parse_scratchpad_action(&args)?;
+                let action = parse_scratchpad_action(&message.args)?;
                 if let Some(mut scratchpad) = self.scratchpad.take() {
                     let ctx = self.build_scratchpad_context();
                     let commands = scratchpad.handle_action(action, &ctx);
@@ -161,8 +164,35 @@ impl State {
                 }
                 Ok(())
             }
-            _ => Err(ParseError::UnknownEvent(event.to_string())),
+            "subscribe-focus" => {
+                let pipe_id = match &pipe_message.source {
+                    PipeSource::Cli(id) => id.clone(),
+                    _ => {
+                        return Err(ParseError::InvalidArgs(
+                            "subscribe-focus only works from CLI pipes".to_string(),
+                        ))
+                    }
+                };
+
+                let pane_filter = if message.args.is_empty() {
+                    None
+                } else {
+                    Some(message.args[0].parse::<u32>().map_err(|_| {
+                        ParseError::InvalidArgs(format!("Invalid pane ID: {}", message.args[0]))
+                    })?)
+                };
+
+                if let Some(event) = self.focus_tracker.subscribe(pipe_id.clone(), pane_filter) {
+                    self.emit_focus_event(&pipe_id, &event.to_json());
+                }
+                Ok(())
+            }
+            _ => Err(ParseError::UnknownEvent(message.event)),
         }
+    }
+
+    fn emit_focus_event(&self, pipe_id: &str, json: &str) {
+        cli_pipe_output(pipe_id, json);
     }
 }
 
@@ -308,21 +338,10 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-        let payload = match pipe_message.payload {
-            Some(p) => p,
-            None => return false,
-        };
-
-        match parse_message(&payload) {
-            Ok(message) => match self.handle_event(&message.event, message.args) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("Error handling event: {}", e);
-                    false
-                }
-            },
+        match self.handle_event(&pipe_message) {
+            Ok(()) => true,
             Err(e) => {
-                eprintln!("Error parsing message: {}", e);
+                eprintln!("Error handling event: {}", e);
                 false
             }
         }
