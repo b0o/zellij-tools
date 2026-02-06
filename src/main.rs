@@ -201,7 +201,8 @@ impl State {
     }
 
     fn emit_focus_event(&self, pipe_id: &str, json: &str) {
-        cli_pipe_output(pipe_id, json);
+        // Append newline so CLI can read line-by-line with BufReader::lines()
+        cli_pipe_output(pipe_id, &format!("{}\n", json));
     }
 
     fn find_focused_pane(&self) -> Option<(u32, bool)> {
