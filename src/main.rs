@@ -165,15 +165,15 @@ impl State {
                 Ok(())
             }
             "subscribe-focus" => {
-                // Verify this came from a CLI pipe
-                if !matches!(&pipe_message.source, PipeSource::Cli(_)) {
-                    return Err(ParseError::InvalidArgs(
-                        "subscribe-focus only works from CLI pipes".to_string(),
-                    ));
-                }
+                let cli_pipe_id = match &pipe_message.source {
+                    PipeSource::Cli(id) => id.clone(),
+                    _ => {
+                        return Err(ParseError::InvalidArgs(
+                            "subscribe-focus only works from CLI pipes".to_string(),
+                        ))
+                    }
+                };
 
-                // Use the pipe NAME (not the CLI pipe ID) for cli_pipe_output.
-                // cli_pipe_output identifies pipes by name, not by the auto-assigned CLI ID.
                 let pipe_name = pipe_message.name.clone();
 
                 let pane_filter = if message.args.is_empty() {
@@ -185,15 +185,26 @@ impl State {
                 };
 
                 eprintln!(
-                    "[zjt:subscribe] pipe_name={} pane_filter={:?}",
-                    pipe_name, pane_filter
+                    "[zjt:subscribe] cli_pipe_id={} pipe_name={} pane_filter={:?}",
+                    cli_pipe_id, pipe_name, pane_filter
                 );
-                if let Some(event) = self.focus_tracker.subscribe(pipe_name.clone(), pane_filter) {
+
+                // DEBUG: Try both identifiers to see which one works
+                let test_json = r#"{"pane_id":999,"focused":true}"#;
+                eprintln!("[zjt:debug] emitting test via pipe_name={}", pipe_name);
+                cli_pipe_output(&pipe_name, &format!("{}\n", test_json));
+                eprintln!("[zjt:debug] emitting test via cli_pipe_id={}", cli_pipe_id);
+                cli_pipe_output(&cli_pipe_id, &format!("{}\n", test_json));
+
+                if let Some(event) = self
+                    .focus_tracker
+                    .subscribe(cli_pipe_id.clone(), pane_filter)
+                {
                     eprintln!(
-                        "[zjt:subscribe] emitting initial state: {}",
+                        "[zjt:subscribe] emitting initial state via cli_pipe_id: {}",
                         event.to_json()
                     );
-                    self.emit_focus_event(&pipe_name, &event.to_json());
+                    self.emit_focus_event(&cli_pipe_id, &event.to_json());
                 }
                 eprintln!(
                     "[zjt:subscribe] has_subscribers={}",
