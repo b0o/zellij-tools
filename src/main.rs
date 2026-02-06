@@ -274,6 +274,8 @@ impl ZellijPlugin for State {
     }
 
     fn update(&mut self, event: Event) -> bool {
+        let mut should_render = false;
+
         match event {
             Event::PaneUpdate(pane_manifest) => {
                 self.pane_manifest = pane_manifest.panes;
@@ -287,6 +289,9 @@ impl ZellijPlugin for State {
                         focused,
                         events.len()
                     );
+                }
+                if !events.is_empty() {
+                    should_render = true;
                 }
                 for (pipe_id, json) in &events {
                     eprintln!("[zjt:emit] pipe_id={} json={}", pipe_id, json);
@@ -383,7 +388,7 @@ impl ZellijPlugin for State {
             }
             _ => (),
         };
-        false
+        should_render
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
