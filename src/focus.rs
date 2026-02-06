@@ -87,6 +87,61 @@ impl FocusTracker {
     pub fn has_subscribers(&self) -> bool {
         !self.subscribers.is_empty()
     }
+
+    /// Process a focus change, returns events to emit
+    ///
+    /// # Arguments
+    /// * `new_focused` - The newly focused pane (pane_id, is_plugin), or None if no pane focused
+    ///
+    /// # Returns
+    /// A vec of (pipe_id, json_event) tuples to emit
+    pub fn on_focus_change(&mut self, new_focused: Option<(u32, bool)>) -> Vec<(String, String)> {
+        if !self.has_subscribers() {
+            self.last_focused = new_focused;
+            return vec![];
+        }
+
+        let mut events = vec![];
+
+        // Emit unfocus event for old pane (if different)
+        if let Some((old_pane_id, _)) = self.last_focused {
+            let should_emit = match new_focused {
+                Some((new_id, _)) => new_id != old_pane_id,
+                None => true,
+            };
+            if should_emit {
+                let event = FocusEvent {
+                    pane_id: old_pane_id,
+                    focused: false,
+                };
+                let json = event.to_json();
+                for sub in self.subscribers_for_pane(old_pane_id) {
+                    events.push((sub.pipe_id.clone(), json.clone()));
+                }
+            }
+        }
+
+        // Emit focus event for new pane
+        if let Some((new_pane_id, _)) = new_focused {
+            let should_emit = match self.last_focused {
+                Some((old_id, _)) => old_id != new_pane_id,
+                None => true,
+            };
+            if should_emit {
+                let event = FocusEvent {
+                    pane_id: new_pane_id,
+                    focused: true,
+                };
+                let json = event.to_json();
+                for sub in self.subscribers_for_pane(new_pane_id) {
+                    events.push((sub.pipe_id.clone(), json.clone()));
+                }
+            }
+        }
+
+        self.last_focused = new_focused;
+        events
+    }
 }
 
 #[cfg(test)]
@@ -146,5 +201,62 @@ mod tests {
 
         let subs = tracker.subscribers_for_pane(1);
         assert_eq!(subs.len(), 1); // only all-panes
+    }
+
+    #[test]
+    fn tracker_on_focus_change_emits_focus_event() {
+        let mut tracker = FocusTracker::new();
+        tracker.subscribe("pipe-1".to_string(), None);
+
+        let events = tracker.on_focus_change(Some((42, false)));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "pipe-1");
+        assert_eq!(events[0].1, r#"{"pane_id":42,"focused":true}"#);
+    }
+
+    #[test]
+    fn tracker_on_focus_change_emits_unfocus_then_focus() {
+        let mut tracker = FocusTracker::new();
+        tracker.subscribe("pipe-1".to_string(), None);
+
+        // Initial focus on pane 42
+        tracker.on_focus_change(Some((42, false)));
+
+        // Switch to pane 17
+        let events = tracker.on_focus_change(Some((17, false)));
+        assert_eq!(events.len(), 2);
+        // First: unfocus 42
+        assert_eq!(events[0].1, r#"{"pane_id":42,"focused":false}"#);
+        // Second: focus 17
+        assert_eq!(events[1].1, r#"{"pane_id":17,"focused":true}"#);
+    }
+
+    #[test]
+    fn tracker_on_focus_change_no_event_if_same_pane() {
+        let mut tracker = FocusTracker::new();
+        tracker.subscribe("pipe-1".to_string(), None);
+
+        tracker.on_focus_change(Some((42, false)));
+        let events = tracker.on_focus_change(Some((42, false)));
+        assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn tracker_on_focus_change_no_events_without_subscribers() {
+        let mut tracker = FocusTracker::new();
+        let events = tracker.on_focus_change(Some((42, false)));
+        assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn tracker_subscribe_returns_current_focus_state() {
+        let mut tracker = FocusTracker::new();
+        tracker.on_focus_change(Some((42, false)));
+
+        let event = tracker.subscribe("pipe-1".to_string(), None);
+        assert!(event.is_some());
+        let event = event.unwrap();
+        assert_eq!(event.pane_id, 42);
+        assert!(event.focused);
     }
 }
