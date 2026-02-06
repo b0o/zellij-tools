@@ -4,12 +4,23 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-const PLUGIN_PATH: &str = "file:~/.config/zellij/plugins/zellij-tools.wasm";
+const DEFAULT_PLUGIN: &str = "zellij-tools";
+
+fn resolve_plugin(cli_override: Option<&str>) -> String {
+    cli_override
+        .map(String::from)
+        .or_else(|| std::env::var("ZELLIJ_TOOLS_PLUGIN").ok())
+        .unwrap_or_else(|| DEFAULT_PLUGIN.to_string())
+}
 
 #[derive(Parser)]
 #[command(name = "zellij-tools")]
 #[command(about = "CLI utilities for zellij-tools plugin")]
 struct Cli {
+    /// Plugin reference (name alias or file: path) [env: ZELLIJ_TOOLS_PLUGIN]
+    #[arg(long, global = true)]
+    plugin: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -33,7 +44,7 @@ enum SubscribeEvent {
     },
 }
 
-fn subscribe_pane_focus(pane_filter: Option<u32>) -> std::io::Result<()> {
+fn subscribe_pane_focus(pane_filter: Option<u32>, plugin: &str) -> std::io::Result<()> {
     let pipe_name = format!("zellij-tools-focus-{}", uuid::Uuid::new_v4());
 
     // Build subscribe message
@@ -44,7 +55,7 @@ fn subscribe_pane_focus(pane_filter: Option<u32>) -> std::io::Result<()> {
 
     // Spawn zellij pipe
     let mut child = Command::new("zellij")
-        .args(["pipe", "--name", &pipe_name, "--plugin", PLUGIN_PATH])
+        .args(["pipe", "--name", &pipe_name, "--plugin", plugin])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -60,6 +71,7 @@ fn subscribe_pane_focus(pane_filter: Option<u32>) -> std::io::Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     let pipe_name_clone = pipe_name.clone();
+    let plugin_clone = plugin.to_string();
     let child_clone = Arc::clone(&child);
 
     ctrlc::set_handler(move || {
@@ -69,7 +81,7 @@ fn subscribe_pane_focus(pane_filter: Option<u32>) -> std::io::Result<()> {
             .args([
                 "pipe",
                 "--plugin",
-                PLUGIN_PATH,
+                &plugin_clone,
                 "--",
                 &format!("zellij-tools::unsubscribe-focus::{}", pipe_name_clone),
             ])
@@ -115,10 +127,12 @@ fn subscribe_pane_focus(pane_filter: Option<u32>) -> std::io::Result<()> {
 fn main() {
     let cli = Cli::parse();
 
+    let plugin = resolve_plugin(cli.plugin.as_deref());
+
     match cli.command {
         Commands::Subscribe { event } => match event {
             SubscribeEvent::PaneFocus { pane } => {
-                if let Err(e) = subscribe_pane_focus(pane) {
+                if let Err(e) = subscribe_pane_focus(pane, &plugin) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
