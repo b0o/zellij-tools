@@ -53,6 +53,98 @@ impl Event {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap()
     }
+
+    /// Serialize with full detail from pane/tab context.
+    /// For pane events, looks up the pane and includes all its fields.
+    /// For tab events, looks up the tab and includes all its fields.
+    pub fn to_full_json(&self, panes: &[PaneInfo], tabs: &[TabInfo]) -> String {
+        let mut value = serde_json::to_value(self).unwrap();
+
+        match self {
+            Event::PaneFocused { pane_id }
+            | Event::PaneUnfocused { pane_id }
+            | Event::PaneClosed { pane_id } => {
+                if let Some(pane) = panes.iter().find(|p| p.id == *pane_id) {
+                    Self::merge_pane_detail(&mut value, pane);
+                }
+            }
+            Event::PaneOpened { pane_id, .. } => {
+                if let Some(pane) = panes.iter().find(|p| p.id == *pane_id) {
+                    Self::merge_pane_detail(&mut value, pane);
+                }
+            }
+            Event::TabFocused { stable_id, .. }
+            | Event::TabUnfocused { stable_id, .. }
+            | Event::TabCreated { stable_id, .. }
+            | Event::TabClosed { stable_id, .. } => {
+                if let Some(tab) = tabs.iter().find(|t| t.stable_id == *stable_id) {
+                    Self::merge_tab_detail(&mut value, tab);
+                }
+            }
+            Event::TabMoved { stable_id, .. } => {
+                if let Some(tab) = tabs.iter().find(|t| t.stable_id == *stable_id) {
+                    Self::merge_tab_detail(&mut value, tab);
+                }
+            }
+        }
+
+        serde_json::to_string(&value).unwrap()
+    }
+
+    /// Merge pane detail fields into the event's inner object
+    fn merge_pane_detail(value: &mut serde_json::Value, pane: &PaneInfo) {
+        // The event is {"EventName": {fields}} — get the inner object
+        if let Some(obj) = value.as_object_mut() {
+            for (_, inner) in obj.iter_mut() {
+                if let Some(inner_obj) = inner.as_object_mut() {
+                    inner_obj.insert(
+                        "title".to_string(),
+                        serde_json::Value::String(pane.title.clone()),
+                    );
+                    inner_obj.insert(
+                        "is_plugin".to_string(),
+                        serde_json::Value::Bool(pane.is_plugin),
+                    );
+                    inner_obj.insert(
+                        "is_floating".to_string(),
+                        serde_json::Value::Bool(pane.is_floating),
+                    );
+                    inner_obj.insert(
+                        "is_suppressed".to_string(),
+                        serde_json::Value::Bool(pane.is_suppressed),
+                    );
+                    if let Some(ref cmd) = pane.terminal_command {
+                        inner_obj.insert(
+                            "terminal_command".to_string(),
+                            serde_json::Value::String(cmd.clone()),
+                        );
+                    }
+                    if let Some(ref url) = pane.plugin_url {
+                        inner_obj.insert(
+                            "plugin_url".to_string(),
+                            serde_json::Value::String(url.clone()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Merge tab detail fields into the event's inner object
+    fn merge_tab_detail(value: &mut serde_json::Value, _tab: &TabInfo) {
+        // TabInfo already has all fields in the event (stable_id, position, name)
+        // Nothing extra to merge for now
+        let _ = value;
+    }
+}
+
+/// Subscriber mode: controls how much detail is included in events
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscribeMode {
+    /// Minimal events with just IDs
+    Compact,
+    /// Full events with all object fields
+    Full,
 }
 
 /// A subscriber to the event stream
@@ -60,11 +152,13 @@ impl Event {
 pub struct Subscriber {
     /// The CLI pipe ID to send events to
     pub pipe_id: String,
+    /// Whether to include full object details in events
+    pub mode: SubscribeMode,
 }
 
 impl Subscriber {
-    pub fn new(pipe_id: String) -> Self {
-        Self { pipe_id }
+    pub fn new(pipe_id: String, mode: SubscribeMode) -> Self {
+        Self { pipe_id, mode }
     }
 }
 
@@ -97,13 +191,17 @@ pub struct TabInfo {
     pub active: bool,
 }
 
-/// Information about a pane from the manifest, used for diffing
+/// Information about a pane from the manifest, used for diffing and detail
 pub struct PaneInfo {
     pub id: u32,
     pub is_focused: bool,
     pub is_floating: bool,
     pub is_suppressed: bool,
     pub is_plugin: bool,
+    // Extra fields for full mode
+    pub title: String,
+    pub terminal_command: Option<String>,
+    pub plugin_url: Option<String>,
 }
 
 impl EventStream {
@@ -113,8 +211,8 @@ impl EventStream {
 
     /// Add a subscriber. Returns a vec of events representing current state
     /// (so the subscriber gets an initial snapshot).
-    pub fn subscribe(&mut self, pipe_id: String) -> Vec<Event> {
-        let subscriber = Subscriber::new(pipe_id.clone());
+    pub fn subscribe(&mut self, pipe_id: String, mode: SubscribeMode) -> Vec<Event> {
+        let subscriber = Subscriber::new(pipe_id.clone(), mode);
         self.subscribers.insert(pipe_id, subscriber);
 
         let mut initial_events = Vec::new();
@@ -157,7 +255,6 @@ impl EventStream {
     /// Returns a vec of (pipe_id, json_event) tuples to emit.
     pub fn on_pane_update(&mut self, panes: &[PaneInfo]) -> Vec<(String, String)> {
         if !self.has_subscribers() {
-            // Still update internal state even without subscribers
             self.update_pane_state(panes);
             return vec![];
         }
@@ -165,16 +262,7 @@ impl EventStream {
         let events = self.compute_events(panes);
         self.update_pane_state(panes);
 
-        // Broadcast each event to all subscribers
-        let mut output = Vec::new();
-        for event in &events {
-            let json = event.to_json();
-            for sub in self.subscribers.values() {
-                output.push((sub.pipe_id.clone(), json.clone()));
-            }
-        }
-
-        output
+        self.broadcast_events(&events, panes, &[])
     }
 
     /// Process a tab update, returns events to broadcast to all subscribers.
@@ -187,14 +275,39 @@ impl EventStream {
         let events = self.compute_tab_events(tabs);
         self.update_tab_state(tabs);
 
+        self.broadcast_events(&events, &[], tabs)
+    }
+
+    /// Broadcast events to all subscribers, respecting their mode.
+    /// Full-mode subscribers get extra detail fields in the JSON.
+    fn broadcast_events(
+        &self,
+        events: &[Event],
+        panes: &[PaneInfo],
+        tabs: &[TabInfo],
+    ) -> Vec<(String, String)> {
         let mut output = Vec::new();
-        for event in &events {
-            let json = event.to_json();
+        for event in events {
+            let compact_json = event.to_json();
+            // Only compute full JSON if any subscriber wants it
+            let full_json = if self
+                .subscribers
+                .values()
+                .any(|s| s.mode == SubscribeMode::Full)
+            {
+                Some(event.to_full_json(panes, tabs))
+            } else {
+                None
+            };
+
             for sub in self.subscribers.values() {
-                output.push((sub.pipe_id.clone(), json.clone()));
+                let json = match sub.mode {
+                    SubscribeMode::Compact => compact_json.clone(),
+                    SubscribeMode::Full => full_json.as_ref().unwrap_or(&compact_json).clone(),
+                };
+                output.push((sub.pipe_id.clone(), json));
             }
         }
-
         output
     }
 
@@ -376,6 +489,9 @@ mod tests {
             is_floating,
             is_suppressed: false,
             is_plugin: false,
+            title: String::new(),
+            terminal_command: None,
+            plugin_url: None,
         }
     }
 
@@ -386,6 +502,9 @@ mod tests {
             is_floating: true,
             is_suppressed: true,
             is_plugin: false,
+            title: String::new(),
+            terminal_command: None,
+            plugin_url: None,
         }
     }
 
@@ -426,7 +545,7 @@ mod tests {
     #[test]
     fn subscribe_with_no_prior_state_returns_empty() {
         let mut stream = EventStream::new();
-        let events = stream.subscribe("pipe-1".to_string());
+        let events = stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
         assert!(events.is_empty());
     }
 
@@ -437,7 +556,7 @@ mod tests {
         let panes = vec![make_pane(42, true, false)];
         stream.on_pane_update(&panes);
 
-        let events = stream.subscribe("pipe-1".to_string());
+        let events = stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], Event::PaneFocused { pane_id: 42 });
     }
@@ -445,7 +564,7 @@ mod tests {
     #[test]
     fn unsubscribe_removes_subscriber() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
         assert!(stream.has_subscribers());
         stream.unsubscribe("pipe-1");
         assert!(!stream.has_subscribers());
@@ -456,7 +575,7 @@ mod tests {
     #[test]
     fn focus_change_emits_focused_event() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         let panes = vec![make_pane(42, true, false)];
         let output = stream.on_pane_update(&panes);
@@ -469,7 +588,7 @@ mod tests {
     #[test]
     fn focus_switch_emits_unfocus_then_focus() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         // Initial: pane 42 focused
         let panes = vec![make_pane(42, true, false), make_pane(17, false, false)];
@@ -487,7 +606,7 @@ mod tests {
     #[test]
     fn same_focus_emits_no_focus_events() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         let panes = vec![make_pane(42, true, false)];
         stream.on_pane_update(&panes);
@@ -510,7 +629,7 @@ mod tests {
     #[test]
     fn new_pane_emits_opened_event() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         // Initial: one pane
         let panes = vec![make_pane(1, true, false)];
@@ -527,7 +646,7 @@ mod tests {
     #[test]
     fn removed_pane_emits_closed_event() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         // Initial: two panes
         let panes = vec![make_pane(1, true, false), make_pane(2, false, false)];
@@ -546,7 +665,7 @@ mod tests {
     #[test]
     fn floating_pane_takes_focus_precedence() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         // Both tiled and floating report focused, floating wins
         let panes = vec![make_pane(1, true, false), make_pane(2, true, true)];
@@ -561,7 +680,7 @@ mod tests {
     #[test]
     fn suppressed_pane_not_considered_focused() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         let panes = vec![make_pane(1, true, false), make_suppressed_pane(2, true)];
         let output = stream.on_pane_update(&panes);
@@ -640,7 +759,7 @@ mod tests {
     #[test]
     fn tab_focus_change_emits_events() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         // Initial: tab 0 active
         let tabs = vec![
@@ -664,7 +783,7 @@ mod tests {
     #[test]
     fn same_tab_focus_emits_nothing() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         let tabs = vec![make_tab(100, 0, "tab1", true)];
         stream.on_tab_update(&tabs);
@@ -678,7 +797,7 @@ mod tests {
     #[test]
     fn new_tab_emits_created_event() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         let tabs = vec![make_tab(100, 0, "tab1", true)];
         stream.on_tab_update(&tabs);
@@ -697,7 +816,7 @@ mod tests {
     #[test]
     fn removed_tab_emits_closed_event() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         let tabs = vec![
             make_tab(100, 0, "tab1", true),
@@ -721,7 +840,7 @@ mod tests {
         let tabs = vec![make_tab(100, 0, "tab1", true)];
         stream.on_tab_update(&tabs);
 
-        let events = stream.subscribe("pipe-1".to_string());
+        let events = stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
         assert!(events.contains(&Event::TabFocused {
             stable_id: 100,
             position: 0,
@@ -734,7 +853,7 @@ mod tests {
     #[test]
     fn tab_swap_emits_moved_not_focus_change() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         // Initial: tab A at pos 0 (active), tab B at pos 1
         let tabs = vec![
@@ -766,7 +885,7 @@ mod tests {
     #[test]
     fn tab_move_with_focus_change() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         // Initial: tab A at pos 0 (active), tab B at pos 1
         let tabs = vec![
@@ -796,8 +915,8 @@ mod tests {
     #[test]
     fn events_broadcast_to_all_subscribers() {
         let mut stream = EventStream::new();
-        stream.subscribe("pipe-1".to_string());
-        stream.subscribe("pipe-2".to_string());
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
+        stream.subscribe("pipe-2".to_string(), SubscribeMode::Compact);
 
         let panes = vec![make_pane(42, true, false)];
         let output = stream.on_pane_update(&panes);
@@ -810,5 +929,88 @@ mod tests {
             .collect();
         assert!(pipe_ids.contains(&"pipe-1"));
         assert!(pipe_ids.contains(&"pipe-2"));
+    }
+
+    // --- Full mode ---
+
+    fn make_detailed_pane(id: u32, is_focused: bool, title: &str, command: &str) -> PaneInfo {
+        PaneInfo {
+            id,
+            is_focused,
+            is_floating: false,
+            is_suppressed: false,
+            is_plugin: false,
+            title: title.to_string(),
+            terminal_command: Some(command.to_string()),
+            plugin_url: None,
+        }
+    }
+
+    #[test]
+    fn full_mode_pane_event_includes_detail() {
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Full);
+
+        let panes = vec![make_detailed_pane(42, true, "zsh", "/bin/zsh")];
+        let output = stream.on_pane_update(&panes);
+
+        // Find the PaneFocused event
+        let focus_json = output
+            .iter()
+            .find(|(_, json)| json.contains("PaneFocused"))
+            .map(|(_, json)| json.clone())
+            .expect("Should have PaneFocused event");
+
+        let v: serde_json::Value = serde_json::from_str(&focus_json).unwrap();
+        let inner = &v["PaneFocused"];
+        assert_eq!(inner["pane_id"], 42);
+        assert_eq!(inner["title"], "zsh");
+        assert_eq!(inner["terminal_command"], "/bin/zsh");
+        assert_eq!(inner["is_floating"], false);
+    }
+
+    #[test]
+    fn compact_mode_pane_event_has_no_extra_fields() {
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
+
+        let panes = vec![make_detailed_pane(42, true, "zsh", "/bin/zsh")];
+        let output = stream.on_pane_update(&panes);
+
+        let focus_json = output
+            .iter()
+            .find(|(_, json)| json.contains("PaneFocused"))
+            .map(|(_, json)| json.clone())
+            .expect("Should have PaneFocused event");
+
+        // Compact mode should NOT have title
+        let v: serde_json::Value = serde_json::from_str(&focus_json).unwrap();
+        assert!(v["PaneFocused"]["title"].is_null());
+    }
+
+    #[test]
+    fn mixed_mode_subscribers_get_different_json() {
+        let mut stream = EventStream::new();
+        stream.subscribe("compact".to_string(), SubscribeMode::Compact);
+        stream.subscribe("full".to_string(), SubscribeMode::Full);
+
+        let panes = vec![make_detailed_pane(42, true, "zsh", "/bin/zsh")];
+        let output = stream.on_pane_update(&panes);
+
+        let compact_json = output
+            .iter()
+            .find(|(id, json)| id == "compact" && json.contains("PaneFocused"))
+            .map(|(_, json)| json.clone())
+            .expect("compact subscriber should get PaneFocused");
+        let full_json = output
+            .iter()
+            .find(|(id, json)| id == "full" && json.contains("PaneFocused"))
+            .map(|(_, json)| json.clone())
+            .expect("full subscriber should get PaneFocused");
+
+        // Full should have more data
+        assert!(full_json.len() > compact_json.len());
+        assert!(full_json.contains("title"));
+        assert!(!compact_json.contains("title"));
     }
 }

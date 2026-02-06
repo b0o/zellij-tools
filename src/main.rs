@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use zellij_tile::prelude::*;
 
 use zellij_tools::config::resolve_include_path;
-use zellij_tools::events::{EventStream, PaneInfo as EventPaneInfo, TabInfo as EventTabInfo};
+use zellij_tools::events::{
+    EventStream, PaneInfo as EventPaneInfo, SubscribeMode, TabInfo as EventTabInfo,
+};
 use zellij_tools::message::{parse_message, ParseError};
 use zellij_tools::scratchpad::{
     parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadCommand, ScratchpadContext,
@@ -176,7 +178,13 @@ impl State {
                     }
                 };
 
-                let initial_events = self.event_stream.subscribe(cli_pipe_id.clone());
+                let mode = if message.args.first().map(|s| s.as_str()) == Some("full") {
+                    SubscribeMode::Full
+                } else {
+                    SubscribeMode::Compact
+                };
+
+                let initial_events = self.event_stream.subscribe(cli_pipe_id.clone(), mode);
                 for event in &initial_events {
                     self.emit_event(&cli_pipe_id, &event.to_json());
                 }
@@ -281,6 +289,9 @@ impl ZellijPlugin for State {
                         is_floating: p.is_floating,
                         is_suppressed: p.is_suppressed,
                         is_plugin: p.is_plugin,
+                        title: p.title.clone(),
+                        terminal_command: p.terminal_command.clone(),
+                        plugin_url: p.plugin_url.clone(),
                     })
                     .collect();
                 let events = self.event_stream.on_pane_update(&event_panes);
