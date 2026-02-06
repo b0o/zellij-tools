@@ -11,13 +11,15 @@ use zellij_tools::scratchpad::{
     ScratchpadManager,
 };
 use zellij_tools::stable_tabs::StableTabTracker;
+use zellij_tools::tree;
 
 #[derive(Default)]
 struct State {
     // Pane tracking (from PaneUpdate events)
     pane_manifest: HashMap<usize, Vec<PaneInfo>>,
 
-    // Current tab position and floating pane visibility (from TabUpdate events)
+    // Tab tracking (from TabUpdate events)
+    tab_infos: Vec<TabInfo>,
     current_tab_position: usize,
     are_floating_panes_visible: bool,
 
@@ -189,6 +191,22 @@ impl State {
                 self.event_stream.unsubscribe(&message.args[0]);
                 Ok(())
             }
+            "tree" => {
+                let cli_pipe_id = match &pipe_message.source {
+                    PipeSource::Cli(id) => id.clone(),
+                    _ => {
+                        return Err(ParseError::InvalidArgs(
+                            "tree only works from CLI pipes".to_string(),
+                        ))
+                    }
+                };
+
+                let session_tree =
+                    tree::build_tree(&self.tab_infos, &self.pane_manifest, &self.tab_tracker);
+                let json = serde_json::to_string(&session_tree).unwrap_or_default();
+                self.emit_event(&cli_pipe_id, &json);
+                Ok(())
+            }
             _ => Err(ParseError::UnknownEvent(message.event)),
         }
     }
@@ -287,6 +305,7 @@ impl ZellijPlugin for State {
                     self.current_tab_position = active_tab.position;
                     self.are_floating_panes_visible = active_tab.are_floating_panes_visible;
                 }
+                self.tab_infos = tab_infos;
             }
             Event::HostFolderChanged(_new_path) => {
                 // Resolve include path now that /host is mounted to /

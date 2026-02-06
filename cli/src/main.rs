@@ -31,6 +31,8 @@ struct Cli {
 enum Commands {
     /// Subscribe to the event stream from the zellij-tools plugin
     Subscribe,
+    /// Print the session tree (tabs, panes, stable IDs) as JSON
+    Tree,
 }
 
 fn subscribe(plugin: &str) -> std::io::Result<()> {
@@ -132,17 +134,69 @@ fn subscribe(plugin: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Send a one-shot request to the plugin and read a single JSON response.
+fn tree(plugin: &str) -> std::io::Result<()> {
+    let pipe_name = format!("zellij-tools-tree-{}", uuid::Uuid::new_v4());
+    let msg = "zellij-tools::tree".to_string();
+
+    let mut child = Command::new("zellij")
+        .args(["pipe", "--name", &pipe_name, "--plugin", plugin, "--", &msg])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    // The tree response is emitted from pipe(), so it arrives immediately
+    // without needing heartbeats. But we still need a single heartbeat
+    // to flush the response if it was buffered.
+    if let Some(mut stdin) = child.stdin.take() {
+        // Send one heartbeat then close stdin so the pipe closes after response
+        let _ = stdin.write_all(b"\n");
+        let _ = stdin.flush();
+        // Keep stdin open briefly to allow the response to flush
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            drop(stdin);
+        });
+
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) if !l.is_empty() => {
+                        println!("{}", l);
+                        // Got our response, we're done
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        eprintln!("Error reading: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        handle.join().ok();
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
 
     let plugin = resolve_plugin(cli.plugin.as_deref());
 
-    match cli.command {
-        Commands::Subscribe => {
-            if let Err(e) = subscribe(&plugin) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        }
+    let result = match cli.command {
+        Commands::Subscribe => subscribe(&plugin),
+        Commands::Tree => tree(&plugin),
+    };
+
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
     }
 }

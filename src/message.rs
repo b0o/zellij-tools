@@ -115,4 +115,11 @@ mod tests {
         assert_eq!(msg.event, "unsubscribe");
         assert_eq!(msg.args, vec!["pipe-123"]);
     }
+
+    #[test]
+    fn parse_tree() {
+        let msg = parse_message("zellij-tools::tree").unwrap();
+        assert_eq!(msg.event, "tree");
+        assert!(msg.args.is_empty());
+    }
 }
