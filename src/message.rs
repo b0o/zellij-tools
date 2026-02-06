@@ -101,4 +101,25 @@ mod tests {
         let result = parse_message("");
         assert!(matches!(result, Err(ParseError::InvalidFormat)));
     }
+
+    #[test]
+    fn parse_subscribe_focus_no_filter() {
+        let msg = parse_message("zellij-tools::subscribe-focus").unwrap();
+        assert_eq!(msg.event, "subscribe-focus");
+        assert!(msg.args.is_empty());
+    }
+
+    #[test]
+    fn parse_subscribe_focus_with_pane_filter() {
+        let msg = parse_message("zellij-tools::subscribe-focus::42").unwrap();
+        assert_eq!(msg.event, "subscribe-focus");
+        assert_eq!(msg.args, vec!["42"]);
+    }
+
+    #[test]
+    fn parse_unsubscribe_focus() {
+        let msg = parse_message("zellij-tools::unsubscribe-focus::pipe-123").unwrap();
+        assert_eq!(msg.event, "unsubscribe-focus");
+        assert_eq!(msg.args, vec!["pipe-123"]);
+    }
 }
