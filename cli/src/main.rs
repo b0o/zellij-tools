@@ -1,10 +1,12 @@
 use clap::{Parser, Subcommand};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const DEFAULT_PLUGIN: &str = "zellij-tools";
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 
 fn resolve_plugin(cli_override: Option<&str>) -> String {
     cli_override
@@ -54,7 +56,6 @@ fn subscribe_pane_focus(pane_filter: Option<u32>, plugin: &str) -> std::io::Resu
     };
 
     // Spawn zellij pipe with subscribe message as positional payload.
-    // The payload is sent immediately; stdin is kept open to hold the pipe alive.
     let mut child = Command::new("zellij")
         .args([
             "pipe",
@@ -70,8 +71,7 @@ fn subscribe_pane_focus(pane_filter: Option<u32>, plugin: &str) -> std::io::Resu
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    // Hold stdin open to keep the pipe alive (dropping it would close the pipe)
-    let _stdin = child.stdin.take().expect("Failed to open stdin");
+    let stdin = child.stdin.take().expect("Failed to open stdin");
     let stdout = child.stdout.take().expect("Failed to open stdout");
 
     // Wrap child in Arc<Mutex> so Ctrl+C handler can kill it
@@ -104,6 +104,23 @@ fn subscribe_pane_focus(pane_filter: Option<u32>, plugin: &str) -> std::io::Resu
     })
     .expect("Error setting Ctrl-C handler");
 
+    // Spawn heartbeat thread: sends empty lines to stdin to trigger pipe()
+    // calls on the plugin, which flushes buffered cli_pipe_output data.
+    // Without this, events emitted from update() would never reach the CLI.
+    let heartbeat_running = running.clone();
+    let stdin = Arc::new(Mutex::new(stdin));
+    let heartbeat_stdin = Arc::clone(&stdin);
+    std::thread::spawn(move || {
+        while heartbeat_running.load(Ordering::SeqCst) {
+            std::thread::sleep(HEARTBEAT_INTERVAL);
+            if let Ok(mut stdin) = heartbeat_stdin.lock() {
+                if stdin.write_all(b"\n").is_err() || stdin.flush().is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
     // Read and forward stdout
     let reader = BufReader::new(stdout);
     for line in reader.lines() {
@@ -111,7 +128,11 @@ fn subscribe_pane_focus(pane_filter: Option<u32>, plugin: &str) -> std::io::Resu
             break;
         }
         match line {
-            Ok(l) => println!("{}", l),
+            Ok(l) => {
+                if !l.is_empty() {
+                    println!("{}", l);
+                }
+            }
             Err(e) => {
                 if running.load(Ordering::SeqCst) {
                     eprintln!("Error reading: {}", e);
