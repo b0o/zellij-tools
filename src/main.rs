@@ -182,9 +182,21 @@ impl State {
                     })?)
                 };
 
+                eprintln!(
+                    "[zjt:subscribe] pipe_id={} pane_filter={:?}",
+                    pipe_id, pane_filter
+                );
                 if let Some(event) = self.focus_tracker.subscribe(pipe_id.clone(), pane_filter) {
+                    eprintln!(
+                        "[zjt:subscribe] emitting initial state: {}",
+                        event.to_json()
+                    );
                     self.emit_focus_event(&pipe_id, &event.to_json());
                 }
+                eprintln!(
+                    "[zjt:subscribe] has_subscribers={}",
+                    self.focus_tracker.has_subscribers()
+                );
                 Ok(())
             }
             "unsubscribe-focus" => {
@@ -223,6 +235,7 @@ impl ZellijPlugin for State {
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
+            PermissionType::ReadCliPipes,
             PermissionType::FullHdAccess,
         ]);
 
@@ -268,8 +281,16 @@ impl ZellijPlugin for State {
                 // Track focus changes and emit events
                 let focused = self.find_focused_pane();
                 let events = self.focus_tracker.on_focus_change(focused);
-                for (pipe_id, json) in events {
-                    self.emit_focus_event(&pipe_id, &json);
+                if self.focus_tracker.has_subscribers() {
+                    eprintln!(
+                        "[zjt:pane_update] focused={:?} events_count={}",
+                        focused,
+                        events.len()
+                    );
+                }
+                for (pipe_id, json) in &events {
+                    eprintln!("[zjt:emit] pipe_id={} json={}", pipe_id, json);
+                    self.emit_focus_event(pipe_id, json);
                 }
 
                 // Update stable tab mapping and get orphaned tabs
@@ -366,10 +387,17 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        eprintln!(
+            "[zjt:pipe] source={:?} name={:?} payload={:?}",
+            pipe_message.source, pipe_message.name, pipe_message.payload
+        );
         match self.handle_event(&pipe_message) {
-            Ok(()) => true,
+            Ok(()) => {
+                eprintln!("[zjt:pipe] handled OK");
+                true
+            }
             Err(e) => {
-                eprintln!("Error handling event: {}", e);
+                eprintln!("[zjt:pipe] error: {}", e);
                 false
             }
         }
