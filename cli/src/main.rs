@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -53,15 +53,25 @@ fn subscribe_pane_focus(pane_filter: Option<u32>, plugin: &str) -> std::io::Resu
         None => "zellij-tools::subscribe-focus".to_string(),
     };
 
-    // Spawn zellij pipe
+    // Spawn zellij pipe with subscribe message as positional payload.
+    // The payload is sent immediately; stdin is kept open to hold the pipe alive.
     let mut child = Command::new("zellij")
-        .args(["pipe", "--name", &pipe_name, "--plugin", plugin])
+        .args([
+            "pipe",
+            "--name",
+            &pipe_name,
+            "--plugin",
+            plugin,
+            "--",
+            &subscribe_msg,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    let mut stdin = child.stdin.take().expect("Failed to open stdin");
+    // Hold stdin open to keep the pipe alive (dropping it would close the pipe)
+    let _stdin = child.stdin.take().expect("Failed to open stdin");
     let stdout = child.stdout.take().expect("Failed to open stdout");
 
     // Wrap child in Arc<Mutex> so Ctrl+C handler can kill it
@@ -93,12 +103,6 @@ fn subscribe_pane_focus(pane_filter: Option<u32>, plugin: &str) -> std::io::Resu
         }
     })
     .expect("Error setting Ctrl-C handler");
-
-    // Send subscribe message
-    writeln!(stdin, "{}", subscribe_msg)?;
-    stdin.flush()?;
-    // Keep stdin open to keep the pipe alive
-    let _keep_stdin = stdin;
 
     // Read and forward stdout
     let reader = BufReader::new(stdout);
