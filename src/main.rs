@@ -174,8 +174,6 @@ impl State {
                     }
                 };
 
-                let pipe_name = pipe_message.name.clone();
-
                 let pane_filter = if message.args.is_empty() {
                     None
                 } else {
@@ -184,32 +182,12 @@ impl State {
                     })?)
                 };
 
-                eprintln!(
-                    "[zjt:subscribe] cli_pipe_id={} pipe_name={} pane_filter={:?}",
-                    cli_pipe_id, pipe_name, pane_filter
-                );
-
-                // DEBUG: Try both identifiers to see which one works
-                let test_json = r#"{"pane_id":999,"focused":true}"#;
-                eprintln!("[zjt:debug] emitting test via pipe_name={}", pipe_name);
-                cli_pipe_output(&pipe_name, &format!("{}\n", test_json));
-                eprintln!("[zjt:debug] emitting test via cli_pipe_id={}", cli_pipe_id);
-                cli_pipe_output(&cli_pipe_id, &format!("{}\n", test_json));
-
                 if let Some(event) = self
                     .focus_tracker
                     .subscribe(cli_pipe_id.clone(), pane_filter)
                 {
-                    eprintln!(
-                        "[zjt:subscribe] emitting initial state via cli_pipe_id: {}",
-                        event.to_json()
-                    );
                     self.emit_focus_event(&cli_pipe_id, &event.to_json());
                 }
-                eprintln!(
-                    "[zjt:subscribe] has_subscribers={}",
-                    self.focus_tracker.has_subscribers()
-                );
                 Ok(())
             }
             "unsubscribe-focus" => {
@@ -287,27 +265,17 @@ impl ZellijPlugin for State {
     }
 
     fn update(&mut self, event: Event) -> bool {
-        let mut should_render = false;
-
         match event {
             Event::PaneUpdate(pane_manifest) => {
                 self.pane_manifest = pane_manifest.panes;
 
-                // Track focus changes and emit events
+                // Track focus changes and emit events.
+                // Note: cli_pipe_output calls are buffered by zellij and only
+                // flushed on the next pipe() call. The CLI sends periodic
+                // heartbeats to trigger the flush.
                 let focused = self.find_focused_pane();
                 let events = self.focus_tracker.on_focus_change(focused);
-                if self.focus_tracker.has_subscribers() {
-                    eprintln!(
-                        "[zjt:pane_update] focused={:?} events_count={}",
-                        focused,
-                        events.len()
-                    );
-                }
-                if !events.is_empty() {
-                    should_render = true;
-                }
                 for (pipe_id, json) in &events {
-                    eprintln!("[zjt:emit] pipe_id={} json={}", pipe_id, json);
                     self.emit_focus_event(pipe_id, json);
                 }
 
@@ -401,21 +369,21 @@ impl ZellijPlugin for State {
             }
             _ => (),
         };
-        should_render
+        false
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-        eprintln!(
-            "[zjt:pipe] source={:?} name={:?} payload={:?}",
-            pipe_message.source, pipe_message.name, pipe_message.payload
-        );
+        // Empty payloads are heartbeats from CLI subscribers to flush buffered
+        // cli_pipe_output data. Silently ignore them.
+        let payload = pipe_message.payload.as_deref().unwrap_or("");
+        if payload.is_empty() || payload.trim().is_empty() {
+            return false;
+        }
+
         match self.handle_event(&pipe_message) {
-            Ok(()) => {
-                eprintln!("[zjt:pipe] handled OK");
-                true
-            }
+            Ok(()) => true,
             Err(e) => {
-                eprintln!("[zjt:pipe] error: {}", e);
+                eprintln!("Error handling event: {}", e);
                 false
             }
         }
