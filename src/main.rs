@@ -165,14 +165,16 @@ impl State {
                 Ok(())
             }
             "subscribe-focus" => {
-                let pipe_id = match &pipe_message.source {
-                    PipeSource::Cli(id) => id.clone(),
-                    _ => {
-                        return Err(ParseError::InvalidArgs(
-                            "subscribe-focus only works from CLI pipes".to_string(),
-                        ))
-                    }
-                };
+                // Verify this came from a CLI pipe
+                if !matches!(&pipe_message.source, PipeSource::Cli(_)) {
+                    return Err(ParseError::InvalidArgs(
+                        "subscribe-focus only works from CLI pipes".to_string(),
+                    ));
+                }
+
+                // Use the pipe NAME (not the CLI pipe ID) for cli_pipe_output.
+                // cli_pipe_output identifies pipes by name, not by the auto-assigned CLI ID.
+                let pipe_name = pipe_message.name.clone();
 
                 let pane_filter = if message.args.is_empty() {
                     None
@@ -183,15 +185,15 @@ impl State {
                 };
 
                 eprintln!(
-                    "[zjt:subscribe] pipe_id={} pane_filter={:?}",
-                    pipe_id, pane_filter
+                    "[zjt:subscribe] pipe_name={} pane_filter={:?}",
+                    pipe_name, pane_filter
                 );
-                if let Some(event) = self.focus_tracker.subscribe(pipe_id.clone(), pane_filter) {
+                if let Some(event) = self.focus_tracker.subscribe(pipe_name.clone(), pane_filter) {
                     eprintln!(
                         "[zjt:subscribe] emitting initial state: {}",
                         event.to_json()
                     );
-                    self.emit_focus_event(&pipe_id, &event.to_json());
+                    self.emit_focus_event(&pipe_name, &event.to_json());
                 }
                 eprintln!(
                     "[zjt:subscribe] has_subscribers={}",
