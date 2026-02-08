@@ -8,7 +8,7 @@ version = "0.1.0"
 authors = ["Maddison Hellstrom <hi@maddison.io>"]
 edition = "2021"
 license = "MIT"
-rust-version = "1.84"
+rust-version = "1.85"
 
 [lib]
 name = "zellij_tools"

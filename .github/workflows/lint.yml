@@ -15,7 +15,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4f647fc679bcd3b11499ccb42104547c83dabe96 # stable
         with:
-          toolchain: "1.84.0"
+          toolchain: "1.85.0"
           target: wasm32-wasip1
           components: clippy
 
@@ -23,4 +23,4 @@ jobs:
         uses: clechasseur/rs-clippy-check@9ef202cdf5c9672a6d795dbb5309f6b62c4ab908 # v3
         with:
           args: --all-features --target=wasm32-wasip1
-          toolchain: "1.84.0"
+          toolchain: "1.85.0"
