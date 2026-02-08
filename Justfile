@@ -21,5 +21,10 @@ build-all-release: build-release build-cli-release
 fmt:
     dprint fmt
 
+check:
+    dprint check
+    cargo clippy --target={{ target }} -- -D warnings
+    cargo clippy -p zellij-tools-cli -- -D warnings
+
 test:
     cargo test --lib
