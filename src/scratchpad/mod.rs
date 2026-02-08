@@ -91,7 +91,7 @@ impl ScratchpadManager {
             if removed_names.contains(name) {
                 for (&stable_id, &pane_id) in inner {
                     let orphaned_set = self.orphaned.get(name);
-                    if !orphaned_set.map_or(false, |s| s.contains(&stable_id)) {
+                    if !orphaned_set.is_some_and(|s| s.contains(&stable_id)) {
                         commands.push(ScratchpadCommand::ShowPane { pane_id });
                         // Defer insertion to avoid borrow conflict
                     }
@@ -139,7 +139,7 @@ impl ScratchpadManager {
     fn is_orphaned(&self, name: &str, stable_tab_id: StableTabId) -> bool {
         self.orphaned
             .get(name)
-            .map_or(false, |s| s.contains(&stable_tab_id))
+            .is_some_and(|s| s.contains(&stable_tab_id))
     }
 
     /// Extract state that should be persisted across reloads.
@@ -194,7 +194,7 @@ impl ScratchpadManager {
                     let is_already_orphaned = self
                         .orphaned
                         .get(name)
-                        .map_or(false, |s| s.contains(&stable_id));
+                        .is_some_and(|s| s.contains(&stable_id));
                     if !is_already_orphaned {
                         commands.push(ScratchpadCommand::ShowPane { pane_id });
                         self.orphaned
@@ -355,7 +355,7 @@ impl ScratchpadManager {
 
         if let Some(pane_id) = pane_id {
             // Clean up empty outer entries
-            if self.panes.get(name).map_or(false, |m| m.is_empty()) {
+            if self.panes.get(name).is_some_and(|m| m.is_empty()) {
                 self.panes.remove(name);
             }
             if let Some(inner) = self.focus_times.get_mut(name) {
