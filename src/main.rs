@@ -51,6 +51,43 @@ struct State {
 register_plugin!(State);
 
 impl State {
+    fn current_event_context(&self) -> (Vec<EventPaneInfo>, Vec<EventTabInfo>) {
+        let event_panes: Vec<EventPaneInfo> = self
+            .pane_manifest
+            .iter()
+            .flat_map(|(&tab_pos, panes)| {
+                panes.iter().map(move |p| EventPaneInfo {
+                    id: p.id,
+                    is_focused: p.is_focused,
+                    is_floating: p.is_floating,
+                    is_suppressed: p.is_suppressed,
+                    is_plugin: p.is_plugin,
+                    tab_position: tab_pos,
+                    title: p.title.clone(),
+                    terminal_command: p.terminal_command.clone(),
+                    plugin_url: p.plugin_url.clone(),
+                })
+            })
+            .collect();
+        let event_tabs: Vec<EventTabInfo> = self
+            .tab_infos
+            .iter()
+            .map(|t| {
+                let stable_id = self
+                    .tab_tracker
+                    .get_stable_id(t.position)
+                    .unwrap_or(t.position as u64);
+                EventTabInfo {
+                    stable_id,
+                    position: t.position,
+                    name: t.name.clone(),
+                    active: t.active,
+                }
+            })
+            .collect();
+        (event_panes, event_tabs)
+    }
+
     /// Load and merge inline + external configs
     fn load_merged_configs(
         &self,
@@ -514,6 +551,21 @@ impl ZellijPlugin for State {
                         match self.event_stream.initialize_subscriber(id, payload.trim()) {
                             Ok(()) => {
                                 self.emit_event(id, &StreamEvent::InitAck {}.to_json());
+
+                                let (event_panes, event_tabs) = self.current_event_context();
+                                let mode = self
+                                    .event_stream
+                                    .subscriber_mode(id)
+                                    .unwrap_or(SubscribeMode::Compact);
+                                for event in self.event_stream.initial_events_for(id) {
+                                    let json = match mode {
+                                        SubscribeMode::Compact => event.to_json(),
+                                        SubscribeMode::Full => {
+                                            event.to_full_json(&event_panes, &event_tabs)
+                                        }
+                                    };
+                                    self.emit_event(id, &json);
+                                }
                             }
                             Err(err) => {
                                 self.emit_event(
