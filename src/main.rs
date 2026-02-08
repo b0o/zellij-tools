@@ -456,10 +456,14 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-        // Empty payloads are heartbeats from CLI subscribers to flush buffered
-        // cli_pipe_output data. Silently ignore them.
         let payload = pipe_message.payload.as_deref().unwrap_or("");
+
         if payload.is_empty() || payload.trim().is_empty() {
+            // Heartbeat from a CLI subscriber — record liveness and prune stale ones.
+            if let PipeSource::Cli(ref id) = pipe_message.source {
+                self.event_stream.record_heartbeat(id);
+                self.event_stream.prune_stale_subscribers(50);
+            }
             return false;
         }
 
