@@ -228,6 +228,8 @@ pub struct PaneInfo {
     pub is_floating: bool,
     pub is_suppressed: bool,
     pub is_plugin: bool,
+    /// Which tab this pane belongs to (tab position index)
+    pub tab_position: usize,
     // Extra fields for full mode
     pub title: String,
     pub terminal_command: Option<String>,
@@ -320,17 +322,21 @@ impl EventStream {
     ///
     /// This method:
     /// 1. Diffs the pane set to detect opens/closes
-    /// 2. Diffs focus state to detect focus changes
+    /// 2. Diffs focus state to detect focus changes (only considers panes on `active_tab`)
     ///
     /// Returns a vec of (pipe_id, json_event) tuples to emit.
-    pub fn on_pane_update(&mut self, panes: &[PaneInfo]) -> Vec<(String, String)> {
+    pub fn on_pane_update(
+        &mut self,
+        panes: &[PaneInfo],
+        active_tab: usize,
+    ) -> Vec<(String, String)> {
         if !self.has_subscribers() {
-            self.update_pane_state(panes);
+            self.update_pane_state(panes, active_tab);
             return vec![];
         }
 
-        let events = self.compute_events(panes);
-        self.update_pane_state(panes);
+        let events = self.compute_events(panes, active_tab);
+        self.update_pane_state(panes, active_tab);
 
         self.broadcast_events(&events, panes, &[])
     }
@@ -477,7 +483,7 @@ impl EventStream {
     }
 
     /// Compute the events that should be emitted for this pane update
-    fn compute_events(&self, panes: &[PaneInfo]) -> Vec<Event> {
+    fn compute_events(&self, panes: &[PaneInfo], active_tab: usize) -> Vec<Event> {
         let mut events = Vec::new();
 
         // 1. Detect pane opens/closes by diffing composite keys (id, pane_type)
@@ -506,8 +512,8 @@ impl EventStream {
             }
         }
 
-        // 2. Detect focus changes
-        let new_focused = Self::find_focused(panes);
+        // 2. Detect focus changes (only consider panes on the active tab)
+        let new_focused = Self::find_focused(panes, active_tab);
 
         match (self.last_focused_pane, new_focused) {
             (Some((old_id, old_type)), Some((new_id, new_type)))
@@ -541,19 +547,21 @@ impl EventStream {
     }
 
     /// Update internal pane state to match current pane manifest
-    pub fn update_pane_state(&mut self, panes: &[PaneInfo]) {
+    pub fn update_pane_state(&mut self, panes: &[PaneInfo], active_tab: usize) {
         self.known_panes = panes.iter().map(|p| (p.id, p.pane_type())).collect();
-        self.last_focused_pane = Self::find_focused(panes);
+        self.last_focused_pane = Self::find_focused(panes, active_tab);
     }
 
-    /// Find the focused pane from a list of panes.
-    /// Floating panes take precedence. Suppressed panes are excluded.
-    fn find_focused(panes: &[PaneInfo]) -> Option<(u32, PaneType)> {
+    /// Find the focused pane from a list of panes on the active tab.
+    /// Only considers panes on `active_tab` to avoid stale focus from other tabs
+    /// (e.g., a floating pane on tab 0 that retains is_focused after switching to tab 1).
+    /// Among active-tab panes, floating panes take precedence. Suppressed panes are excluded.
+    fn find_focused(panes: &[PaneInfo], active_tab: usize) -> Option<(u32, PaneType)> {
         let mut focused_tiled: Option<(u32, PaneType)> = None;
         let mut focused_floating: Option<(u32, PaneType)> = None;
 
         for pane in panes {
-            if pane.is_focused && !pane.is_suppressed {
+            if pane.tab_position == active_tab && pane.is_focused && !pane.is_suppressed {
                 if pane.is_floating {
                     focused_floating = Some((pane.id, pane.pane_type()));
                 } else {
@@ -577,6 +585,7 @@ mod tests {
             is_floating,
             is_suppressed: false,
             is_plugin: false,
+            tab_position: 0,
             title: String::new(),
             terminal_command: None,
             plugin_url: None,
@@ -590,6 +599,7 @@ mod tests {
             is_floating: true,
             is_suppressed: true,
             is_plugin: false,
+            tab_position: 0,
             title: String::new(),
             terminal_command: None,
             plugin_url: None,
@@ -661,7 +671,7 @@ mod tests {
         let mut stream = EventStream::new();
         // Set up state with a focused pane
         let panes = vec![make_pane(42, true, false)];
-        stream.on_pane_update(&panes);
+        stream.on_pane_update(&panes, 0);
 
         let events = stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
         assert_eq!(events.len(), 1);
@@ -691,7 +701,7 @@ mod tests {
         stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         let panes = vec![make_pane(42, true, false)];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
 
         // Should have PaneOpened + PaneFocused
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
@@ -705,11 +715,11 @@ mod tests {
 
         // Initial: pane 42 focused
         let panes = vec![make_pane(42, true, false), make_pane(17, false, false)];
-        stream.on_pane_update(&panes);
+        stream.on_pane_update(&panes, 0);
 
         // Switch focus to pane 17
         let panes = vec![make_pane(42, false, false), make_pane(17, true, false)];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
         assert!(jsons.contains(&r#"{"PaneUnfocused":{"pane_id":42,"pane_type":"terminal"}}"#));
@@ -722,10 +732,10 @@ mod tests {
         stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         let panes = vec![make_pane(42, true, false)];
-        stream.on_pane_update(&panes);
+        stream.on_pane_update(&panes, 0);
 
         // Same state again
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
         assert!(output.is_empty());
     }
 
@@ -733,7 +743,7 @@ mod tests {
     fn no_events_without_subscribers() {
         let mut stream = EventStream::new();
         let panes = vec![make_pane(42, true, false)];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
         assert!(output.is_empty());
     }
 
@@ -746,11 +756,11 @@ mod tests {
 
         // Initial: one pane
         let panes = vec![make_pane(1, true, false)];
-        stream.on_pane_update(&panes);
+        stream.on_pane_update(&panes, 0);
 
         // New pane appears
         let panes = vec![make_pane(1, true, false), make_pane(2, false, true)];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
         assert!(jsons.contains(
@@ -765,11 +775,11 @@ mod tests {
 
         // Initial: two panes
         let panes = vec![make_pane(1, true, false), make_pane(2, false, false)];
-        stream.on_pane_update(&panes);
+        stream.on_pane_update(&panes, 0);
 
         // Pane 2 disappears
         let panes = vec![make_pane(1, true, false)];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
         assert!(jsons.contains(&r#"{"PaneClosed":{"pane_id":2,"pane_type":"terminal"}}"#));
@@ -784,6 +794,7 @@ mod tests {
             is_floating: false,
             is_suppressed,
             is_plugin: true,
+            tab_position: 0,
             title: String::new(),
             terminal_command: None,
             plugin_url: Some("plugin://test".to_string()),
@@ -803,7 +814,7 @@ mod tests {
             make_plugin_pane(1, false, true),
             make_plugin_pane(2, false, true),
         ];
-        stream.on_pane_update(&panes);
+        stream.on_pane_update(&panes, 0);
 
         // User opens a new terminal pane — terminal pane 1 has same ID as plugin pane 1
         let panes = vec![
@@ -813,7 +824,7 @@ mod tests {
             make_plugin_pane(1, false, true),
             make_plugin_pane(2, false, true),
         ];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
         assert!(
@@ -838,7 +849,7 @@ mod tests {
             make_plugin_pane(1, false, true),
             make_plugin_pane(2, false, true),
         ];
-        stream.on_pane_update(&panes);
+        stream.on_pane_update(&panes, 0);
 
         // User closes terminal pane 1 — plugin pane 1 still exists
         let panes = vec![
@@ -847,7 +858,7 @@ mod tests {
             make_plugin_pane(1, false, true),
             make_plugin_pane(2, false, true),
         ];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
         assert!(
@@ -866,7 +877,7 @@ mod tests {
 
         // Both tiled and floating report focused, floating wins
         let panes = vec![make_pane(1, true, false), make_pane(2, true, true)];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
         assert!(jsons.contains(&r#"{"PaneFocused":{"pane_id":2,"pane_type":"terminal"}}"#));
@@ -880,7 +891,7 @@ mod tests {
         stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         let panes = vec![make_pane(1, true, false), make_suppressed_pane(2, true)];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
         // Pane 1 (tiled) should be focused since pane 2 is suppressed
@@ -1116,7 +1127,7 @@ mod tests {
         stream.subscribe("pipe-2".to_string(), SubscribeMode::Compact);
 
         let panes = vec![make_pane(42, true, false)];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
 
         // Each event should be sent to both subscribers
         let pipe_ids: Vec<&str> = output
@@ -1137,6 +1148,7 @@ mod tests {
             is_floating: false,
             is_suppressed: false,
             is_plugin: false,
+            tab_position: 0,
             title: title.to_string(),
             terminal_command: Some(command.to_string()),
             plugin_url: None,
@@ -1149,7 +1161,7 @@ mod tests {
         stream.subscribe("pipe-1".to_string(), SubscribeMode::Full);
 
         let panes = vec![make_detailed_pane(42, true, "zsh", "/bin/zsh")];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
 
         // Find the PaneFocused event
         let focus_json = output
@@ -1172,7 +1184,7 @@ mod tests {
         stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
 
         let panes = vec![make_detailed_pane(42, true, "zsh", "/bin/zsh")];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
 
         let focus_json = output
             .iter()
@@ -1192,7 +1204,7 @@ mod tests {
         stream.subscribe("full".to_string(), SubscribeMode::Full);
 
         let panes = vec![make_detailed_pane(42, true, "zsh", "/bin/zsh")];
-        let output = stream.on_pane_update(&panes);
+        let output = stream.on_pane_update(&panes, 0);
 
         let compact_json = output
             .iter()
@@ -1261,7 +1273,7 @@ mod tests {
 
         // Call update_pane_state directly (no subscribers needed)
         let panes = vec![make_pane(42, true, false), make_pane(17, false, false)];
-        stream.update_pane_state(&panes);
+        stream.update_pane_state(&panes, 0);
 
         // State should be tracked: subscribing now returns current focus
         let events = stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
@@ -1293,6 +1305,96 @@ mod tests {
             position: 0,
             name: "tab1".to_string(),
         }));
+    }
+
+    // --- Floating pane focus across tab switches ---
+
+    #[test]
+    fn floating_pane_unfocused_on_tab_switch() {
+        // Bug: when a floating pane is focused and user switches tabs,
+        // PaneUnfocused/PaneFocused events should fire but don't because
+        // find_focused gives floating panes precedence across all tabs.
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
+
+        // Tab 0: tiled pane 0 (focused behind floating), floating pane 10 (focused)
+        let panes = vec![
+            PaneInfo {
+                id: 0,
+                is_focused: true,
+                is_floating: false,
+                is_suppressed: false,
+                is_plugin: false,
+                title: String::new(),
+                terminal_command: None,
+                plugin_url: None,
+                tab_position: 0,
+            },
+            PaneInfo {
+                id: 10,
+                is_focused: true,
+                is_floating: true,
+                is_suppressed: false,
+                is_plugin: false,
+                title: String::new(),
+                terminal_command: None,
+                plugin_url: None,
+                tab_position: 0,
+            },
+        ];
+        stream.on_pane_update(&panes, 0);
+
+        // Now switch to tab 1 — tiled pane 1 is focused on tab 1,
+        // but floating pane 10 on tab 0 still has is_focused: true in the manifest
+        let panes = vec![
+            PaneInfo {
+                id: 0,
+                is_focused: true,
+                is_floating: false,
+                is_suppressed: false,
+                is_plugin: false,
+                title: String::new(),
+                terminal_command: None,
+                plugin_url: None,
+                tab_position: 0,
+            },
+            PaneInfo {
+                id: 10,
+                is_focused: true,
+                is_floating: true,
+                is_suppressed: false,
+                is_plugin: false,
+                title: String::new(),
+                terminal_command: None,
+                plugin_url: None,
+                tab_position: 0,
+            },
+            PaneInfo {
+                id: 1,
+                is_focused: true,
+                is_floating: false,
+                is_suppressed: false,
+                is_plugin: false,
+                title: String::new(),
+                terminal_command: None,
+                plugin_url: None,
+                tab_position: 1,
+            },
+        ];
+        let output = stream.on_pane_update(&panes, 1);
+
+        let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
+        // Should unfocus floating pane 10 and focus tiled pane 1
+        assert!(
+            jsons.contains(&r#"{"PaneUnfocused":{"pane_id":10,"pane_type":"terminal"}}"#),
+            "Should emit PaneUnfocused for floating pane 10 when switching tabs. Got: {:?}",
+            jsons
+        );
+        assert!(
+            jsons.contains(&r#"{"PaneFocused":{"pane_id":1,"pane_type":"terminal"}}"#),
+            "Should emit PaneFocused for tiled pane 1 on new tab. Got: {:?}",
+            jsons
+        );
     }
 
     #[test]
