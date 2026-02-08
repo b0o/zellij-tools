@@ -1,6 +1,6 @@
 # zellij-tools
 
-A [Zellij](https://github.com/zellij-org/zellij) plugin that adds handy utilities including scratchpad terminals.
+A [Zellij](https://github.com/zellij-org/zellij) plugin and companion CLI that add scratchpads, focus helpers, event streaming, and session tree utilities.
 
 ## Installation
 
@@ -86,45 +86,19 @@ The config directory is determined by (in order):
 | `watch_ms`    | Polling interval in ms. `"false"` or `"0"` to disable. | `2000`        |      Yes      |          No          |
 | `scratchpads` | Scratchpad definitions                                 | -             |      Yes      |         Yes          |
 
-### Usage
-
-Toggle a scratchpad:
-
-```sh
-zellij pipe "zellij-tools::scratchpad::toggle::term"
-```
-
-Or bind it to a key:
-
-```kdl
-bind "Alt t" {
-    MessagePlugin "zellij-tools" {
-        payload "zellij-tools::scratchpad::toggle::term"
-    }
-}
-```
-
-### Scratchpad Actions
-
-| Action           | Description                      |
-| ---------------- | -------------------------------- |
-| `toggle::<name>` | Toggle scratchpad visibility     |
-| `show::<name>`   | Show scratchpad                  |
-| `hide::<name>`   | Hide scratchpad                  |
-| `close::<name>`  | Close scratchpad (process exits) |
-
 ## Other Actions
 
 ### Focus Pane
 
 Focuses a pane by ID. You can get the pane ID from the `$ZELLIJ_PANE_ID` environment variable.
 
+Note: pane IDs are only unique within their type. A `terminal` id `0` and a `plugin` id `0` can both exist at the same time.
+
 Defaults to terminal panes in the CLI. Use `--plugin` to target plugin panes.
 
 ```sh
-zellij pipe "zellij-tools::focus-pane::2"
 zellij-tools focus pane 2
-zellij-tools focus pane 7 --plugin
+zellij-tools focus pane --plugin 7
 ```
 
 ### Focus Tab
@@ -134,10 +108,26 @@ Focuses a tab by position (1-based) by default.
 Use `--id` to focus by stable tab ID.
 
 ```sh
-zellij pipe "zellij-tools::focus-tab::2"
 zellij-tools focus tab 2
-zellij-tools focus tab 42 --id
+zellij-tools focus tab --id 42
 ```
+
+## Events and Tree
+
+Stream pane/tab events:
+
+```sh
+zellij-tools subscribe
+zellij-tools subscribe --full
+```
+
+Get a session tree snapshot:
+
+```sh
+zellij-tools tree
+```
+
+For full event formats and examples, see `docs/event-subscription-api.md`.
 
 ## Permissions
 
@@ -146,6 +136,7 @@ The plugin requires the following permissions:
 - `ReadApplicationState` - Track panes and tabs
 - `ChangeApplicationState` - Show/hide panes
 - `RunCommands` - Launch scratchpad commands
+- `ReadCliPipes` - Stream events and tree data to CLI pipes
 - `FullHdAccess` - Read external config files
 
 ## License
