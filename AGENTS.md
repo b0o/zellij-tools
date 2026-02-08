@@ -87,13 +87,32 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 - `unsubscribe::<pipe_id>`
 - `tree` (CLI pipes only)
 
+`subscribe` now uses a same-pipe init handshake:
+
+1. CLI opens the pipe with `zellij-tools::subscribe` (or `::full`)
+2. Plugin registers the subscriber as pending and emits `Ack`
+3. CLI writes one raw JSON init line to the same pipe stdin
+4. Plugin emits `InitAck` on success or `InitError` on failure
+5. Pane/tab streaming starts only after `InitAck`
+
 ## Event Streaming Notes
 
 - Subscribe replies with an `Ack` event first so the CLI can confirm connection.
+- Subscribers start in pending-init state; no pane/tab stream events are emitted before init succeeds.
+- Init payload is raw JSON over the same pipe stdin (not a second `zellij pipe` message).
+- Init JSON supports `full`, `events`, `pane_ids`, and `tab_ids` filter fields.
 - Plugin emits newline-delimited JSON to CLI pipes (`cli_pipe_output(..."\n")`).
 - Empty payloads from CLI are treated as heartbeats for subscriber liveness.
 - Stale subscribers are pruned after missed heartbeat ticks.
 - Compact mode emits minimal event objects; full mode enriches pane events with fields like `title`, `terminal_command`, `plugin_url`, and suppression/floating flags.
+
+### CLI Subscribe Filter Flags
+
+- `--event` filters by canonical event names (eg `PaneFocused`, `TabMoved`)
+- `--pane-id` filters terminal pane IDs
+- `--plugin-pane-id` filters plugin pane IDs
+- `--tab-id` filters stable tab IDs
+- CLI converts pane ID flags to typed IDs (`terminal_N`, `plugin_N`) in init JSON
 
 ### How External Config Works
 
