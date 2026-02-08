@@ -185,8 +185,43 @@ impl State {
                 };
 
                 let initial_events = self.event_stream.subscribe(cli_pipe_id.clone(), mode);
+                let event_panes: Vec<EventPaneInfo> = self
+                    .pane_manifest
+                    .values()
+                    .flatten()
+                    .map(|p| EventPaneInfo {
+                        id: p.id,
+                        is_focused: p.is_focused,
+                        is_floating: p.is_floating,
+                        is_suppressed: p.is_suppressed,
+                        is_plugin: p.is_plugin,
+                        title: p.title.clone(),
+                        terminal_command: p.terminal_command.clone(),
+                        plugin_url: p.plugin_url.clone(),
+                    })
+                    .collect();
+                let event_tabs: Vec<EventTabInfo> = self
+                    .tab_infos
+                    .iter()
+                    .map(|t| {
+                        let stable_id = self
+                            .tab_tracker
+                            .get_stable_id(t.position)
+                            .unwrap_or(t.position as u64);
+                        EventTabInfo {
+                            stable_id,
+                            position: t.position,
+                            name: t.name.clone(),
+                            active: t.active,
+                        }
+                    })
+                    .collect();
                 for event in &initial_events {
-                    self.emit_event(&cli_pipe_id, &event.to_json());
+                    let json = match mode {
+                        SubscribeMode::Compact => event.to_json(),
+                        SubscribeMode::Full => event.to_full_json(&event_panes, &event_tabs),
+                    };
+                    self.emit_event(&cli_pipe_id, &json);
                 }
                 Ok(())
             }
@@ -294,6 +329,7 @@ impl ZellijPlugin for State {
                         plugin_url: p.plugin_url.clone(),
                     })
                     .collect();
+
                 let events = self.event_stream.on_pane_update(&event_panes);
                 for (pipe_id, json) in &events {
                     self.emit_event(pipe_id, json);

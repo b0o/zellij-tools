@@ -2,24 +2,38 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
+/// The type of a pane, mirroring zellij's `PaneId` enum variants.
+/// Zellij uses separate ID namespaces for terminal and plugin panes,
+/// so the same numeric ID can refer to both types simultaneously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneType {
+    Terminal,
+    Plugin,
+}
+
 /// An event emitted to subscribers.
 ///
 /// Serialized as an externally-tagged JSON object, e.g.:
-/// `{"PaneFocused":{"pane_id":3}}`
+/// `{"PaneFocused":{"pane_id":3,"pane_type":"terminal"}}`
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum Event {
     PaneFocused {
         pane_id: u32,
+        pane_type: PaneType,
     },
     PaneUnfocused {
         pane_id: u32,
+        pane_type: PaneType,
     },
     PaneOpened {
         pane_id: u32,
+        pane_type: PaneType,
         is_floating: bool,
     },
     PaneClosed {
         pane_id: u32,
+        pane_type: PaneType,
     },
     TabFocused {
         stable_id: u64,
@@ -61,15 +75,17 @@ impl Event {
         let mut value = serde_json::to_value(self).unwrap();
 
         match self {
-            Event::PaneFocused { pane_id }
-            | Event::PaneUnfocused { pane_id }
-            | Event::PaneClosed { pane_id } => {
-                if let Some(pane) = panes.iter().find(|p| p.id == *pane_id) {
-                    Self::merge_pane_detail(&mut value, pane);
-                }
-            }
-            Event::PaneOpened { pane_id, .. } => {
-                if let Some(pane) = panes.iter().find(|p| p.id == *pane_id) {
+            Event::PaneFocused { pane_id, pane_type }
+            | Event::PaneUnfocused { pane_id, pane_type }
+            | Event::PaneClosed { pane_id, pane_type }
+            | Event::PaneOpened {
+                pane_id, pane_type, ..
+            } => {
+                let is_plugin = *pane_type == PaneType::Plugin;
+                if let Some(pane) = panes
+                    .iter()
+                    .find(|p| p.id == *pane_id && p.is_plugin == is_plugin)
+                {
                     Self::merge_pane_detail(&mut value, pane);
                 }
             }
@@ -100,10 +116,6 @@ impl Event {
                     inner_obj.insert(
                         "title".to_string(),
                         serde_json::Value::String(pane.title.clone()),
-                    );
-                    inner_obj.insert(
-                        "is_plugin".to_string(),
-                        serde_json::Value::Bool(pane.is_plugin),
                     );
                     inner_obj.insert(
                         "is_floating".to_string(),
@@ -162,6 +174,11 @@ impl Subscriber {
     }
 }
 
+/// A unique identifier for a pane, combining the numeric ID with the pane type.
+/// Zellij uses separate ID namespaces for terminal and plugin panes, so the same numeric ID
+/// can refer to both a terminal pane and a plugin pane simultaneously.
+type PaneKey = (u32, PaneType);
+
 /// Tracks state and emits events to subscribers when things change.
 ///
 /// Detects:
@@ -173,10 +190,12 @@ impl Subscriber {
 pub struct EventStream {
     /// Active subscribers keyed by pipe ID
     subscribers: HashMap<String, Subscriber>,
-    /// Last known focused pane (pane_id, is_plugin)
-    last_focused_pane: Option<(u32, bool)>,
-    /// Set of pane IDs we knew about last time
-    known_panes: HashSet<u32>,
+    /// Last known focused pane (pane_id, pane_type)
+    last_focused_pane: Option<(u32, PaneType)>,
+    /// Set of pane keys we knew about last time.
+    /// Uses (id, is_plugin) to distinguish terminal from plugin panes,
+    /// since zellij allows overlapping numeric IDs between the two namespaces.
+    known_panes: HashSet<PaneKey>,
     /// Last known active tab (by stable_id)
     last_active_tab: Option<u64>,
     /// Known tabs by stable_id: stable_id -> (position, name)
@@ -204,6 +223,17 @@ pub struct PaneInfo {
     pub plugin_url: Option<String>,
 }
 
+impl PaneInfo {
+    /// Get the pane type (terminal or plugin) for this pane.
+    pub fn pane_type(&self) -> PaneType {
+        if self.is_plugin {
+            PaneType::Plugin
+        } else {
+            PaneType::Terminal
+        }
+    }
+}
+
 impl EventStream {
     pub fn new() -> Self {
         Self::default()
@@ -229,8 +259,8 @@ impl EventStream {
         }
 
         // Send current pane focus state
-        if let Some((pane_id, _)) = self.last_focused_pane {
-            initial_events.push(Event::PaneFocused { pane_id });
+        if let Some((pane_id, pane_type)) = self.last_focused_pane {
+            initial_events.push(Event::PaneFocused { pane_id, pane_type });
         }
 
         initial_events
@@ -411,24 +441,29 @@ impl EventStream {
     fn compute_events(&self, panes: &[PaneInfo]) -> Vec<Event> {
         let mut events = Vec::new();
 
-        // 1. Detect pane opens/closes by diffing IDs
-        let new_ids: HashSet<u32> = panes.iter().map(|p| p.id).collect();
-        let old_ids = &self.known_panes;
+        // 1. Detect pane opens/closes by diffing composite keys (id, pane_type)
+        let new_keys: HashSet<PaneKey> = panes.iter().map(|p| (p.id, p.pane_type())).collect();
+        let old_keys = &self.known_panes;
 
         // Opened panes (in new but not old)
         for pane in panes {
-            if !old_ids.contains(&pane.id) {
+            let key = (pane.id, pane.pane_type());
+            if !old_keys.contains(&key) {
                 events.push(Event::PaneOpened {
                     pane_id: pane.id,
+                    pane_type: pane.pane_type(),
                     is_floating: pane.is_floating,
                 });
             }
         }
 
         // Closed panes (in old but not new)
-        for &old_id in old_ids {
-            if !new_ids.contains(&old_id) {
-                events.push(Event::PaneClosed { pane_id: old_id });
+        for &(old_id, old_pane_type) in old_keys {
+            if !new_keys.contains(&(old_id, old_pane_type)) {
+                events.push(Event::PaneClosed {
+                    pane_id: old_id,
+                    pane_type: old_pane_type,
+                });
             }
         }
 
@@ -436,15 +471,29 @@ impl EventStream {
         let new_focused = Self::find_focused(panes);
 
         match (self.last_focused_pane, new_focused) {
-            (Some((old_id, _)), Some((new_id, _))) if old_id != new_id => {
-                events.push(Event::PaneUnfocused { pane_id: old_id });
-                events.push(Event::PaneFocused { pane_id: new_id });
+            (Some((old_id, old_type)), Some((new_id, new_type)))
+                if old_id != new_id || old_type != new_type =>
+            {
+                events.push(Event::PaneUnfocused {
+                    pane_id: old_id,
+                    pane_type: old_type,
+                });
+                events.push(Event::PaneFocused {
+                    pane_id: new_id,
+                    pane_type: new_type,
+                });
             }
-            (Some((old_id, _)), None) => {
-                events.push(Event::PaneUnfocused { pane_id: old_id });
+            (Some((old_id, old_type)), None) => {
+                events.push(Event::PaneUnfocused {
+                    pane_id: old_id,
+                    pane_type: old_type,
+                });
             }
-            (None, Some((new_id, _))) => {
-                events.push(Event::PaneFocused { pane_id: new_id });
+            (None, Some((new_id, new_type))) => {
+                events.push(Event::PaneFocused {
+                    pane_id: new_id,
+                    pane_type: new_type,
+                });
             }
             _ => {} // Same pane or both None — no change
         }
@@ -454,22 +503,22 @@ impl EventStream {
 
     /// Update internal pane state to match current pane manifest
     fn update_pane_state(&mut self, panes: &[PaneInfo]) {
-        self.known_panes = panes.iter().map(|p| p.id).collect();
+        self.known_panes = panes.iter().map(|p| (p.id, p.pane_type())).collect();
         self.last_focused_pane = Self::find_focused(panes);
     }
 
     /// Find the focused pane from a list of panes.
     /// Floating panes take precedence. Suppressed panes are excluded.
-    fn find_focused(panes: &[PaneInfo]) -> Option<(u32, bool)> {
-        let mut focused_tiled: Option<(u32, bool)> = None;
-        let mut focused_floating: Option<(u32, bool)> = None;
+    fn find_focused(panes: &[PaneInfo]) -> Option<(u32, PaneType)> {
+        let mut focused_tiled: Option<(u32, PaneType)> = None;
+        let mut focused_floating: Option<(u32, PaneType)> = None;
 
         for pane in panes {
             if pane.is_focused && !pane.is_suppressed {
                 if pane.is_floating {
-                    focused_floating = Some((pane.id, pane.is_plugin));
+                    focused_floating = Some((pane.id, pane.pane_type()));
                 } else {
-                    focused_tiled = Some((pane.id, pane.is_plugin));
+                    focused_tiled = Some((pane.id, pane.pane_type()));
                 }
             }
         }
@@ -512,32 +561,51 @@ mod tests {
 
     #[test]
     fn event_pane_focused_serializes() {
-        let event = Event::PaneFocused { pane_id: 42 };
-        assert_eq!(event.to_json(), r#"{"PaneFocused":{"pane_id":42}}"#);
+        let event = Event::PaneFocused {
+            pane_id: 42,
+            pane_type: PaneType::Terminal,
+        };
+        assert_eq!(
+            event.to_json(),
+            r#"{"PaneFocused":{"pane_id":42,"pane_type":"terminal"}}"#
+        );
     }
 
     #[test]
     fn event_pane_unfocused_serializes() {
-        let event = Event::PaneUnfocused { pane_id: 42 };
-        assert_eq!(event.to_json(), r#"{"PaneUnfocused":{"pane_id":42}}"#);
+        let event = Event::PaneUnfocused {
+            pane_id: 42,
+            pane_type: PaneType::Terminal,
+        };
+        assert_eq!(
+            event.to_json(),
+            r#"{"PaneUnfocused":{"pane_id":42,"pane_type":"terminal"}}"#
+        );
     }
 
     #[test]
     fn event_pane_opened_serializes() {
         let event = Event::PaneOpened {
             pane_id: 5,
+            pane_type: PaneType::Terminal,
             is_floating: true,
         };
         assert_eq!(
             event.to_json(),
-            r#"{"PaneOpened":{"pane_id":5,"is_floating":true}}"#
+            r#"{"PaneOpened":{"pane_id":5,"pane_type":"terminal","is_floating":true}}"#
         );
     }
 
     #[test]
     fn event_pane_closed_serializes() {
-        let event = Event::PaneClosed { pane_id: 7 };
-        assert_eq!(event.to_json(), r#"{"PaneClosed":{"pane_id":7}}"#);
+        let event = Event::PaneClosed {
+            pane_id: 7,
+            pane_type: PaneType::Terminal,
+        };
+        assert_eq!(
+            event.to_json(),
+            r#"{"PaneClosed":{"pane_id":7,"pane_type":"terminal"}}"#
+        );
     }
 
     // --- Subscriber management ---
@@ -558,7 +626,13 @@ mod tests {
 
         let events = stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0], Event::PaneFocused { pane_id: 42 });
+        assert_eq!(
+            events[0],
+            Event::PaneFocused {
+                pane_id: 42,
+                pane_type: PaneType::Terminal,
+            }
+        );
     }
 
     #[test]
@@ -582,7 +656,7 @@ mod tests {
 
         // Should have PaneOpened + PaneFocused
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
-        assert!(jsons.contains(&r#"{"PaneFocused":{"pane_id":42}}"#));
+        assert!(jsons.contains(&r#"{"PaneFocused":{"pane_id":42,"pane_type":"terminal"}}"#));
     }
 
     #[test]
@@ -599,8 +673,8 @@ mod tests {
         let output = stream.on_pane_update(&panes);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
-        assert!(jsons.contains(&r#"{"PaneUnfocused":{"pane_id":42}}"#));
-        assert!(jsons.contains(&r#"{"PaneFocused":{"pane_id":17}}"#));
+        assert!(jsons.contains(&r#"{"PaneUnfocused":{"pane_id":42,"pane_type":"terminal"}}"#));
+        assert!(jsons.contains(&r#"{"PaneFocused":{"pane_id":17,"pane_type":"terminal"}}"#));
     }
 
     #[test]
@@ -640,7 +714,9 @@ mod tests {
         let output = stream.on_pane_update(&panes);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
-        assert!(jsons.contains(&r#"{"PaneOpened":{"pane_id":2,"is_floating":true}}"#));
+        assert!(jsons.contains(
+            &r#"{"PaneOpened":{"pane_id":2,"pane_type":"terminal","is_floating":true}}"#
+        ));
     }
 
     #[test]
@@ -657,7 +733,89 @@ mod tests {
         let output = stream.on_pane_update(&panes);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
-        assert!(jsons.contains(&r#"{"PaneClosed":{"pane_id":2}}"#));
+        assert!(jsons.contains(&r#"{"PaneClosed":{"pane_id":2,"pane_type":"terminal"}}"#));
+    }
+
+    // --- Overlapping pane ID detection ---
+
+    fn make_plugin_pane(id: u32, is_focused: bool, is_suppressed: bool) -> PaneInfo {
+        PaneInfo {
+            id,
+            is_focused,
+            is_floating: false,
+            is_suppressed,
+            is_plugin: true,
+            title: String::new(),
+            terminal_command: None,
+            plugin_url: Some("plugin://test".to_string()),
+        }
+    }
+
+    #[test]
+    fn terminal_pane_open_detected_despite_same_id_plugin_pane() {
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
+
+        // Initial: one terminal pane (0) and suppressed plugin panes (0, 1, 2)
+        // This matches real zellij behavior where plugin and terminal IDs overlap
+        let panes = vec![
+            make_pane(0, true, false),
+            make_plugin_pane(0, false, true),
+            make_plugin_pane(1, false, true),
+            make_plugin_pane(2, false, true),
+        ];
+        stream.on_pane_update(&panes);
+
+        // User opens a new terminal pane — terminal pane 1 has same ID as plugin pane 1
+        let panes = vec![
+            make_pane(0, false, false),
+            make_pane(1, true, false), // new terminal pane
+            make_plugin_pane(0, false, true),
+            make_plugin_pane(1, false, true),
+            make_plugin_pane(2, false, true),
+        ];
+        let output = stream.on_pane_update(&panes);
+
+        let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
+        assert!(
+            jsons.contains(
+                &r#"{"PaneOpened":{"pane_id":1,"pane_type":"terminal","is_floating":false}}"#
+            ),
+            "Should detect terminal pane 1 opening despite plugin pane 1 existing. Got: {:?}",
+            jsons
+        );
+    }
+
+    #[test]
+    fn terminal_pane_close_detected_despite_same_id_plugin_pane() {
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
+
+        // Initial: two terminal panes (0, 1) and suppressed plugin panes (0, 1, 2)
+        let panes = vec![
+            make_pane(0, false, false),
+            make_pane(1, true, false),
+            make_plugin_pane(0, false, true),
+            make_plugin_pane(1, false, true),
+            make_plugin_pane(2, false, true),
+        ];
+        stream.on_pane_update(&panes);
+
+        // User closes terminal pane 1 — plugin pane 1 still exists
+        let panes = vec![
+            make_pane(0, true, false),
+            make_plugin_pane(0, false, true),
+            make_plugin_pane(1, false, true),
+            make_plugin_pane(2, false, true),
+        ];
+        let output = stream.on_pane_update(&panes);
+
+        let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
+        assert!(
+            jsons.contains(&r#"{"PaneClosed":{"pane_id":1,"pane_type":"terminal"}}"#),
+            "Should detect terminal pane 1 closing despite plugin pane 1 still existing. Got: {:?}",
+            jsons
+        );
     }
 
     // --- Floating pane focus precedence ---
@@ -672,9 +830,9 @@ mod tests {
         let output = stream.on_pane_update(&panes);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
-        assert!(jsons.contains(&r#"{"PaneFocused":{"pane_id":2}}"#));
+        assert!(jsons.contains(&r#"{"PaneFocused":{"pane_id":2,"pane_type":"terminal"}}"#));
         // Pane 1 should NOT get a focused event
-        assert!(!jsons.contains(&r#"{"PaneFocused":{"pane_id":1}}"#));
+        assert!(!jsons.contains(&r#"{"PaneFocused":{"pane_id":1,"pane_type":"terminal"}}"#));
     }
 
     #[test]
@@ -687,7 +845,7 @@ mod tests {
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
         // Pane 1 (tiled) should be focused since pane 2 is suppressed
-        assert!(jsons.contains(&r#"{"PaneFocused":{"pane_id":1}}"#));
+        assert!(jsons.contains(&r#"{"PaneFocused":{"pane_id":1,"pane_type":"terminal"}}"#));
     }
 
     // --- Tab event serialization ---
