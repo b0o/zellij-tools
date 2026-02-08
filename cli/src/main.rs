@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +41,18 @@ enum Commands {
         /// Include full object details in each event
         #[arg(long)]
         full: bool,
+        /// Filter by canonical event names (eg PaneFocused,TabMoved)
+        #[arg(long = "event", value_delimiter = ',', num_args = 1..)]
+        events: Vec<SubscribeEventKind>,
+        /// Filter by terminal pane IDs
+        #[arg(long = "pane-id", value_delimiter = ',', num_args = 1..)]
+        pane_ids: Vec<u32>,
+        /// Filter by plugin pane IDs
+        #[arg(long = "plugin-pane-id", value_delimiter = ',', num_args = 1..)]
+        plugin_pane_ids: Vec<u32>,
+        /// Filter by stable tab IDs
+        #[arg(long = "tab-id", value_delimiter = ',', num_args = 1..)]
+        tab_ids: Vec<u64>,
     },
     /// Print the session tree (tabs, panes, stable IDs) as JSON
     Tree,
@@ -67,6 +80,78 @@ enum FocusTarget {
         #[arg(short = 'p', long, conflicts_with = "id")]
         position: bool,
     },
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
+enum SubscribeEventKind {
+    #[value(name = "PaneFocused")]
+    PaneFocused,
+    #[value(name = "PaneUnfocused")]
+    PaneUnfocused,
+    #[value(name = "PaneOpened")]
+    PaneOpened,
+    #[value(name = "PaneClosed")]
+    PaneClosed,
+    #[value(name = "TabFocused")]
+    TabFocused,
+    #[value(name = "TabUnfocused")]
+    TabUnfocused,
+    #[value(name = "TabCreated")]
+    TabCreated,
+    #[value(name = "TabClosed")]
+    TabClosed,
+    #[value(name = "TabMoved")]
+    TabMoved,
+}
+
+impl SubscribeEventKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::PaneFocused => "PaneFocused",
+            Self::PaneUnfocused => "PaneUnfocused",
+            Self::PaneOpened => "PaneOpened",
+            Self::PaneClosed => "PaneClosed",
+            Self::TabFocused => "TabFocused",
+            Self::TabUnfocused => "TabUnfocused",
+            Self::TabCreated => "TabCreated",
+            Self::TabClosed => "TabClosed",
+            Self::TabMoved => "TabMoved",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SubscribeInitSpec {
+    full: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    events: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tab_ids: Option<Vec<u64>>,
+}
+
+fn build_subscribe_init_json(
+    full: bool,
+    events: &[SubscribeEventKind],
+    pane_ids: &[u32],
+    plugin_pane_ids: &[u32],
+    tab_ids: &[u64],
+) -> String {
+    let typed_pane_ids: Vec<String> = pane_ids
+        .iter()
+        .map(|id| format!("terminal_{id}"))
+        .chain(plugin_pane_ids.iter().map(|id| format!("plugin_{id}")))
+        .collect();
+
+    let spec = SubscribeInitSpec {
+        full,
+        events: (!events.is_empty())
+            .then(|| events.iter().map(|e| e.as_str().to_string()).collect()),
+        pane_ids: (!typed_pane_ids.is_empty()).then_some(typed_pane_ids),
+        tab_ids: (!tab_ids.is_empty()).then(|| tab_ids.to_vec()),
+    };
+    serde_json::to_string(&spec).expect("subscribe init json should serialize")
 }
 
 fn send_pipe_message(plugin: &str, msg: &str) -> std::io::Result<()> {
@@ -110,7 +195,14 @@ fn focus(plugin: &str, target: FocusTarget) -> std::io::Result<()> {
     send_pipe_message(plugin, &msg)
 }
 
-fn subscribe(plugin: &str, full: bool) -> std::io::Result<()> {
+fn subscribe(
+    plugin: &str,
+    full: bool,
+    events: Vec<SubscribeEventKind>,
+    pane_ids: Vec<u32>,
+    plugin_pane_ids: Vec<u32>,
+    tab_ids: Vec<u64>,
+) -> std::io::Result<()> {
     let pipe_name = format!("zellij-tools-events-{}", uuid::Uuid::new_v4());
 
     let subscribe_msg = if full {
@@ -168,22 +260,7 @@ fn subscribe(plugin: &str, full: bool) -> std::io::Result<()> {
     })
     .expect("Error setting Ctrl-C handler");
 
-    // Spawn heartbeat thread: sends empty lines to stdin to trigger pipe()
-    // calls on the plugin, which flushes buffered cli_pipe_output data.
-    // Without this, events emitted from update() would never reach the CLI.
-    let heartbeat_running = running.clone();
     let stdin = Arc::new(Mutex::new(stdin));
-    let heartbeat_stdin = Arc::clone(&stdin);
-    std::thread::spawn(move || {
-        while heartbeat_running.load(Ordering::SeqCst) {
-            std::thread::sleep(HEARTBEAT_INTERVAL);
-            if let Ok(mut stdin) = heartbeat_stdin.lock() {
-                if stdin.write_all(b"\n").is_err() || stdin.flush().is_err() {
-                    break;
-                }
-            }
-        }
-    });
 
     // Spawn reader thread that sends lines over a channel
     let (tx, rx) = mpsc::channel();
@@ -210,7 +287,51 @@ fn subscribe(plugin: &str, full: bool) -> std::io::Result<()> {
     match rx.recv_timeout(CONNECT_TIMEOUT) {
         Ok(line) => {
             if line.contains(r#""Ack""#) {
-                // ACK received, connected successfully
+                let init_json =
+                    build_subscribe_init_json(full, &events, &pane_ids, &plugin_pane_ids, &tab_ids);
+                if let Ok(mut stdin) = stdin.lock() {
+                    stdin.write_all(init_json.as_bytes())?;
+                    stdin.write_all(b"\n")?;
+                    stdin.flush()?;
+                }
+
+                match rx.recv_timeout(CONNECT_TIMEOUT) {
+                    Ok(line) if line.contains(r#""InitAck""#) => {}
+                    Ok(line) if line.contains(r#""InitError""#) => {
+                        eprintln!("error: subscribe init rejected: {}", line);
+                        if let Ok(mut child) = child.lock() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        std::process::exit(1);
+                    }
+                    Ok(line) => {
+                        eprintln!("error: unexpected init response from plugin: {}", line);
+                        if let Ok(mut child) = child.lock() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        std::process::exit(1);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        eprintln!(
+                            "error: timed out waiting for subscribe init ack ({}s)",
+                            CONNECT_TIMEOUT.as_secs()
+                        );
+                        if let Ok(mut child) = child.lock() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        std::process::exit(1);
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        eprintln!("error: plugin connection closed during subscribe init");
+                        if let Ok(mut child) = child.lock() {
+                            let _ = child.wait();
+                        }
+                        std::process::exit(1);
+                    }
+                }
             } else {
                 // First line isn't an ACK — treat it as a normal event
                 // (backwards compat with older plugin versions)
@@ -237,6 +358,20 @@ fn subscribe(plugin: &str, full: bool) -> std::io::Result<()> {
             std::process::exit(1);
         }
     }
+
+    // Start heartbeat only after init handshake succeeds.
+    let heartbeat_running = running.clone();
+    let heartbeat_stdin = Arc::clone(&stdin);
+    std::thread::spawn(move || {
+        while heartbeat_running.load(Ordering::SeqCst) {
+            std::thread::sleep(HEARTBEAT_INTERVAL);
+            if let Ok(mut stdin) = heartbeat_stdin.lock() {
+                if stdin.write_all(b"\n").is_err() || stdin.flush().is_err() {
+                    break;
+                }
+            }
+        }
+    });
 
     // Phase 2: Normal event loop (no timeout)
     while running.load(Ordering::SeqCst) {
@@ -309,7 +444,13 @@ fn main() {
 
     let result = match cli.command {
         Commands::Focus { target } => focus(&plugin, target),
-        Commands::Subscribe { full } => subscribe(&plugin, full),
+        Commands::Subscribe {
+            full,
+            events,
+            pane_ids,
+            plugin_pane_ids,
+            tab_ids,
+        } => subscribe(&plugin, full, events, pane_ids, plugin_pane_ids, tab_ids),
         Commands::Tree => tree(&plugin),
     };
 
@@ -401,5 +542,83 @@ mod tests {
 
         let tab = Cli::try_parse_from(["zellij-tools", "focus", "tab", "2", "--id", "--position"]);
         assert!(tab.is_err());
+    }
+
+    #[test]
+    fn parses_subscribe_filter_flags() {
+        let cli = Cli::try_parse_from([
+            "zellij-tools",
+            "subscribe",
+            "--full",
+            "--event",
+            "PaneFocused,TabMoved",
+            "--pane-id",
+            "2,3",
+            "--plugin-pane-id",
+            "7,8",
+            "--tab-id",
+            "101,202",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Subscribe {
+                full,
+                events,
+                pane_ids,
+                plugin_pane_ids,
+                tab_ids,
+            } => {
+                assert!(full);
+                assert_eq!(
+                    events,
+                    vec![
+                        SubscribeEventKind::PaneFocused,
+                        SubscribeEventKind::TabMoved
+                    ]
+                );
+                assert_eq!(pane_ids, vec![2, 3]);
+                assert_eq!(plugin_pane_ids, vec![7, 8]);
+                assert_eq!(tab_ids, vec![101, 202]);
+            }
+            _ => panic!("expected subscribe command"),
+        }
+    }
+
+    #[test]
+    fn subscribe_init_json_contains_requested_filters() {
+        let json = build_subscribe_init_json(
+            true,
+            &[
+                SubscribeEventKind::PaneFocused,
+                SubscribeEventKind::TabMoved,
+            ],
+            &[2],
+            &[2],
+            &[7, 9],
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["full"], true);
+        assert_eq!(
+            value["events"],
+            serde_json::json!(["PaneFocused", "TabMoved"])
+        );
+        assert_eq!(
+            value["pane_ids"],
+            serde_json::json!(["terminal_2", "plugin_2"])
+        );
+        assert_eq!(value["tab_ids"], serde_json::json!([7, 9]));
+    }
+
+    #[test]
+    fn subscribe_init_json_omits_empty_filter_fields() {
+        let json = build_subscribe_init_json(false, &[], &[], &[], &[]);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["full"], false);
+        assert!(value.get("events").is_none());
+        assert!(value.get("pane_ids").is_none());
+        assert!(value.get("tab_ids").is_none());
     }
 }

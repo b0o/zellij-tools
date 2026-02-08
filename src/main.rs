@@ -5,7 +5,8 @@ use zellij_tile::prelude::*;
 
 use zellij_tools::config::resolve_include_path;
 use zellij_tools::events::{
-    EventStream, PaneInfo as EventPaneInfo, SubscribeMode, TabInfo as EventTabInfo,
+    Event as StreamEvent, EventStream, PaneInfo as EventPaneInfo, SubscribeMode,
+    TabInfo as EventTabInfo,
 };
 use zellij_tools::focus::{parse_focus_tab_target, FocusTabTarget};
 use zellij_tools::message::{parse_message, ParseError};
@@ -211,51 +212,11 @@ impl State {
                     SubscribeMode::Compact
                 };
 
-                let initial_events = self.event_stream.subscribe(cli_pipe_id.clone(), mode);
+                self.event_stream
+                    .subscribe_pending(cli_pipe_id.clone(), mode);
 
                 // Send ACK so CLI knows we're alive
-                self.emit_event(&cli_pipe_id, &zellij_tools::events::Event::Ack {}.to_json());
-
-                let event_panes: Vec<EventPaneInfo> = self
-                    .pane_manifest
-                    .iter()
-                    .flat_map(|(&tab_pos, panes)| {
-                        panes.iter().map(move |p| EventPaneInfo {
-                            id: p.id,
-                            is_focused: p.is_focused,
-                            is_floating: p.is_floating,
-                            is_suppressed: p.is_suppressed,
-                            is_plugin: p.is_plugin,
-                            tab_position: tab_pos,
-                            title: p.title.clone(),
-                            terminal_command: p.terminal_command.clone(),
-                            plugin_url: p.plugin_url.clone(),
-                        })
-                    })
-                    .collect();
-                let event_tabs: Vec<EventTabInfo> = self
-                    .tab_infos
-                    .iter()
-                    .map(|t| {
-                        let stable_id = self
-                            .tab_tracker
-                            .get_stable_id(t.position)
-                            .unwrap_or(t.position as u64);
-                        EventTabInfo {
-                            stable_id,
-                            position: t.position,
-                            name: t.name.clone(),
-                            active: t.active,
-                        }
-                    })
-                    .collect();
-                for event in &initial_events {
-                    let json = match mode {
-                        SubscribeMode::Compact => event.to_json(),
-                        SubscribeMode::Full => event.to_full_json(&event_panes, &event_tabs),
-                    };
-                    self.emit_event(&cli_pipe_id, &json);
-                }
+                self.emit_event(&cli_pipe_id, &StreamEvent::Ack {}.to_json());
                 Ok(())
             }
             "unsubscribe" => {
@@ -548,6 +509,26 @@ impl ZellijPlugin for State {
         match self.handle_event(&pipe_message) {
             Ok(()) => true,
             Err(ParseError::WrongPlugin | ParseError::InvalidFormat) => {
+                if let PipeSource::Cli(ref id) = pipe_message.source {
+                    if self.event_stream.is_pending(id) {
+                        match self.event_stream.initialize_subscriber(id, payload.trim()) {
+                            Ok(()) => {
+                                self.emit_event(id, &StreamEvent::InitAck {}.to_json());
+                            }
+                            Err(err) => {
+                                self.emit_event(
+                                    id,
+                                    &StreamEvent::InitError {
+                                        message: err.message(),
+                                    }
+                                    .to_json(),
+                                );
+                            }
+                        }
+                        return true;
+                    }
+                }
+
                 // Silently ignore messages from other plugins (zjstatus, etc.)
                 // and keybind payloads that don't match our format.
                 false

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The type of a pane, mirroring zellij's `PaneId` enum variants.
 /// Zellij uses separate ID namespaces for terminal and plugin panes,
@@ -10,6 +11,130 @@ use serde::Serialize;
 pub enum PaneType {
     Terminal,
     Plugin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EventKind {
+    PaneFocused,
+    PaneUnfocused,
+    PaneOpened,
+    PaneClosed,
+    TabFocused,
+    TabUnfocused,
+    TabCreated,
+    TabClosed,
+    TabMoved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypedPaneId {
+    Terminal(u32),
+    Plugin(u32),
+}
+
+impl TypedPaneId {
+    fn from_parts(prefix: &str, value: u32) -> Result<Self, String> {
+        match prefix {
+            "terminal" => Ok(Self::Terminal(value)),
+            "plugin" => Ok(Self::Plugin(value)),
+            _ => Err(format!("invalid pane type prefix: {prefix}")),
+        }
+    }
+
+    fn from_event(pane_id: u32, pane_type: PaneType) -> Self {
+        match pane_type {
+            PaneType::Terminal => Self::Terminal(pane_id),
+            PaneType::Plugin => Self::Plugin(pane_id),
+        }
+    }
+}
+
+impl FromStr for TypedPaneId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (prefix, id) = s
+            .split_once('_')
+            .ok_or_else(|| format!("invalid typed pane id: {s}"))?;
+        let value = id
+            .parse::<u32>()
+            .map_err(|_| format!("invalid typed pane numeric id: {s}"))?;
+        Self::from_parts(prefix, value)
+    }
+}
+
+impl<'de> Deserialize<'de> for TypedPaneId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::from_str(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SubscribeSpec {
+    #[serde(default)]
+    pub full: Option<bool>,
+    #[serde(default)]
+    pub events: Option<Vec<EventKind>>,
+    #[serde(default)]
+    pub pane_ids: Option<Vec<TypedPaneId>>,
+    #[serde(default)]
+    pub tab_ids: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EventFilter {
+    event_kinds: Option<HashSet<EventKind>>,
+    pane_ids: Option<HashSet<TypedPaneId>>,
+    tab_ids: Option<HashSet<u64>>,
+}
+
+impl EventFilter {
+    fn from_spec(spec: &SubscribeSpec) -> Self {
+        Self {
+            event_kinds: spec
+                .events
+                .as_ref()
+                .map(|kinds| kinds.iter().copied().collect()),
+            pane_ids: spec
+                .pane_ids
+                .as_ref()
+                .map(|pane_ids| pane_ids.iter().copied().collect()),
+            tab_ids: spec
+                .tab_ids
+                .as_ref()
+                .map(|tab_ids| tab_ids.iter().copied().collect()),
+        }
+    }
+
+    fn matches(&self, event: &Event) -> bool {
+        if let Some(event_kinds) = &self.event_kinds {
+            match event.kind() {
+                Some(kind) if event_kinds.contains(&kind) => {}
+                _ => return false,
+            }
+        }
+
+        if let Some(pane_ids) = &self.pane_ids {
+            match event.pane_key() {
+                Some(pane_id) if pane_ids.contains(&pane_id) => {}
+                _ => return false,
+            }
+        }
+
+        if let Some(tab_ids) = &self.tab_ids {
+            match event.tab_stable_id() {
+                Some(tab_id) if tab_ids.contains(&tab_id) => {}
+                _ => return false,
+            }
+        }
+
+        true
+    }
 }
 
 /// An event emitted to subscribers.
@@ -63,9 +188,55 @@ pub enum Event {
     },
     /// Acknowledgment sent to CLI after a successful subscribe.
     Ack {},
+    /// Acknowledgment sent after successful init payload parsing.
+    InitAck {},
+    /// Error response sent when init payload is rejected.
+    InitError {
+        message: String,
+    },
 }
 
 impl Event {
+    fn kind(&self) -> Option<EventKind> {
+        match self {
+            Self::PaneFocused { .. } => Some(EventKind::PaneFocused),
+            Self::PaneUnfocused { .. } => Some(EventKind::PaneUnfocused),
+            Self::PaneOpened { .. } => Some(EventKind::PaneOpened),
+            Self::PaneClosed { .. } => Some(EventKind::PaneClosed),
+            Self::TabFocused { .. } => Some(EventKind::TabFocused),
+            Self::TabUnfocused { .. } => Some(EventKind::TabUnfocused),
+            Self::TabCreated { .. } => Some(EventKind::TabCreated),
+            Self::TabClosed { .. } => Some(EventKind::TabClosed),
+            Self::TabMoved { .. } => Some(EventKind::TabMoved),
+            Self::Ack {} | Self::InitAck {} | Self::InitError { .. } => None,
+        }
+    }
+
+    fn pane_key(&self) -> Option<TypedPaneId> {
+        match self {
+            Self::PaneFocused { pane_id, pane_type }
+            | Self::PaneUnfocused { pane_id, pane_type }
+            | Self::PaneOpened {
+                pane_id, pane_type, ..
+            }
+            | Self::PaneClosed { pane_id, pane_type } => {
+                Some(TypedPaneId::from_event(*pane_id, *pane_type))
+            }
+            _ => None,
+        }
+    }
+
+    fn tab_stable_id(&self) -> Option<u64> {
+        match self {
+            Self::TabFocused { stable_id, .. }
+            | Self::TabUnfocused { stable_id, .. }
+            | Self::TabCreated { stable_id, .. }
+            | Self::TabClosed { stable_id, .. }
+            | Self::TabMoved { stable_id, .. } => Some(*stable_id),
+            _ => None,
+        }
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap()
     }
@@ -104,7 +275,7 @@ impl Event {
                     Self::merge_tab_detail(&mut value, tab);
                 }
             }
-            Event::Ack {} => {}
+            Event::Ack {} | Event::InitAck {} | Event::InitError { .. } => {}
         }
 
         serde_json::to_string(&value).unwrap()
@@ -164,22 +335,69 @@ pub enum SubscribeMode {
 
 /// A subscriber to the event stream
 #[derive(Debug, Clone)]
-pub struct Subscriber {
+struct Subscriber {
     /// The CLI pipe ID to send events to
-    pub pipe_id: String,
+    pipe_id: String,
     /// Whether to include full object details in events
-    pub mode: SubscribeMode,
+    mode: SubscribeMode,
     /// Monotonic counter value at last heartbeat from this subscriber.
-    pub last_heartbeat: u64,
+    last_heartbeat: u64,
+    state: SubscriberState,
+}
+
+#[derive(Debug, Clone)]
+enum SubscriberState {
+    PendingInit,
+    Active { filter: EventFilter },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum InitError {
+    InvalidJson { message: String },
+    SubscriberNotFound { pipe_id: String },
+    SubscriberAlreadyActive { pipe_id: String },
+}
+
+impl InitError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::InvalidJson { message } => format!("invalid init json: {message}"),
+            Self::SubscriberNotFound { pipe_id } => {
+                format!("subscriber not found: {pipe_id}")
+            }
+            Self::SubscriberAlreadyActive { pipe_id } => {
+                format!("subscriber already active: {pipe_id}")
+            }
+        }
+    }
 }
 
 impl Subscriber {
-    pub fn new(pipe_id: String, mode: SubscribeMode, heartbeat_counter: u64) -> Self {
+    fn pending(pipe_id: String, mode: SubscribeMode, heartbeat_counter: u64) -> Self {
         Self {
             pipe_id,
             mode,
             last_heartbeat: heartbeat_counter,
+            state: SubscriberState::PendingInit,
         }
+    }
+
+    fn active(
+        pipe_id: String,
+        mode: SubscribeMode,
+        heartbeat_counter: u64,
+        filter: EventFilter,
+    ) -> Self {
+        Self {
+            pipe_id,
+            mode,
+            last_heartbeat: heartbeat_counter,
+            state: SubscriberState::Active { filter },
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self.state, SubscriberState::Active { .. })
     }
 }
 
@@ -279,7 +497,12 @@ impl EventStream {
     /// Add a subscriber. Returns a vec of events representing current state
     /// (so the subscriber gets an initial snapshot).
     pub fn subscribe(&mut self, pipe_id: String, mode: SubscribeMode) -> Vec<Event> {
-        let subscriber = Subscriber::new(pipe_id.clone(), mode, self.heartbeat_counter);
+        let subscriber = Subscriber::active(
+            pipe_id.clone(),
+            mode,
+            self.heartbeat_counter,
+            EventFilter::default(),
+        );
         self.subscribers.insert(pipe_id, subscriber);
 
         let mut initial_events = Vec::new();
@@ -301,6 +524,63 @@ impl EventStream {
         }
 
         initial_events
+    }
+
+    /// Add a subscriber that must be initialized before receiving stream events.
+    pub fn subscribe_pending(&mut self, pipe_id: String, mode: SubscribeMode) {
+        let subscriber = Subscriber::pending(pipe_id.clone(), mode, self.heartbeat_counter);
+        self.subscribers.insert(pipe_id, subscriber);
+    }
+
+    /// Initialize a pending subscriber from an init JSON payload.
+    pub fn initialize_subscriber(
+        &mut self,
+        pipe_id: &str,
+        spec_json: &str,
+    ) -> Result<(), InitError> {
+        let spec = serde_json::from_str::<SubscribeSpec>(spec_json).map_err(|err| {
+            InitError::InvalidJson {
+                message: err.to_string(),
+            }
+        })?;
+        let sub =
+            self.subscribers
+                .get_mut(pipe_id)
+                .ok_or_else(|| InitError::SubscriberNotFound {
+                    pipe_id: pipe_id.to_string(),
+                })?;
+
+        if sub.is_active() {
+            return Err(InitError::SubscriberAlreadyActive {
+                pipe_id: pipe_id.to_string(),
+            });
+        }
+
+        if let Some(full) = spec.full {
+            sub.mode = if full {
+                SubscribeMode::Full
+            } else {
+                SubscribeMode::Compact
+            };
+        }
+        sub.state = SubscriberState::Active {
+            filter: EventFilter::from_spec(&spec),
+        };
+        Ok(())
+    }
+
+    pub fn is_active(&self, pipe_id: &str) -> bool {
+        self.subscribers
+            .get(pipe_id)
+            .map(Subscriber::is_active)
+            .unwrap_or(false)
+    }
+
+    pub fn is_pending(&self, pipe_id: &str) -> bool {
+        self.subscribers
+            .get(pipe_id)
+            .map(|sub| matches!(sub.state, SubscriberState::PendingInit))
+            .unwrap_or(false)
     }
 
     /// Record a heartbeat from a subscriber (called on empty pipe messages).
@@ -413,13 +693,21 @@ impl EventStream {
         panes: &[PaneInfo],
         tabs: &[TabInfo],
     ) -> Vec<(String, String)> {
+        let active_subscribers: Vec<&Subscriber> = self
+            .subscribers
+            .values()
+            .filter(|s| s.is_active())
+            .collect();
+        if active_subscribers.is_empty() {
+            return Vec::new();
+        }
+
         let mut output = Vec::new();
         for event in events {
             let compact_json = event.to_json();
             // Only compute full JSON if any subscriber wants it
-            let full_json = if self
-                .subscribers
-                .values()
+            let full_json = if active_subscribers
+                .iter()
                 .any(|s| s.mode == SubscribeMode::Full)
             {
                 Some(event.to_full_json(panes, tabs))
@@ -427,7 +715,12 @@ impl EventStream {
                 None
             };
 
-            for sub in self.subscribers.values() {
+            for sub in &active_subscribers {
+                if let SubscriberState::Active { filter } = &sub.state {
+                    if !filter.matches(event) {
+                        continue;
+                    }
+                }
                 let json = match sub.mode {
                     SubscribeMode::Compact => compact_json.clone(),
                     SubscribeMode::Full => full_json.as_ref().unwrap_or(&compact_json).clone(),
@@ -700,6 +993,266 @@ mod tests {
             terminal_command: None,
             plugin_url: None,
         }
+    }
+
+    // --- Filter matching ---
+
+    #[test]
+    fn filter_event_kind_matches_canonical_names() {
+        let filter = EventFilter::from_spec(&SubscribeSpec {
+            events: Some(vec![EventKind::PaneFocused, EventKind::TabMoved]),
+            pane_ids: None,
+            tab_ids: None,
+            full: None,
+        });
+
+        assert!(filter.matches(&Event::PaneFocused {
+            pane_id: 2,
+            pane_type: PaneType::Terminal,
+        }));
+        assert!(filter.matches(&Event::TabMoved {
+            stable_id: 42,
+            old_position: 0,
+            new_position: 1,
+            name: "dev".to_string(),
+        }));
+        assert!(!filter.matches(&Event::PaneClosed {
+            pane_id: 2,
+            pane_type: PaneType::Terminal,
+        }));
+    }
+
+    #[test]
+    fn filter_typed_pane_ids_distinguishes_terminal_and_plugin() {
+        let filter = EventFilter::from_spec(&SubscribeSpec {
+            events: None,
+            pane_ids: Some(vec![
+                "terminal_2".parse().unwrap(),
+                "plugin_2".parse().unwrap(),
+            ]),
+            tab_ids: None,
+            full: None,
+        });
+
+        assert!(filter.matches(&Event::PaneFocused {
+            pane_id: 2,
+            pane_type: PaneType::Terminal,
+        }));
+        assert!(filter.matches(&Event::PaneFocused {
+            pane_id: 2,
+            pane_type: PaneType::Plugin,
+        }));
+        assert!(!filter.matches(&Event::PaneFocused {
+            pane_id: 3,
+            pane_type: PaneType::Terminal,
+        }));
+    }
+
+    #[test]
+    fn filter_tab_stable_ids_match_tab_events() {
+        let filter = EventFilter::from_spec(&SubscribeSpec {
+            events: None,
+            pane_ids: None,
+            tab_ids: Some(vec![101]),
+            full: None,
+        });
+
+        assert!(filter.matches(&Event::TabFocused {
+            stable_id: 101,
+            position: 0,
+            name: "main".to_string(),
+        }));
+        assert!(!filter.matches(&Event::TabFocused {
+            stable_id: 202,
+            position: 1,
+            name: "other".to_string(),
+        }));
+    }
+
+    #[test]
+    fn filter_omitted_fields_are_unconstrained() {
+        let filter = EventFilter::from_spec(&SubscribeSpec {
+            events: Some(vec![EventKind::PaneFocused]),
+            pane_ids: None,
+            tab_ids: None,
+            full: None,
+        });
+
+        assert!(filter.matches(&Event::PaneFocused {
+            pane_id: 999,
+            pane_type: PaneType::Plugin,
+        }));
+    }
+
+    #[test]
+    fn filter_empty_list_matches_none_for_dimension() {
+        let pane_filter = EventFilter::from_spec(&SubscribeSpec {
+            events: None,
+            pane_ids: Some(vec![]),
+            tab_ids: None,
+            full: None,
+        });
+        assert!(!pane_filter.matches(&Event::PaneFocused {
+            pane_id: 2,
+            pane_type: PaneType::Terminal,
+        }));
+
+        let kind_filter = EventFilter::from_spec(&SubscribeSpec {
+            events: Some(vec![]),
+            pane_ids: None,
+            tab_ids: None,
+            full: None,
+        });
+        assert!(!kind_filter.matches(&Event::PaneFocused {
+            pane_id: 2,
+            pane_type: PaneType::Terminal,
+        }));
+
+        let tab_filter = EventFilter::from_spec(&SubscribeSpec {
+            events: None,
+            pane_ids: None,
+            tab_ids: Some(vec![]),
+            full: None,
+        });
+        assert!(!tab_filter.matches(&Event::TabFocused {
+            stable_id: 101,
+            position: 0,
+            name: "main".to_string(),
+        }));
+    }
+
+    #[test]
+    fn pending_subscribe_creates_pending_subscriber_only() {
+        let mut stream = EventStream::new();
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+
+        assert!(stream.has_subscribers());
+        assert!(!stream.is_active("pipe-1"));
+    }
+
+    #[test]
+    fn pending_subscriber_receives_no_stream_events() {
+        let mut stream = EventStream::new();
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+
+        let panes = vec![make_pane(42, true, false)];
+        let pane_output = stream.on_pane_update(&panes, 0);
+        assert!(pane_output.is_empty());
+
+        let tabs = vec![make_tab(100, 0, "tab1", true)];
+        let tab_output = stream.on_tab_update(&tabs);
+        assert!(tab_output.is_empty());
+    }
+
+    #[test]
+    fn pending_subscriber_activates_after_valid_init() {
+        let mut stream = EventStream::new();
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+
+        stream
+            .initialize_subscriber("pipe-1", r#"{"events":["PaneFocused"]}"#)
+            .unwrap();
+
+        assert!(stream.is_active("pipe-1"));
+
+        let panes = vec![make_pane(42, true, false)];
+        let output = stream.on_pane_update(&panes, 0);
+        assert!(output
+            .iter()
+            .any(|(pipe, json)| { pipe == "pipe-1" && json.contains(r#""PaneFocused""#) }));
+    }
+
+    #[test]
+    fn pending_subscriber_stays_pending_after_invalid_init() {
+        let mut stream = EventStream::new();
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+
+        let err = stream.initialize_subscriber("pipe-1", "not-json");
+        assert!(err.is_err());
+        assert!(!stream.is_active("pipe-1"));
+
+        let panes = vec![make_pane(42, true, false)];
+        let output = stream.on_pane_update(&panes, 0);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn subscribe_filter_no_events_before_init() {
+        let mut stream = EventStream::new();
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+
+        let panes = vec![make_pane(42, true, false)];
+        let output = stream.on_pane_update(&panes, 0);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn subscribe_filter_only_matching_events_after_init() {
+        let mut stream = EventStream::new();
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+        stream
+            .initialize_subscriber(
+                "pipe-1",
+                r#"{"events":["PaneFocused"],"pane_ids":["terminal_42"]}"#,
+            )
+            .unwrap();
+
+        let panes = vec![make_pane(42, true, false), make_pane(5, false, false)];
+        let output = stream.on_pane_update(&panes, 0);
+
+        assert!(output
+            .iter()
+            .any(|(pipe, json)| pipe == "pipe-1" && json.contains(r#""PaneFocused""#)));
+        assert!(!output
+            .iter()
+            .any(|(pipe, json)| pipe == "pipe-1" && json.contains(r#""PaneOpened""#)));
+    }
+
+    #[test]
+    fn subscribe_filter_full_mode_still_enriches_matching_events() {
+        let mut stream = EventStream::new();
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+        stream
+            .initialize_subscriber("pipe-1", r#"{"full":true,"events":["PaneFocused"]}"#)
+            .unwrap();
+
+        let panes = vec![make_detailed_pane(42, true, "shell", "/bin/zsh")];
+        let output = stream.on_pane_update(&panes, 0);
+
+        let focused = output
+            .iter()
+            .find(|(pipe, json)| pipe == "pipe-1" && json.contains(r#""PaneFocused""#))
+            .map(|(_, json)| json)
+            .expect("expected matching focused event");
+        assert!(focused.contains("title"));
+        assert!(focused.contains("terminal_command"));
+    }
+
+    #[test]
+    fn subscribe_filter_multiple_subscribers_receive_independent_outputs() {
+        let mut stream = EventStream::new();
+        stream.subscribe_pending("pane-sub".to_string(), SubscribeMode::Compact);
+        stream.subscribe_pending("tab-sub".to_string(), SubscribeMode::Compact);
+        stream
+            .initialize_subscriber("pane-sub", r#"{"events":["PaneFocused"]}"#)
+            .unwrap();
+        stream
+            .initialize_subscriber("tab-sub", r#"{"events":["TabFocused"]}"#)
+            .unwrap();
+
+        let panes = vec![make_pane(42, true, false)];
+        let pane_output = stream.on_pane_update(&panes, 0);
+        assert!(pane_output
+            .iter()
+            .any(|(pipe, json)| pipe == "pane-sub" && json.contains(r#""PaneFocused""#)));
+        assert!(!pane_output.iter().any(|(pipe, _)| pipe == "tab-sub"));
+
+        let tabs = vec![make_tab(100, 0, "main", true)];
+        let tab_output = stream.on_tab_update(&tabs);
+        assert!(tab_output
+            .iter()
+            .any(|(pipe, json)| pipe == "tab-sub" && json.contains(r#""TabFocused""#)));
+        assert!(!tab_output.iter().any(|(pipe, _)| pipe == "pane-sub"));
     }
 
     // --- Event serialization ---
@@ -1323,6 +1876,20 @@ mod tests {
     fn event_ack_serializes() {
         let event = Event::Ack {};
         assert_eq!(event.to_json(), r#"{"Ack":{}}"#);
+    }
+
+    #[test]
+    fn event_init_ack_serializes() {
+        let event = Event::InitAck {};
+        assert_eq!(event.to_json(), r#"{"InitAck":{}}"#);
+    }
+
+    #[test]
+    fn event_init_error_serializes() {
+        let event = Event::InitError {
+            message: "bad spec".to_string(),
+        };
+        assert_eq!(event.to_json(), r#"{"InitError":{"message":"bad spec"}}"#);
     }
 
     // --- Heartbeat tracking ---
