@@ -67,6 +67,7 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 ### WASI Sandbox Notes
 
 Zellij plugins run in a WASI sandbox with limited filesystem access:
+
 - `/host` - Mapped to a host directory via `change_host_folder()`
 - `/data` - Plugin data directory (persists across plugin instances)
 - `/tmp` - Temporary directory
