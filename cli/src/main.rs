@@ -6,7 +6,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 const DEFAULT_PLUGIN: &str = "zellij-tools";
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn resolve_plugin(cli_override: Option<&str>) -> String {
