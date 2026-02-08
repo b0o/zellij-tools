@@ -119,6 +119,7 @@ Stream pane/tab events:
 ```sh
 zellij-tools subscribe
 zellij-tools subscribe --full
+zellij-tools subscribe --event PaneFocused,TabMoved --pane-id 2 --plugin-pane-id 7 --tab-id 42
 ```
 
 Get a session tree snapshot:
