@@ -17,15 +17,14 @@ pub struct StableTabTracker {
     reference_pane_to_tab: HashMap<u32, StableTabId>,
     /// stable_tab_id -> current position (updated on each update)
     pub stable_tab_to_position: HashMap<StableTabId, usize>,
+    /// current position -> stable_tab_id (reverse lookup, rebuilt at end of update)
+    pub position_to_stable: HashMap<usize, StableTabId>,
 }
 
 impl StableTabTracker {
     /// Get stable ID for a tab position, if known
     pub fn get_stable_id(&self, position: usize) -> Option<StableTabId> {
-        self.stable_tab_to_position
-            .iter()
-            .find(|(_, &pos)| pos == position)
-            .map(|(&id, _)| id)
+        self.position_to_stable.get(&position).copied()
     }
 
     /// Update mappings based on current pane manifest.
@@ -66,9 +65,11 @@ impl StableTabTracker {
         // Rebuild stable_tab_to_position based on where reference panes are NOW
         // (stable ID follows the reference pane, even if position changed)
         self.stable_tab_to_position.clear();
+        self.position_to_stable.clear();
         for (&pane_id, &stable_id) in &self.reference_pane_to_tab {
             if let Some(&tab_position) = pane_to_current_tab.get(&pane_id) {
                 self.stable_tab_to_position.insert(stable_id, tab_position);
+                self.position_to_stable.insert(tab_position, stable_id);
             }
         }
 
@@ -82,11 +83,7 @@ impl StableTabTracker {
             // Find tabs that don't have a stable ID yet
             for (&tab_position, panes) in pane_manifest {
                 // Skip if this position already has a stable ID
-                if self
-                    .stable_tab_to_position
-                    .values()
-                    .any(|&pos| pos == tab_position)
-                {
+                if self.position_to_stable.contains_key(&tab_position) {
                     continue;
                 }
 
@@ -101,6 +98,7 @@ impl StableTabTracker {
                     // Assign this orphaned stable ID to this tab with a new reference pane
                     self.reference_pane_to_tab.insert(new_ref_pane, *stable_id);
                     self.stable_tab_to_position.insert(*stable_id, tab_position);
+                    self.position_to_stable.insert(tab_position, *stable_id);
                     break;
                 }
             }
@@ -116,11 +114,7 @@ impl StableTabTracker {
         // Assign new stable IDs to any tabs that still don't have one
         for (&tab_position, panes) in pane_manifest {
             // Skip if this position already has a stable ID
-            if self
-                .stable_tab_to_position
-                .values()
-                .any(|&pos| pos == tab_position)
-            {
+            if self.position_to_stable.contains_key(&tab_position) {
                 continue;
             }
 
@@ -139,6 +133,7 @@ impl StableTabTracker {
             self.next_id += 1;
             self.reference_pane_to_tab.insert(tiled_panes[0], new_id);
             self.stable_tab_to_position.insert(new_id, tab_position);
+            self.position_to_stable.insert(tab_position, new_id);
         }
 
         orphaned
@@ -245,6 +240,54 @@ mod tests {
         let orphaned = tracker.update(&manifest);
 
         assert!(orphaned.contains(&id_for_tab1));
+    }
+
+    #[test]
+    fn reverse_map_consistent_after_reorder() {
+        let mut tracker = StableTabTracker::default();
+
+        // Initial: 3 tabs
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_tiled_pane(100)]);
+        manifest.insert(1, vec![make_tiled_pane(200)]);
+        manifest.insert(2, vec![make_tiled_pane(300)]);
+        tracker.update(&manifest);
+
+        let id0 = tracker.get_stable_id(0).unwrap();
+        let id1 = tracker.get_stable_id(1).unwrap();
+        let id2 = tracker.get_stable_id(2).unwrap();
+
+        // Reorder: reverse the tab positions
+        manifest.clear();
+        manifest.insert(0, vec![make_tiled_pane(300)]);
+        manifest.insert(1, vec![make_tiled_pane(200)]);
+        manifest.insert(2, vec![make_tiled_pane(100)]);
+        tracker.update(&manifest);
+
+        // Stable IDs follow panes, not positions
+        assert_eq!(tracker.get_stable_id(0), Some(id2));
+        assert_eq!(tracker.get_stable_id(1), Some(id1));
+        assert_eq!(tracker.get_stable_id(2), Some(id0));
+
+        // Verify the reverse map is consistent with forward map
+        for (&stable_id, &position) in &tracker.stable_tab_to_position {
+            assert_eq!(
+                tracker.position_to_stable.get(&position),
+                Some(&stable_id),
+                "position_to_stable inconsistent for position {} (expected stable_id {})",
+                position,
+                stable_id
+            );
+        }
+        for (&position, &stable_id) in &tracker.position_to_stable {
+            assert_eq!(
+                tracker.stable_tab_to_position.get(&stable_id),
+                Some(&position),
+                "stable_tab_to_position inconsistent for stable_id {} (expected position {})",
+                stable_id,
+                position
+            );
+        }
     }
 
     #[test]
