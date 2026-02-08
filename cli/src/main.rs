@@ -21,7 +21,7 @@ fn resolve_plugin(cli_override: Option<&str>) -> String {
 #[command(about = "CLI utilities for zellij-tools plugin")]
 struct Cli {
     /// Plugin reference (name alias or file: path) [env: ZELLIJ_TOOLS_PLUGIN]
-    #[arg(long, global = true)]
+    #[arg(long = "zellij-plugin", global = true)]
     plugin: Option<String>,
 
     #[command(subcommand)]
@@ -30,6 +30,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Focus a pane or tab
+    Focus {
+        #[command(subcommand)]
+        target: FocusTarget,
+    },
     /// Subscribe to the event stream from the zellij-tools plugin
     Subscribe {
         /// Include full object details in each event
@@ -38,6 +43,71 @@ enum Commands {
     },
     /// Print the session tree (tabs, panes, stable IDs) as JSON
     Tree,
+}
+
+#[derive(Subcommand)]
+enum FocusTarget {
+    /// Focus a pane by ID
+    Pane {
+        pane_id: u32,
+        /// Focus a plugin pane ID (mutually exclusive with --terminal)
+        #[arg(short = 'p', long = "plugin", conflicts_with = "terminal_pane")]
+        plugin_pane: bool,
+        /// Focus a terminal pane ID (default)
+        #[arg(short = 't', long = "terminal", conflicts_with = "plugin_pane")]
+        terminal_pane: bool,
+    },
+    /// Focus a tab (position by default, or stable ID with --id)
+    Tab {
+        tab: u64,
+        /// Interpret the value as stable tab ID (mutually exclusive with --position)
+        #[arg(short = 'i', long, conflicts_with = "position")]
+        id: bool,
+        /// Interpret the value as tab position (default, 1-based)
+        #[arg(short = 'p', long, conflicts_with = "id")]
+        position: bool,
+    },
+}
+
+fn send_pipe_message(plugin: &str, msg: &str) -> std::io::Result<()> {
+    let status = Command::new("zellij")
+        .args(["pipe", "--plugin", plugin, "--", msg])
+        .status()?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "zellij pipe exited with status {}",
+            status
+        )))
+    }
+}
+
+fn focus(plugin: &str, target: FocusTarget) -> std::io::Result<()> {
+    let msg = match target {
+        FocusTarget::Pane {
+            pane_id,
+            plugin_pane,
+            ..
+        } => {
+            let pane = if plugin_pane {
+                format!("plugin_{}", pane_id)
+            } else {
+                format!("terminal_{}", pane_id)
+            };
+            format!("zellij-tools::focus-pane::{}", pane)
+        }
+        FocusTarget::Tab { tab, id, .. } => {
+            if id {
+                format!("zellij-tools::focus-tab::id::{}", tab)
+            } else {
+                format!("zellij-tools::focus-tab::position::{}", tab)
+            }
+        }
+    };
+
+    send_pipe_message(plugin, &msg)
 }
 
 fn subscribe(plugin: &str, full: bool) -> std::io::Result<()> {
@@ -245,6 +315,7 @@ fn main() {
     let plugin = resolve_plugin(cli.plugin.as_deref());
 
     let result = match cli.command {
+        Commands::Focus { target } => focus(&plugin, target),
         Commands::Subscribe { full } => subscribe(&plugin, full),
         Commands::Tree => tree(&plugin),
     };
@@ -252,5 +323,90 @@ fn main() {
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_focus_pane_command() {
+        let cli = Cli::try_parse_from(["zellij-tools", "focus", "pane", "2"]).unwrap();
+
+        match cli.command {
+            Commands::Focus {
+                target:
+                    FocusTarget::Pane {
+                        pane_id,
+                        plugin_pane,
+                        terminal_pane,
+                    },
+            } => {
+                assert_eq!(pane_id, 2);
+                assert!(!plugin_pane);
+                assert!(!terminal_pane);
+            }
+            _ => panic!("expected focus pane command"),
+        }
+    }
+
+    #[test]
+    fn parses_focus_pane_plugin_flag() {
+        let cli = Cli::try_parse_from(["zellij-tools", "focus", "pane", "2", "--plugin"]).unwrap();
+
+        match cli.command {
+            Commands::Focus {
+                target: FocusTarget::Pane { plugin_pane, .. },
+            } => assert!(plugin_pane),
+            _ => panic!("expected focus pane command"),
+        }
+    }
+
+    #[test]
+    fn parses_focus_tab_command() {
+        let cli = Cli::try_parse_from(["zellij-tools", "focus", "tab", "3"]).unwrap();
+
+        match cli.command {
+            Commands::Focus {
+                target: FocusTarget::Tab { tab, id, position },
+            } => {
+                assert_eq!(tab, 3);
+                assert!(!id);
+                assert!(!position);
+            }
+            _ => panic!("expected focus tab command"),
+        }
+    }
+
+    #[test]
+    fn parses_focus_tab_id_flag() {
+        let cli = Cli::try_parse_from(["zellij-tools", "focus", "tab", "42", "--id"]).unwrap();
+
+        match cli.command {
+            Commands::Focus {
+                target: FocusTarget::Tab { tab, id, .. },
+            } => {
+                assert_eq!(tab, 42);
+                assert!(id);
+            }
+            _ => panic!("expected focus tab command"),
+        }
+    }
+
+    #[test]
+    fn rejects_mutually_exclusive_focus_flags() {
+        let pane = Cli::try_parse_from([
+            "zellij-tools",
+            "focus",
+            "pane",
+            "2",
+            "--plugin",
+            "--terminal",
+        ]);
+        assert!(pane.is_err());
+
+        let tab = Cli::try_parse_from(["zellij-tools", "focus", "tab", "2", "--id", "--position"]);
+        assert!(tab.is_err());
     }
 }

@@ -7,6 +7,7 @@ use zellij_tools::config::resolve_include_path;
 use zellij_tools::events::{
     EventStream, PaneInfo as EventPaneInfo, SubscribeMode, TabInfo as EventTabInfo,
 };
+use zellij_tools::focus::{parse_focus_tab_target, FocusTabTarget};
 use zellij_tools::message::{parse_message, ParseError};
 use zellij_tools::scratchpad::{
     parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadCommand, ScratchpadContext,
@@ -156,6 +157,32 @@ impl State {
                     .map_err(|e| ParseError::InvalidArgs(format!("Invalid pane ID: {}", e)))?;
 
                 show_pane_with_id(pane_id, true);
+                Ok(())
+            }
+            "focus-tab" => {
+                let tab_index = match parse_focus_tab_target(&message.args)? {
+                    FocusTabTarget::Position(position) => position,
+                    FocusTabTarget::StableId(stable_id) => {
+                        let position = self
+                            .tab_tracker
+                            .stable_tab_to_position
+                            .get(&stable_id)
+                            .copied()
+                            .ok_or_else(|| {
+                                ParseError::InvalidArgs(format!(
+                                    "No tab found for stable ID {}",
+                                    stable_id
+                                ))
+                            })?;
+                        u32::try_from(position).map_err(|_| {
+                            ParseError::InvalidArgs(format!(
+                                "Tab position {} does not fit in u32",
+                                position
+                            ))
+                        })?
+                    }
+                };
+                go_to_tab(tab_index);
                 Ok(())
             }
             "scratchpad" => {
