@@ -29,14 +29,14 @@ impl std::fmt::Display for ParseError {
 }
 
 /// A parsed pipe message
-pub struct Message {
-    pub event: String,
-    pub args: Vec<String>,
+pub struct Message<'a> {
+    pub event: &'a str,
+    pub args: Vec<&'a str>,
 }
 
 /// Parse a pipe message payload into event and args.
 /// Format: "zellij-tools::event::arg1::arg2::..."
-pub fn parse_message(payload: &str) -> Result<Message, ParseError> {
+pub fn parse_message(payload: &str) -> Result<Message<'_>, ParseError> {
     let mut parts = payload.splitn(3, "::");
 
     let plugin = parts.next().ok_or(ParseError::InvalidFormat)?;
@@ -47,16 +47,13 @@ pub fn parse_message(payload: &str) -> Result<Message, ParseError> {
         return Err(ParseError::WrongPlugin);
     }
 
-    let args: Vec<String> = if args_str.is_empty() {
+    let args: Vec<&str> = if args_str.is_empty() {
         Vec::new()
     } else {
-        args_str.split("::").map(|s| s.to_string()).collect()
+        args_str.split("::").collect()
     };
 
-    Ok(Message {
-        event: event.to_string(),
-        args,
-    })
+    Ok(Message { event, args })
 }
 
 #[cfg(test)]

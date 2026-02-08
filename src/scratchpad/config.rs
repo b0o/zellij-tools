@@ -29,12 +29,12 @@ pub fn is_valid_scratchpad_name(name: &str) -> bool {
 }
 
 /// Parse a scratchpad action from message args
-pub fn parse_scratchpad_action(args: &[String]) -> Result<ScratchpadAction, ParseError> {
-    let action = args.first().map(|s| s.as_str()).unwrap_or("");
+pub fn parse_scratchpad_action(args: &[&str]) -> Result<ScratchpadAction, ParseError> {
+    let action = args.first().copied().unwrap_or("");
 
     match action {
         "toggle" => {
-            let name = args.get(1).cloned();
+            let name = args.get(1).map(|s| (*s).to_string());
             if let Some(ref n) = name {
                 if !is_valid_scratchpad_name(n) {
                     return Err(ParseError::InvalidScratchpadName(n.clone()));
@@ -47,27 +47,33 @@ pub fn parse_scratchpad_action(args: &[String]) -> Result<ScratchpadAction, Pars
                 ParseError::InvalidArgs("show requires a scratchpad name".to_string())
             })?;
             if !is_valid_scratchpad_name(name) {
-                return Err(ParseError::InvalidScratchpadName(name.clone()));
+                return Err(ParseError::InvalidScratchpadName(name.to_string()));
             }
-            Ok(ScratchpadAction::Show { name: name.clone() })
+            Ok(ScratchpadAction::Show {
+                name: name.to_string(),
+            })
         }
         "hide" => {
             let name = args.get(1).ok_or_else(|| {
                 ParseError::InvalidArgs("hide requires a scratchpad name".to_string())
             })?;
             if !is_valid_scratchpad_name(name) {
-                return Err(ParseError::InvalidScratchpadName(name.clone()));
+                return Err(ParseError::InvalidScratchpadName(name.to_string()));
             }
-            Ok(ScratchpadAction::Hide { name: name.clone() })
+            Ok(ScratchpadAction::Hide {
+                name: name.to_string(),
+            })
         }
         "close" => {
             let name = args.get(1).ok_or_else(|| {
                 ParseError::InvalidArgs("close requires a scratchpad name".to_string())
             })?;
             if !is_valid_scratchpad_name(name) {
-                return Err(ParseError::InvalidScratchpadName(name.clone()));
+                return Err(ParseError::InvalidScratchpadName(name.to_string()));
             }
-            Ok(ScratchpadAction::Close { name: name.clone() })
+            Ok(ScratchpadAction::Close {
+                name: name.to_string(),
+            })
         }
         "register" => {
             // Format: register::<name>::<pane_id>
@@ -81,10 +87,10 @@ pub fn parse_scratchpad_action(args: &[String]) -> Result<ScratchpadAction, Pars
                 ParseError::InvalidArgs(format!("Invalid pane_id '{}': {}", pane_id_str, e))
             })?;
             if !is_valid_scratchpad_name(name) {
-                return Err(ParseError::InvalidScratchpadName(name.clone()));
+                return Err(ParseError::InvalidScratchpadName(name.to_string()));
             }
             Ok(ScratchpadAction::Register {
-                name: name.clone(),
+                name: name.to_string(),
                 pane_id,
             })
         }
@@ -172,8 +178,8 @@ mod tests {
     }
 
     // parse_scratchpad_action tests
-    fn args(strs: &[&str]) -> Vec<String> {
-        strs.iter().map(|s| s.to_string()).collect()
+    fn args<'a>(strs: &[&'a str]) -> Vec<&'a str> {
+        strs.to_vec()
     }
 
     #[test]
