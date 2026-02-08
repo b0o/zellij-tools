@@ -188,6 +188,19 @@ impl Subscriber {
 /// can refer to both a terminal pane and a plugin pane simultaneously.
 type PaneKey = (u32, PaneType);
 
+/// Lightweight snapshot of a pane's focus-relevant fields.
+/// Stored in EventStream so that tab switches can recompute pane focus
+/// without needing a new PaneUpdate. No heap allocations.
+#[derive(Debug, Clone)]
+struct PaneFocusSnapshot {
+    id: u32,
+    pane_type: PaneType,
+    is_focused: bool,
+    is_floating: bool,
+    is_suppressed: bool,
+    tab_position: usize,
+}
+
 /// Tracks state and emits events to subscribers when things change.
 ///
 /// Detects:
@@ -195,6 +208,10 @@ type PaneKey = (u32, PaneType);
 /// - Pane open/close (by diffing the set of known pane IDs across PaneUpdate calls)
 /// - Tab focus changes (by comparing active tab across TabUpdate calls)
 /// - Tab create/close (by diffing the set of known tab positions across TabUpdate calls)
+///
+/// Pane focus is recomputed on both PaneUpdate and TabUpdate, because zellij
+/// delivers these events independently in arbitrary order. A tab switch must
+/// trigger pane focus recomputation even if no PaneUpdate has arrived yet.
 #[derive(Debug, Default)]
 pub struct EventStream {
     /// Active subscribers keyed by pipe ID
@@ -211,6 +228,13 @@ pub struct EventStream {
     last_active_tab: Option<u64>,
     /// Known tabs by stable_id: stable_id -> (position, name)
     known_tabs: HashMap<u64, (usize, String)>,
+    /// Lightweight snapshot of pane focus state for recomputing focus on tab switch.
+    /// Updated on each PaneUpdate.
+    pane_focus_snapshot: Vec<PaneFocusSnapshot>,
+    /// Last known active tab position (by tab index, not stable_id).
+    /// Used for pane focus filtering — we need the position, not stable_id,
+    /// because PaneInfo.tab_position uses position.
+    active_tab_position: Option<usize>,
 }
 
 /// Information about a tab, used for diffing
@@ -342,13 +366,40 @@ impl EventStream {
     }
 
     /// Process a tab update, returns events to broadcast to all subscribers.
+    ///
+    /// Also recomputes pane focus if the active tab position changed, because
+    /// PaneUpdate and TabUpdate arrive in arbitrary order from zellij. A tab
+    /// switch must trigger pane focus recomputation even without a new PaneUpdate.
     pub fn on_tab_update(&mut self, tabs: &[TabInfo]) -> Vec<(String, String)> {
+        let new_active_position = tabs.iter().find(|t| t.active).map(|t| t.position);
+
         if !self.has_subscribers() {
+            // Still recompute pane focus so last_focused_pane stays correct
+            if new_active_position != self.active_tab_position {
+                if let Some(pos) = new_active_position {
+                    self.active_tab_position = Some(pos);
+                    self.last_focused_pane =
+                        Self::find_focused_from_snapshot(&self.pane_focus_snapshot, pos);
+                }
+            }
             self.update_tab_state(tabs);
             return vec![];
         }
 
-        let events = self.compute_tab_events(tabs);
+        let mut events = self.compute_tab_events(tabs);
+
+        // If active tab position changed, recompute pane focus from stored snapshot
+        if new_active_position != self.active_tab_position {
+            if let Some(new_pos) = new_active_position {
+                let new_focused =
+                    Self::find_focused_from_snapshot(&self.pane_focus_snapshot, new_pos);
+                let focus_events = Self::compute_focus_change(self.last_focused_pane, new_focused);
+                events.extend(focus_events);
+                self.active_tab_position = Some(new_pos);
+                self.last_focused_pane = new_focused;
+            }
+        }
+
         self.update_tab_state(tabs);
 
         self.broadcast_events(&events, &[], tabs)
@@ -514,8 +565,81 @@ impl EventStream {
 
         // 2. Detect focus changes (only consider panes on the active tab)
         let new_focused = Self::find_focused(panes, active_tab);
+        events.extend(Self::compute_focus_change(
+            self.last_focused_pane,
+            new_focused,
+        ));
 
-        match (self.last_focused_pane, new_focused) {
+        events
+    }
+
+    /// Update internal pane state to match current pane manifest
+    pub fn update_pane_state(&mut self, panes: &[PaneInfo], active_tab: usize) {
+        self.known_panes = panes.iter().map(|p| (p.id, p.pane_type())).collect();
+        self.last_focused_pane = Self::find_focused(panes, active_tab);
+        self.active_tab_position = Some(active_tab);
+        self.pane_focus_snapshot = panes
+            .iter()
+            .map(|p| PaneFocusSnapshot {
+                id: p.id,
+                pane_type: p.pane_type(),
+                is_focused: p.is_focused,
+                is_floating: p.is_floating,
+                is_suppressed: p.is_suppressed,
+                tab_position: p.tab_position,
+            })
+            .collect();
+    }
+
+    /// Find the focused pane from a list of panes on the active tab.
+    /// Only considers panes on `active_tab` to avoid stale focus from other tabs
+    /// (e.g., a floating pane on tab 0 that retains is_focused after switching to tab 1).
+    /// Among active-tab panes, floating panes take precedence. Suppressed panes are excluded.
+    fn find_focused(panes: &[PaneInfo], active_tab: usize) -> Option<(u32, PaneType)> {
+        let mut focused_tiled: Option<(u32, PaneType)> = None;
+        let mut focused_floating: Option<(u32, PaneType)> = None;
+
+        for pane in panes {
+            if pane.tab_position == active_tab && pane.is_focused && !pane.is_suppressed {
+                if pane.is_floating {
+                    focused_floating = Some((pane.id, pane.pane_type()));
+                } else {
+                    focused_tiled = Some((pane.id, pane.pane_type()));
+                }
+            }
+        }
+
+        focused_floating.or(focused_tiled)
+    }
+
+    /// Like `find_focused` but works on the lightweight snapshot (no PaneInfo needed).
+    fn find_focused_from_snapshot(
+        snapshot: &[PaneFocusSnapshot],
+        active_tab: usize,
+    ) -> Option<(u32, PaneType)> {
+        let mut focused_tiled: Option<(u32, PaneType)> = None;
+        let mut focused_floating: Option<(u32, PaneType)> = None;
+
+        for pane in snapshot {
+            if pane.tab_position == active_tab && pane.is_focused && !pane.is_suppressed {
+                if pane.is_floating {
+                    focused_floating = Some((pane.id, pane.pane_type));
+                } else {
+                    focused_tiled = Some((pane.id, pane.pane_type));
+                }
+            }
+        }
+
+        focused_floating.or(focused_tiled)
+    }
+
+    /// Compute pane focus change events given old and new focused pane.
+    fn compute_focus_change(
+        old: Option<(u32, PaneType)>,
+        new: Option<(u32, PaneType)>,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        match (old, new) {
             (Some((old_id, old_type)), Some((new_id, new_type)))
                 if old_id != new_id || old_type != new_type =>
             {
@@ -540,37 +664,9 @@ impl EventStream {
                     pane_type: new_type,
                 });
             }
-            _ => {} // Same pane or both None — no change
+            _ => {}
         }
-
         events
-    }
-
-    /// Update internal pane state to match current pane manifest
-    pub fn update_pane_state(&mut self, panes: &[PaneInfo], active_tab: usize) {
-        self.known_panes = panes.iter().map(|p| (p.id, p.pane_type())).collect();
-        self.last_focused_pane = Self::find_focused(panes, active_tab);
-    }
-
-    /// Find the focused pane from a list of panes on the active tab.
-    /// Only considers panes on `active_tab` to avoid stale focus from other tabs
-    /// (e.g., a floating pane on tab 0 that retains is_focused after switching to tab 1).
-    /// Among active-tab panes, floating panes take precedence. Suppressed panes are excluded.
-    fn find_focused(panes: &[PaneInfo], active_tab: usize) -> Option<(u32, PaneType)> {
-        let mut focused_tiled: Option<(u32, PaneType)> = None;
-        let mut focused_floating: Option<(u32, PaneType)> = None;
-
-        for pane in panes {
-            if pane.tab_position == active_tab && pane.is_focused && !pane.is_suppressed {
-                if pane.is_floating {
-                    focused_floating = Some((pane.id, pane.pane_type()));
-                } else {
-                    focused_tiled = Some((pane.id, pane.pane_type()));
-                }
-            }
-        }
-
-        focused_floating.or(focused_tiled)
     }
 }
 
@@ -1394,6 +1490,158 @@ mod tests {
             jsons.contains(&r#"{"PaneFocused":{"pane_id":1,"pane_type":"terminal"}}"#),
             "Should emit PaneFocused for tiled pane 1 on new tab. Got: {:?}",
             jsons
+        );
+    }
+
+    #[test]
+    fn tab_update_before_pane_update_emits_pane_focus_change() {
+        // When TabUpdate arrives before PaneUpdate, the tab change should
+        // trigger pane focus recomputation using stored pane state.
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
+
+        // Initial state: tab 0 active, floating pane 10 focused on tab 0,
+        // tiled pane 1 focused on tab 1
+        let tabs = vec![
+            make_tab(100, 0, "tab0", true),
+            make_tab(101, 1, "tab1", false),
+        ];
+        stream.on_tab_update(&tabs);
+
+        let panes = vec![
+            make_pane(0, true, false), // tiled pane on tab 0
+            PaneInfo {
+                id: 10,
+                is_focused: true,
+                is_floating: true,
+                is_suppressed: false,
+                is_plugin: false,
+                tab_position: 0,
+                title: String::new(),
+                terminal_command: None,
+                plugin_url: None,
+            },
+            PaneInfo {
+                id: 1,
+                is_focused: true,
+                is_floating: false,
+                is_suppressed: false,
+                is_plugin: false,
+                tab_position: 1,
+                title: String::new(),
+                terminal_command: None,
+                plugin_url: None,
+            },
+        ];
+        stream.on_pane_update(&panes, 0);
+
+        // Now TabUpdate arrives FIRST (before any new PaneUpdate), switching to tab 1
+        let tabs = vec![
+            make_tab(100, 0, "tab0", false),
+            make_tab(101, 1, "tab1", true),
+        ];
+        let output = stream.on_tab_update(&tabs);
+
+        let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
+        assert!(
+            jsons.contains(&r#"{"PaneUnfocused":{"pane_id":10,"pane_type":"terminal"}}"#),
+            "TabUpdate should trigger PaneUnfocused for floating pane 10. Got: {:?}",
+            jsons
+        );
+        assert!(
+            jsons.contains(&r#"{"PaneFocused":{"pane_id":1,"pane_type":"terminal"}}"#),
+            "TabUpdate should trigger PaneFocused for tiled pane 1 on new tab. Got: {:?}",
+            jsons
+        );
+    }
+
+    #[test]
+    fn pane_update_before_tab_update_emits_pane_focus_on_tab_update() {
+        // When PaneUpdate arrives before TabUpdate with stale active tab,
+        // the focus change should be emitted when TabUpdate arrives.
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
+
+        // Initial state: tab 0 active, floating pane 10 focused
+        let tabs = vec![
+            make_tab(100, 0, "tab0", true),
+            make_tab(101, 1, "tab1", false),
+        ];
+        stream.on_tab_update(&tabs);
+
+        let panes = vec![
+            make_pane(0, true, false),
+            PaneInfo {
+                id: 10,
+                is_focused: true,
+                is_floating: true,
+                is_suppressed: false,
+                is_plugin: false,
+                tab_position: 0,
+                title: String::new(),
+                terminal_command: None,
+                plugin_url: None,
+            },
+        ];
+        stream.on_pane_update(&panes, 0);
+
+        // PaneUpdate arrives FIRST with new pane on tab 1, but active_tab still 0
+        // (TabUpdate hasn't arrived yet, so caller passes old active_tab)
+        let panes = vec![
+            make_pane(0, true, false),
+            PaneInfo {
+                id: 10,
+                is_focused: true,
+                is_floating: true,
+                is_suppressed: false,
+                is_plugin: false,
+                tab_position: 0,
+                title: String::new(),
+                terminal_command: None,
+                plugin_url: None,
+            },
+            PaneInfo {
+                id: 1,
+                is_focused: true,
+                is_floating: false,
+                is_suppressed: false,
+                is_plugin: false,
+                tab_position: 1,
+                title: String::new(),
+                terminal_command: None,
+                plugin_url: None,
+            },
+        ];
+        let pane_output = stream.on_pane_update(&panes, 0);
+
+        // PaneUpdate with stale active_tab should NOT emit focus change
+        // (floating pane 10 is still "focused" on tab 0)
+        let pane_jsons: Vec<&str> = pane_output.iter().map(|(_, json)| json.as_str()).collect();
+        assert!(
+            !pane_jsons
+                .iter()
+                .any(|j| j.contains("PaneUnfocused") || j.contains("PaneFocused")),
+            "PaneUpdate with stale active_tab should not emit focus events. Got: {:?}",
+            pane_jsons
+        );
+
+        // NOW TabUpdate arrives, switching to tab 1
+        let tabs = vec![
+            make_tab(100, 0, "tab0", false),
+            make_tab(101, 1, "tab1", true),
+        ];
+        let tab_output = stream.on_tab_update(&tabs);
+
+        let tab_jsons: Vec<&str> = tab_output.iter().map(|(_, json)| json.as_str()).collect();
+        assert!(
+            tab_jsons.contains(&r#"{"PaneUnfocused":{"pane_id":10,"pane_type":"terminal"}}"#),
+            "TabUpdate should trigger PaneUnfocused for floating pane 10. Got: {:?}",
+            tab_jsons
+        );
+        assert!(
+            tab_jsons.contains(&r#"{"PaneFocused":{"pane_id":1,"pane_type":"terminal"}}"#),
+            "TabUpdate should trigger PaneFocused for pane 1 on new tab. Got: {:?}",
+            tab_jsons
         );
     }
 
