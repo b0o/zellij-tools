@@ -462,7 +462,7 @@ impl ZellijPlugin for State {
             // Heartbeat from a CLI subscriber — record liveness and prune stale ones.
             if let PipeSource::Cli(ref id) = pipe_message.source {
                 self.event_stream.record_heartbeat(id);
-                self.event_stream.prune_stale_subscribers(50);
+                self.event_stream.prune_stale_subscribers(5);
             }
             return false;
         }
