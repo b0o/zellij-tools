@@ -387,11 +387,10 @@ impl EventStream {
         let mut events = Vec::new();
 
         let new_ids: HashSet<u64> = tabs.iter().map(|t| t.stable_id).collect();
-        let old_ids: HashSet<u64> = self.known_tabs.keys().copied().collect();
 
         // Created tabs (new stable_id not in old)
         for tab in tabs {
-            if !old_ids.contains(&tab.stable_id) {
+            if !self.known_tabs.contains_key(&tab.stable_id) {
                 events.push(Event::TabCreated {
                     stable_id: tab.stable_id,
                     position: tab.position,
@@ -401,13 +400,12 @@ impl EventStream {
         }
 
         // Closed tabs (old stable_id not in new)
-        for &old_id in &old_ids {
+        for (&old_id, (position, name)) in &self.known_tabs {
             if !new_ids.contains(&old_id) {
-                let (position, name) = self.known_tabs.get(&old_id).cloned().unwrap_or_default();
                 events.push(Event::TabClosed {
                     stable_id: old_id,
-                    position,
-                    name,
+                    position: *position,
+                    name: name.clone(),
                 });
             }
         }
@@ -469,11 +467,12 @@ impl EventStream {
     }
 
     /// Update internal tab state
-    fn update_tab_state(&mut self, tabs: &[TabInfo]) {
-        self.known_tabs = tabs
-            .iter()
-            .map(|t| (t.stable_id, (t.position, t.name.clone())))
-            .collect();
+    pub fn update_tab_state(&mut self, tabs: &[TabInfo]) {
+        self.known_tabs.clear();
+        for t in tabs {
+            self.known_tabs
+                .insert(t.stable_id, (t.position, t.name.clone()));
+        }
         self.last_active_tab = tabs.iter().find(|t| t.active).map(|t| t.stable_id);
     }
 
@@ -542,7 +541,7 @@ impl EventStream {
     }
 
     /// Update internal pane state to match current pane manifest
-    fn update_pane_state(&mut self, panes: &[PaneInfo]) {
+    pub fn update_pane_state(&mut self, panes: &[PaneInfo]) {
         self.known_panes = panes.iter().map(|p| (p.id, p.pane_type())).collect();
         self.last_focused_pane = Self::find_focused(panes);
     }
@@ -1254,6 +1253,46 @@ mod tests {
         let pruned = stream.prune_stale_subscribers(50);
         assert!(pruned.is_empty());
         assert!(stream.has_subscribers());
+    }
+
+    #[test]
+    fn update_pane_state_is_public() {
+        let mut stream = EventStream::new();
+
+        // Call update_pane_state directly (no subscribers needed)
+        let panes = vec![make_pane(42, true, false), make_pane(17, false, false)];
+        stream.update_pane_state(&panes);
+
+        // State should be tracked: subscribing now returns current focus
+        let events = stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            Event::PaneFocused {
+                pane_id: 42,
+                pane_type: PaneType::Terminal,
+            }
+        );
+    }
+
+    #[test]
+    fn update_tab_state_is_public() {
+        let mut stream = EventStream::new();
+
+        // Call update_tab_state directly (no subscribers needed)
+        let tabs = vec![
+            make_tab(100, 0, "tab1", true),
+            make_tab(101, 1, "tab2", false),
+        ];
+        stream.update_tab_state(&tabs);
+
+        // State should be tracked: subscribing now returns current focus
+        let events = stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
+        assert!(events.contains(&Event::TabFocused {
+            stable_id: 100,
+            position: 0,
+            name: "tab1".to_string(),
+        }));
     }
 
     #[test]
