@@ -185,6 +185,10 @@ impl State {
                 };
 
                 let initial_events = self.event_stream.subscribe(cli_pipe_id.clone(), mode);
+
+                // Send ACK so CLI knows we're alive
+                self.emit_event(&cli_pipe_id, &zellij_tools::events::Event::Ack {}.to_json());
+
                 let event_panes: Vec<EventPaneInfo> = self
                     .pane_manifest
                     .values()
