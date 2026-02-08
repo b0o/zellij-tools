@@ -142,7 +142,7 @@ impl State {
         let payload = pipe_message.payload.as_deref().unwrap_or("");
         let message = parse_message(payload)?;
 
-        match message.event.as_str() {
+        match message.event {
             "focus-pane" => {
                 if message.args.len() != 1 {
                     return Err(ParseError::InvalidArgs(format!(
@@ -178,7 +178,7 @@ impl State {
                     }
                 };
 
-                let mode = if message.args.first().map(|s| s.as_str()) == Some("full") {
+                let mode = if message.args.first().copied() == Some("full") {
                     SubscribeMode::Full
                 } else {
                     SubscribeMode::Compact
@@ -254,7 +254,7 @@ impl State {
                 self.emit_event(&cli_pipe_id, &json);
                 Ok(())
             }
-            _ => Err(ParseError::UnknownEvent(message.event)),
+            _ => Err(ParseError::UnknownEvent(message.event.to_string())),
         }
     }
 
@@ -313,30 +313,51 @@ impl ZellijPlugin for State {
             Event::PaneUpdate(pane_manifest) => {
                 self.pane_manifest = pane_manifest.panes;
 
-                // Convert pane manifest into EventStream's PaneInfo format
-                // and emit any detected changes (focus, open, close).
-                // Note: cli_pipe_output calls are buffered by zellij and only
-                // flushed on the next pipe() call. The CLI sends periodic
-                // heartbeats to trigger the flush.
-                let event_panes: Vec<EventPaneInfo> = self
-                    .pane_manifest
-                    .values()
-                    .flatten()
-                    .map(|p| EventPaneInfo {
-                        id: p.id,
-                        is_focused: p.is_focused,
-                        is_floating: p.is_floating,
-                        is_suppressed: p.is_suppressed,
-                        is_plugin: p.is_plugin,
-                        title: p.title.clone(),
-                        terminal_command: p.terminal_command.clone(),
-                        plugin_url: p.plugin_url.clone(),
-                    })
-                    .collect();
+                if self.event_stream.has_subscribers() {
+                    // Convert pane manifest into EventStream's PaneInfo format
+                    // and emit any detected changes (focus, open, close).
+                    // Note: cli_pipe_output calls are buffered by zellij and only
+                    // flushed on the next pipe() call. The CLI sends periodic
+                    // heartbeats to trigger the flush.
+                    let event_panes: Vec<EventPaneInfo> = self
+                        .pane_manifest
+                        .values()
+                        .flatten()
+                        .map(|p| EventPaneInfo {
+                            id: p.id,
+                            is_focused: p.is_focused,
+                            is_floating: p.is_floating,
+                            is_suppressed: p.is_suppressed,
+                            is_plugin: p.is_plugin,
+                            title: p.title.clone(),
+                            terminal_command: p.terminal_command.clone(),
+                            plugin_url: p.plugin_url.clone(),
+                        })
+                        .collect();
 
-                let events = self.event_stream.on_pane_update(&event_panes);
-                for (pipe_id, json) in &events {
-                    self.emit_event(pipe_id, json);
+                    let events = self.event_stream.on_pane_update(&event_panes);
+                    for (pipe_id, json) in &events {
+                        self.emit_event(pipe_id, json);
+                    }
+                } else {
+                    // No subscribers — still update internal state (focus, known panes)
+                    // but skip expensive String clones for title/command/url fields.
+                    let cheap_panes: Vec<EventPaneInfo> = self
+                        .pane_manifest
+                        .values()
+                        .flatten()
+                        .map(|p| EventPaneInfo {
+                            id: p.id,
+                            is_focused: p.is_focused,
+                            is_floating: p.is_floating,
+                            is_suppressed: p.is_suppressed,
+                            is_plugin: p.is_plugin,
+                            title: String::new(),
+                            terminal_command: None,
+                            plugin_url: None,
+                        })
+                        .collect();
+                    self.event_stream.update_pane_state(&cheap_panes);
                 }
 
                 // Update stable tab mapping and get orphaned tabs
@@ -357,25 +378,46 @@ impl ZellijPlugin for State {
                     self.are_floating_panes_visible = active_tab.are_floating_panes_visible;
                 }
 
-                // Emit tab events (focus, create, close, move)
-                let event_tabs: Vec<EventTabInfo> = tab_infos
-                    .iter()
-                    .map(|t| {
-                        let stable_id = self
-                            .tab_tracker
-                            .get_stable_id(t.position)
-                            .unwrap_or(t.position as u64);
-                        EventTabInfo {
-                            stable_id,
-                            position: t.position,
-                            name: t.name.clone(),
-                            active: t.active,
-                        }
-                    })
-                    .collect();
-                let events = self.event_stream.on_tab_update(&event_tabs);
-                for (pipe_id, json) in &events {
-                    self.emit_event(pipe_id, json);
+                if self.event_stream.has_subscribers() {
+                    // Emit tab events (focus, create, close, move)
+                    let event_tabs: Vec<EventTabInfo> = tab_infos
+                        .iter()
+                        .map(|t| {
+                            let stable_id = self
+                                .tab_tracker
+                                .get_stable_id(t.position)
+                                .unwrap_or(t.position as u64);
+                            EventTabInfo {
+                                stable_id,
+                                position: t.position,
+                                name: t.name.clone(),
+                                active: t.active,
+                            }
+                        })
+                        .collect();
+                    let events = self.event_stream.on_tab_update(&event_tabs);
+                    for (pipe_id, json) in &events {
+                        self.emit_event(pipe_id, json);
+                    }
+                } else {
+                    // No subscribers — still update internal state (active tab, known tabs)
+                    // but skip expensive String clones for tab names.
+                    let cheap_tabs: Vec<EventTabInfo> = tab_infos
+                        .iter()
+                        .map(|t| {
+                            let stable_id = self
+                                .tab_tracker
+                                .get_stable_id(t.position)
+                                .unwrap_or(t.position as u64);
+                            EventTabInfo {
+                                stable_id,
+                                position: t.position,
+                                name: String::new(),
+                                active: t.active,
+                            }
+                        })
+                        .collect();
+                    self.event_stream.update_tab_state(&cheap_tabs);
                 }
 
                 self.tab_infos = tab_infos;
@@ -462,7 +504,9 @@ impl ZellijPlugin for State {
             // Heartbeat from a CLI subscriber — record liveness and prune stale ones.
             if let PipeSource::Cli(ref id) = pipe_message.source {
                 self.event_stream.record_heartbeat(id);
-                self.event_stream.prune_stale_subscribers(5);
+                if self.event_stream.heartbeat_counter() % 5 == 0 {
+                    self.event_stream.prune_stale_subscribers(5);
+                }
             }
             return false;
         }
