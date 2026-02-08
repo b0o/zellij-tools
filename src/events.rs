@@ -111,7 +111,7 @@ impl EventFilter {
         }
     }
 
-    fn matches(&self, event: &Event) -> bool {
+    fn matches_event_and_pane(&self, event: &Event) -> bool {
         if let Some(event_kinds) = &self.event_kinds {
             match event.kind() {
                 Some(kind) if event_kinds.contains(&kind) => {}
@@ -126,14 +126,19 @@ impl EventFilter {
             }
         }
 
-        if let Some(tab_ids) = &self.tab_ids {
-            match event.tab_stable_id() {
-                Some(tab_id) if tab_ids.contains(&tab_id) => {}
-                _ => return false,
-            }
-        }
-
         true
+    }
+
+    fn matches_tab_id(&self, stable_id: Option<u64>) -> bool {
+        match &self.tab_ids {
+            None => true,
+            Some(tab_ids) => stable_id.map(|id| tab_ids.contains(&id)).unwrap_or(false),
+        }
+    }
+
+    #[cfg(test)]
+    fn matches(&self, event: &Event) -> bool {
+        self.matches_event_and_pane(event) && self.matches_tab_id(event.tab_stable_id())
     }
 }
 
@@ -578,8 +583,44 @@ impl EventStream {
         };
         self.current_focus_events()
             .into_iter()
-            .filter(|event| filter.matches(event))
+            .filter(|event| self.matches_filter(filter, event, &[]))
             .collect()
+    }
+
+    fn stable_id_for_tab_position(&self, tab_position: usize) -> Option<u64> {
+        self.known_tabs
+            .iter()
+            .find_map(|(stable_id, (position, _))| {
+                (*position == tab_position).then_some(*stable_id)
+            })
+    }
+
+    fn event_stable_tab_id(&self, event: &Event, panes: &[PaneInfo]) -> Option<u64> {
+        if let Some(stable_id) = event.tab_stable_id() {
+            return Some(stable_id);
+        }
+
+        let pane_key = event.pane_key()?;
+        let tab_position_from_panes = panes
+            .iter()
+            .find(|pane| TypedPaneId::from_event(pane.id, pane.pane_type()) == pane_key)
+            .map(|pane| pane.tab_position);
+
+        let tab_position = tab_position_from_panes.or_else(|| {
+            self.pane_focus_snapshot
+                .iter()
+                .find(|pane| TypedPaneId::from_event(pane.id, pane.pane_type) == pane_key)
+                .map(|pane| pane.tab_position)
+        })?;
+
+        self.stable_id_for_tab_position(tab_position)
+    }
+
+    fn matches_filter(&self, filter: &EventFilter, event: &Event, panes: &[PaneInfo]) -> bool {
+        if !filter.matches_event_and_pane(event) {
+            return false;
+        }
+        filter.matches_tab_id(self.event_stable_tab_id(event, panes))
     }
 
     fn current_focus_events(&self) -> Vec<Event> {
@@ -659,9 +700,10 @@ impl EventStream {
         }
 
         let events = self.compute_events(panes, active_tab);
+        let output = self.broadcast_events(&events, panes, &[]);
         self.update_pane_state(panes, active_tab);
 
-        self.broadcast_events(&events, panes, &[])
+        output
     }
 
     /// Process a tab update, returns events to broadcast to all subscribers.
@@ -670,11 +712,12 @@ impl EventStream {
     /// PaneUpdate and TabUpdate arrive in arbitrary order from zellij. A tab
     /// switch must trigger pane focus recomputation even without a new PaneUpdate.
     pub fn on_tab_update(&mut self, tabs: &[TabInfo]) -> Vec<(String, String)> {
+        let new_active_stable = tabs.iter().find(|t| t.active).map(|t| t.stable_id);
         let new_active_position = tabs.iter().find(|t| t.active).map(|t| t.position);
 
         if !self.has_subscribers() {
             // Still recompute pane focus so last_focused_pane stays correct
-            if new_active_position != self.active_tab_position {
+            if new_active_stable != self.last_active_tab {
                 if let Some(pos) = new_active_position {
                     self.active_tab_position = Some(pos);
                     self.last_focused_pane =
@@ -688,7 +731,7 @@ impl EventStream {
         let mut events = self.compute_tab_events(tabs);
 
         // If active tab position changed, recompute pane focus from stored snapshot
-        if new_active_position != self.active_tab_position {
+        if new_active_stable != self.last_active_tab {
             if let Some(new_pos) = new_active_position {
                 let new_focused =
                     Self::find_focused_from_snapshot(&self.pane_focus_snapshot, new_pos);
@@ -736,7 +779,7 @@ impl EventStream {
 
             for sub in &active_subscribers {
                 if let SubscriberState::Active { filter } = &sub.state {
-                    if !filter.matches(event) {
+                    if !self.matches_filter(filter, event, panes) {
                         continue;
                     }
                 }
@@ -1316,6 +1359,71 @@ mod tests {
         assert!(!tab_output.iter().any(|(pipe, _)| pipe == "pane-sub"));
     }
 
+    #[test]
+    fn tab_filter_allows_pane_events_for_matching_tab() {
+        let mut stream = EventStream::new();
+        stream.update_tab_state(&[
+            make_tab(100, 0, "main", true),
+            make_tab(200, 1, "other", false),
+        ]);
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+        stream
+            .initialize_subscriber("pipe-1", r#"{"tab_ids":[100]}"#)
+            .unwrap();
+
+        let panes = vec![make_pane(42, true, false)];
+        let output = stream.on_pane_update(&panes, 0);
+
+        assert!(output
+            .iter()
+            .any(|(pipe, json)| pipe == "pipe-1" && json.contains(r#""PaneFocused""#)));
+        assert!(output
+            .iter()
+            .any(|(pipe, json)| pipe == "pipe-1" && json.contains(r#""PaneOpened""#)));
+    }
+
+    #[test]
+    fn tab_and_pane_filters_compose() {
+        let mut stream = EventStream::new();
+        stream.update_tab_state(&[
+            make_tab(100, 0, "main", true),
+            make_tab(200, 1, "other", false),
+        ]);
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+        stream
+            .initialize_subscriber("pipe-1", r#"{"tab_ids":[100],"pane_ids":["terminal_42"]}"#)
+            .unwrap();
+
+        let panes = vec![make_pane(42, true, false), make_pane(7, false, false)];
+        let output = stream.on_pane_update(&panes, 0);
+
+        assert!(output.iter().any(|(pipe, json)| {
+            pipe == "pipe-1"
+                && (json.contains(r#""PaneFocused""#) || json.contains(r#""PaneOpened""#))
+        }));
+        assert!(!output
+            .iter()
+            .any(|(pipe, json)| { pipe == "pipe-1" && json.contains(r#""pane_id":7"#) }));
+    }
+
+    #[test]
+    fn tab_filter_allows_pane_closed_for_matching_tab() {
+        let mut stream = EventStream::new();
+        stream.update_tab_state(&[make_tab(100, 0, "main", true)]);
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+        stream
+            .initialize_subscriber("pipe-1", r#"{"tab_ids":[100]}"#)
+            .unwrap();
+
+        let panes = vec![make_pane(42, true, false)];
+        let _ = stream.on_pane_update(&panes, 0);
+
+        let closed_output = stream.on_pane_update(&[], 0);
+        assert!(closed_output
+            .iter()
+            .any(|(pipe, json)| pipe == "pipe-1" && json.contains(r#""PaneClosed""#)));
+    }
+
     // --- Event serialization ---
 
     #[test]
@@ -1826,6 +1934,58 @@ mod tests {
         // Should see focus change
         assert!(jsons.iter().any(|j| j.contains("TabFocused")));
         assert!(jsons.iter().any(|j| j.contains("TabUnfocused")));
+    }
+
+    #[test]
+    fn tab_reorder_keeps_filtered_pane_events_suppressed() {
+        let mut stream = EventStream::new();
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+        stream
+            .initialize_subscriber("pipe-1", r#"{"tab_ids":[0],"pane_ids":["terminal_3"]}"#)
+            .unwrap();
+
+        let tabs = vec![make_tab(0, 0, "tab0", false), make_tab(1, 1, "tab1", true)];
+        stream.on_tab_update(&tabs);
+
+        // Pane 3 is focused on tab 1, not tab 0.
+        let panes = vec![
+            PaneInfo {
+                id: 2,
+                is_focused: false,
+                is_floating: false,
+                is_suppressed: false,
+                is_plugin: false,
+                tab_position: 0,
+                title: String::new(),
+                terminal_command: None,
+                plugin_url: None,
+            },
+            PaneInfo {
+                id: 3,
+                is_focused: true,
+                is_floating: false,
+                is_suppressed: false,
+                is_plugin: false,
+                tab_position: 1,
+                title: String::new(),
+                terminal_command: None,
+                plugin_url: None,
+            },
+        ];
+        let initial_output = stream.on_pane_update(&panes, 1);
+        assert!(initial_output.is_empty());
+
+        // Reorder tabs while tab 1 remains active/focused.
+        let moved_tabs = vec![make_tab(1, 0, "tab1", true), make_tab(0, 1, "tab0", false)];
+        let output = stream.on_tab_update(&moved_tabs);
+
+        let jsons: Vec<&str> = output
+            .iter()
+            .filter(|(pipe, _)| pipe == "pipe-1")
+            .map(|(_, json)| json.as_str())
+            .collect();
+        assert!(!jsons.iter().any(|j| j.contains("PaneUnfocused")));
+        assert!(!jsons.iter().any(|j| j.contains("PaneFocused")));
     }
 
     // --- Multiple subscribers ---
