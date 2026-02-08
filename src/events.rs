@@ -61,6 +61,8 @@ pub enum Event {
         new_position: usize,
         name: String,
     },
+    /// Acknowledgment sent to CLI after a successful subscribe.
+    Ack {},
 }
 
 impl Event {
@@ -102,6 +104,7 @@ impl Event {
                     Self::merge_tab_detail(&mut value, tab);
                 }
             }
+            Event::Ack {} => {}
         }
 
         serde_json::to_string(&value).unwrap()
@@ -1170,5 +1173,11 @@ mod tests {
         assert!(full_json.len() > compact_json.len());
         assert!(full_json.contains("title"));
         assert!(!compact_json.contains("title"));
+    }
+
+    #[test]
+    fn event_ack_serializes() {
+        let event = Event::Ack {};
+        assert_eq!(event.to_json(), r#"{"Ack":{}}"#);
     }
 }
