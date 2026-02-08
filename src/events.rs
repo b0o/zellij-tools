@@ -169,11 +169,17 @@ pub struct Subscriber {
     pub pipe_id: String,
     /// Whether to include full object details in events
     pub mode: SubscribeMode,
+    /// Monotonic counter value at last heartbeat from this subscriber.
+    pub last_heartbeat: u64,
 }
 
 impl Subscriber {
-    pub fn new(pipe_id: String, mode: SubscribeMode) -> Self {
-        Self { pipe_id, mode }
+    pub fn new(pipe_id: String, mode: SubscribeMode, heartbeat_counter: u64) -> Self {
+        Self {
+            pipe_id,
+            mode,
+            last_heartbeat: heartbeat_counter,
+        }
     }
 }
 
@@ -193,6 +199,8 @@ type PaneKey = (u32, PaneType);
 pub struct EventStream {
     /// Active subscribers keyed by pipe ID
     subscribers: HashMap<String, Subscriber>,
+    /// Monotonic counter incremented on each heartbeat (used instead of time in WASI)
+    heartbeat_counter: u64,
     /// Last known focused pane (pane_id, pane_type)
     last_focused_pane: Option<(u32, PaneType)>,
     /// Set of pane keys we knew about last time.
@@ -245,7 +253,7 @@ impl EventStream {
     /// Add a subscriber. Returns a vec of events representing current state
     /// (so the subscriber gets an initial snapshot).
     pub fn subscribe(&mut self, pipe_id: String, mode: SubscribeMode) -> Vec<Event> {
-        let subscriber = Subscriber::new(pipe_id.clone(), mode);
+        let subscriber = Subscriber::new(pipe_id.clone(), mode, self.heartbeat_counter);
         self.subscribers.insert(pipe_id, subscriber);
 
         let mut initial_events = Vec::new();
@@ -267,6 +275,35 @@ impl EventStream {
         }
 
         initial_events
+    }
+
+    /// Record a heartbeat from a subscriber (called on empty pipe messages).
+    pub fn record_heartbeat(&mut self, pipe_id: &str) {
+        self.heartbeat_counter += 1;
+        if let Some(sub) = self.subscribers.get_mut(pipe_id) {
+            sub.last_heartbeat = self.heartbeat_counter;
+        }
+    }
+
+    /// Prune subscribers that haven't sent a heartbeat in `max_missed` ticks.
+    /// Returns the pipe IDs of pruned subscribers.
+    pub fn prune_stale_subscribers(&mut self, max_missed: u64) -> Vec<String> {
+        let threshold = self.heartbeat_counter.saturating_sub(max_missed);
+        let stale: Vec<String> = self
+            .subscribers
+            .iter()
+            .filter(|(_, sub)| sub.last_heartbeat < threshold)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stale {
+            self.subscribers.remove(id);
+        }
+        stale
+    }
+
+    /// Get the current heartbeat counter value.
+    pub fn heartbeat_counter(&self) -> u64 {
+        self.heartbeat_counter
     }
 
     /// Remove a subscriber
@@ -1179,5 +1216,57 @@ mod tests {
     fn event_ack_serializes() {
         let event = Event::Ack {};
         assert_eq!(event.to_json(), r#"{"Ack":{}}"#);
+    }
+
+    // --- Heartbeat tracking ---
+
+    #[test]
+    fn record_heartbeat_updates_subscriber() {
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
+        stream.record_heartbeat("pipe-1");
+        stream.record_heartbeat("pipe-1");
+        assert_eq!(stream.heartbeat_counter(), 2);
+        assert!(stream.has_subscribers());
+    }
+
+    #[test]
+    fn prune_stale_removes_dead_subscriber() {
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
+        // Simulate 100 heartbeats from a different source (not pipe-1)
+        for _ in 0..100 {
+            stream.record_heartbeat("other-pipe");
+        }
+        let pruned = stream.prune_stale_subscribers(50);
+        assert_eq!(pruned, vec!["pipe-1"]);
+        assert!(!stream.has_subscribers());
+    }
+
+    #[test]
+    fn prune_keeps_active_subscriber() {
+        let mut stream = EventStream::new();
+        stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
+        // pipe-1 sends heartbeats regularly
+        for _ in 0..100 {
+            stream.record_heartbeat("pipe-1");
+        }
+        let pruned = stream.prune_stale_subscribers(50);
+        assert!(pruned.is_empty());
+        assert!(stream.has_subscribers());
+    }
+
+    #[test]
+    fn prune_mixed_active_and_stale() {
+        let mut stream = EventStream::new();
+        stream.subscribe("active".to_string(), SubscribeMode::Compact);
+        stream.subscribe("stale".to_string(), SubscribeMode::Compact);
+        // Only "active" sends heartbeats
+        for _ in 0..100 {
+            stream.record_heartbeat("active");
+        }
+        let pruned = stream.prune_stale_subscribers(50);
+        assert_eq!(pruned, vec!["stale"]);
+        assert!(stream.has_subscribers());
     }
 }
