@@ -44,6 +44,10 @@ struct State {
     config_last_modified: Option<std::time::SystemTime>,
     // Watch interval in milliseconds (None = disabled, Some(ms) = poll interval)
     watch_interval_ms: Option<u64>,
+    // Our own plugin ID (for self-piping to flush buffered cli_pipe_output)
+    plugin_id: Option<u32>,
+    // Whether a flush timer is pending (debounces rapid event emissions)
+    flush_pending: bool,
 }
 
 register_plugin!(State);
@@ -262,16 +266,41 @@ impl State {
         // Append newline so CLI can read line-by-line with BufReader::lines()
         cli_pipe_output(pipe_id, &format!("{}\n", json));
     }
+
+    /// Schedule a debounced flush of buffered cli_pipe_output data.
+    /// Sets a 100ms timer; when it fires, a self-pipe triggers pipe() which
+    /// causes zellij to flush. Rapid events coalesce into a single flush.
+    fn schedule_flush(&mut self) {
+        if !self.flush_pending {
+            self.flush_pending = true;
+            set_timeout(0.1); // 100ms debounce
+        }
+    }
+
+    /// Send a pipe message to ourselves to trigger a pipe() call, which causes
+    /// zellij to flush any buffered cli_pipe_output data from update().
+    fn flush_pipe_output(&mut self) {
+        self.flush_pending = false;
+        if let Some(plugin_id) = self.plugin_id {
+            pipe_message_to_plugin(MessageToPlugin {
+                destination_plugin_id: Some(plugin_id),
+                ..Default::default()
+            });
+        }
+    }
 }
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.plugin_id = Some(get_plugin_ids().plugin_id);
+
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
             PermissionType::ReadCliPipes,
             PermissionType::FullHdAccess,
+            PermissionType::MessageAndLaunchOtherPlugins,
         ]);
 
         subscribe(&[
@@ -316,9 +345,6 @@ impl ZellijPlugin for State {
                 if self.event_stream.has_subscribers() {
                     // Convert pane manifest into EventStream's PaneInfo format
                     // and emit any detected changes (focus, open, close).
-                    // Note: cli_pipe_output calls are buffered by zellij and only
-                    // flushed on the next pipe() call. The CLI sends periodic
-                    // heartbeats to trigger the flush.
                     let event_panes: Vec<EventPaneInfo> = self
                         .pane_manifest
                         .values()
@@ -336,8 +362,11 @@ impl ZellijPlugin for State {
                         .collect();
 
                     let events = self.event_stream.on_pane_update(&event_panes);
-                    for (pipe_id, json) in &events {
-                        self.emit_event(pipe_id, json);
+                    if !events.is_empty() {
+                        for (pipe_id, json) in &events {
+                            self.emit_event(pipe_id, json);
+                        }
+                        self.schedule_flush();
                     }
                 } else {
                     // No subscribers — still update internal state (focus, known panes)
@@ -396,8 +425,11 @@ impl ZellijPlugin for State {
                         })
                         .collect();
                     let events = self.event_stream.on_tab_update(&event_tabs);
-                    for (pipe_id, json) in &events {
-                        self.emit_event(pipe_id, json);
+                    if !events.is_empty() {
+                        for (pipe_id, json) in &events {
+                            self.emit_event(pipe_id, json);
+                        }
+                        self.schedule_flush();
                     }
                 } else {
                     // No subscribers — still update internal state (active tab, known tabs)
@@ -467,6 +499,11 @@ impl ZellijPlugin for State {
                 }
             }
             Event::Timer(_elapsed) => {
+                // Flush buffered cli_pipe_output if a debounced flush is pending
+                if self.flush_pending {
+                    self.flush_pipe_output();
+                }
+
                 // Check if config file has changed (only if watching is enabled)
                 if let (Some(ref include_path), Some(interval_ms)) =
                     (&self.include_path, self.watch_interval_ms)
