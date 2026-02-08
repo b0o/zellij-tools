@@ -237,7 +237,7 @@ impl State {
                         "unsubscribe requires pipe_id argument".to_string(),
                     ));
                 }
-                self.event_stream.unsubscribe(&message.args[0]);
+                self.event_stream.unsubscribe(message.args[0]);
                 Ok(())
             }
             "tree" => {
