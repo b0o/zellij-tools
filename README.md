@@ -119,8 +119,24 @@ bind "Alt t" {
 
 Focuses a pane by ID. You can get the pane ID from the `$ZELLIJ_PANE_ID` environment variable.
 
+Defaults to terminal panes in the CLI. Use `--plugin` to target plugin panes.
+
 ```sh
 zellij pipe "zellij-tools::focus-pane::2"
+zellij-tools focus pane 2
+zellij-tools focus pane 7 --plugin
+```
+
+### Focus Tab
+
+Focuses a tab by position (1-based) by default.
+
+Use `--id` to focus by stable tab ID.
+
+```sh
+zellij pipe "zellij-tools::focus-tab::2"
+zellij-tools focus tab 2
+zellij-tools focus tab 42 --id
 ```
 
 ## Permissions
