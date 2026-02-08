@@ -2,11 +2,12 @@ use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 const DEFAULT_PLUGIN: &str = "zellij-tools";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn resolve_plugin(cli_override: Option<&str>) -> String {
     cli_override
@@ -114,24 +115,69 @@ fn subscribe(plugin: &str, full: bool) -> std::io::Result<()> {
         }
     });
 
-    // Read and forward stdout
-    let reader = BufReader::new(stdout);
-    for line in reader.lines() {
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-        match line {
-            Ok(l) => {
-                if !l.is_empty() {
-                    println!("{}", l);
-                }
-            }
-            Err(e) => {
-                if running.load(Ordering::SeqCst) {
-                    eprintln!("Error reading: {}", e);
-                }
+    // Spawn reader thread that sends lines over a channel
+    let (tx, rx) = mpsc::channel();
+    let reader_running = running.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            if !reader_running.load(Ordering::SeqCst) {
                 break;
             }
+            match line {
+                Ok(l) if !l.is_empty() => {
+                    if tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Phase 1: Wait for ACK with timeout
+    match rx.recv_timeout(CONNECT_TIMEOUT) {
+        Ok(line) => {
+            if line.contains(r#""Ack""#) {
+                // ACK received, connected successfully
+            } else {
+                // First line isn't an ACK — treat it as a normal event
+                // (backwards compat with older plugin versions)
+                println!("{}", line);
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "error: timed out waiting for plugin to respond ({}s)",
+                CONNECT_TIMEOUT.as_secs()
+            );
+            eprintln!("hint: is the zellij-tools plugin loaded?");
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            std::process::exit(1);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("error: plugin connection closed before responding");
+            if let Ok(mut child) = child.lock() {
+                let _ = child.wait();
+            }
+            std::process::exit(1);
+        }
+    }
+
+    // Phase 2: Normal event loop (no timeout)
+    while running.load(Ordering::SeqCst) {
+        match rx.recv() {
+            Ok(line) => {
+                if line.contains(r#""Ack""#) {
+                    continue; // Skip any duplicate ACKs
+                }
+                println!("{}", line);
+            }
+            Err(_) => break,
         }
     }
 
