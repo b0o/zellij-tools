@@ -76,6 +76,11 @@
       {
         inherit packages;
 
+        checks = {
+          plugin = packages.default;
+          cli = packages.cli;
+        };
+
         devShells.default = mkShell {
           name = "zellij-tools";
 
