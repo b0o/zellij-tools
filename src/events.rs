@@ -505,25 +505,7 @@ impl EventStream {
         );
         self.subscribers.insert(pipe_id, subscriber);
 
-        let mut initial_events = Vec::new();
-
-        // Send current tab focus state
-        if let Some(stable_id) = self.last_active_tab {
-            if let Some((position, name)) = self.known_tabs.get(&stable_id) {
-                initial_events.push(Event::TabFocused {
-                    stable_id,
-                    position: *position,
-                    name: name.clone(),
-                });
-            }
-        }
-
-        // Send current pane focus state
-        if let Some((pane_id, pane_type)) = self.last_focused_pane {
-            initial_events.push(Event::PaneFocused { pane_id, pane_type });
-        }
-
-        initial_events
+        self.current_focus_events()
     }
 
     /// Add a subscriber that must be initialized before receiving stream events.
@@ -581,6 +563,43 @@ impl EventStream {
             .get(pipe_id)
             .map(|sub| matches!(sub.state, SubscriberState::PendingInit))
             .unwrap_or(false)
+    }
+
+    pub fn subscriber_mode(&self, pipe_id: &str) -> Option<SubscribeMode> {
+        self.subscribers.get(pipe_id).map(|sub| sub.mode)
+    }
+
+    pub fn initial_events_for(&self, pipe_id: &str) -> Vec<Event> {
+        let Some(sub) = self.subscribers.get(pipe_id) else {
+            return Vec::new();
+        };
+        let SubscriberState::Active { filter } = &sub.state else {
+            return Vec::new();
+        };
+        self.current_focus_events()
+            .into_iter()
+            .filter(|event| filter.matches(event))
+            .collect()
+    }
+
+    fn current_focus_events(&self) -> Vec<Event> {
+        let mut initial_events = Vec::new();
+
+        if let Some(stable_id) = self.last_active_tab {
+            if let Some((position, name)) = self.known_tabs.get(&stable_id) {
+                initial_events.push(Event::TabFocused {
+                    stable_id,
+                    position: *position,
+                    name: name.clone(),
+                });
+            }
+        }
+
+        if let Some((pane_id, pane_type)) = self.last_focused_pane {
+            initial_events.push(Event::PaneFocused { pane_id, pane_type });
+        }
+
+        initial_events
     }
 
     /// Record a heartbeat from a subscriber (called on empty pipe messages).
@@ -1174,6 +1193,48 @@ mod tests {
         let panes = vec![make_pane(42, true, false)];
         let output = stream.on_pane_update(&panes, 0);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn init_emits_filtered_initial_snapshot_events() {
+        let mut stream = EventStream::new();
+        stream.update_tab_state(&[make_tab(100, 0, "main", true)]);
+        stream.update_pane_state(&[make_pane(42, true, false)], 0);
+
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+        stream
+            .initialize_subscriber("pipe-1", r#"{"events":["PaneFocused"]}"#)
+            .unwrap();
+
+        let initial = stream.initial_events_for("pipe-1");
+        assert_eq!(
+            initial,
+            vec![Event::PaneFocused {
+                pane_id: 42,
+                pane_type: PaneType::Terminal,
+            }]
+        );
+    }
+
+    #[test]
+    fn init_emits_tab_and_pane_snapshot_when_unfiltered() {
+        let mut stream = EventStream::new();
+        stream.update_tab_state(&[make_tab(100, 0, "main", true)]);
+        stream.update_pane_state(&[make_pane(42, true, false)], 0);
+
+        stream.subscribe_pending("pipe-1".to_string(), SubscribeMode::Compact);
+        stream.initialize_subscriber("pipe-1", "{}").unwrap();
+
+        let initial = stream.initial_events_for("pipe-1");
+        assert!(initial.contains(&Event::TabFocused {
+            stable_id: 100,
+            position: 0,
+            name: "main".to_string(),
+        }));
+        assert!(initial.contains(&Event::PaneFocused {
+            pane_id: 42,
+            pane_type: PaneType::Terminal,
+        }));
     }
 
     #[test]
