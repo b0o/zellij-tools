@@ -195,17 +195,19 @@ impl State {
 
                 let event_panes: Vec<EventPaneInfo> = self
                     .pane_manifest
-                    .values()
-                    .flatten()
-                    .map(|p| EventPaneInfo {
-                        id: p.id,
-                        is_focused: p.is_focused,
-                        is_floating: p.is_floating,
-                        is_suppressed: p.is_suppressed,
-                        is_plugin: p.is_plugin,
-                        title: p.title.clone(),
-                        terminal_command: p.terminal_command.clone(),
-                        plugin_url: p.plugin_url.clone(),
+                    .iter()
+                    .flat_map(|(&tab_pos, panes)| {
+                        panes.iter().map(move |p| EventPaneInfo {
+                            id: p.id,
+                            is_focused: p.is_focused,
+                            is_floating: p.is_floating,
+                            is_suppressed: p.is_suppressed,
+                            is_plugin: p.is_plugin,
+                            tab_position: tab_pos,
+                            title: p.title.clone(),
+                            terminal_command: p.terminal_command.clone(),
+                            plugin_url: p.plugin_url.clone(),
+                        })
                     })
                     .collect();
                 let event_tabs: Vec<EventTabInfo> = self
@@ -347,21 +349,25 @@ impl ZellijPlugin for State {
                     // and emit any detected changes (focus, open, close).
                     let event_panes: Vec<EventPaneInfo> = self
                         .pane_manifest
-                        .values()
-                        .flatten()
-                        .map(|p| EventPaneInfo {
-                            id: p.id,
-                            is_focused: p.is_focused,
-                            is_floating: p.is_floating,
-                            is_suppressed: p.is_suppressed,
-                            is_plugin: p.is_plugin,
-                            title: p.title.clone(),
-                            terminal_command: p.terminal_command.clone(),
-                            plugin_url: p.plugin_url.clone(),
+                        .iter()
+                        .flat_map(|(&tab_pos, panes)| {
+                            panes.iter().map(move |p| EventPaneInfo {
+                                id: p.id,
+                                is_focused: p.is_focused,
+                                is_floating: p.is_floating,
+                                is_suppressed: p.is_suppressed,
+                                is_plugin: p.is_plugin,
+                                tab_position: tab_pos,
+                                title: p.title.clone(),
+                                terminal_command: p.terminal_command.clone(),
+                                plugin_url: p.plugin_url.clone(),
+                            })
                         })
                         .collect();
 
-                    let events = self.event_stream.on_pane_update(&event_panes);
+                    let events = self
+                        .event_stream
+                        .on_pane_update(&event_panes, self.current_tab_position);
                     if !events.is_empty() {
                         for (pipe_id, json) in &events {
                             self.emit_event(pipe_id, json);
@@ -373,20 +379,23 @@ impl ZellijPlugin for State {
                     // but skip expensive String clones for title/command/url fields.
                     let cheap_panes: Vec<EventPaneInfo> = self
                         .pane_manifest
-                        .values()
-                        .flatten()
-                        .map(|p| EventPaneInfo {
-                            id: p.id,
-                            is_focused: p.is_focused,
-                            is_floating: p.is_floating,
-                            is_suppressed: p.is_suppressed,
-                            is_plugin: p.is_plugin,
-                            title: String::new(),
-                            terminal_command: None,
-                            plugin_url: None,
+                        .iter()
+                        .flat_map(|(&tab_pos, panes)| {
+                            panes.iter().map(move |p| EventPaneInfo {
+                                id: p.id,
+                                is_focused: p.is_focused,
+                                is_floating: p.is_floating,
+                                is_suppressed: p.is_suppressed,
+                                is_plugin: p.is_plugin,
+                                tab_position: tab_pos,
+                                title: String::new(),
+                                terminal_command: None,
+                                plugin_url: None,
+                            })
                         })
                         .collect();
-                    self.event_stream.update_pane_state(&cheap_panes);
+                    self.event_stream
+                        .update_pane_state(&cheap_panes, self.current_tab_position);
                 }
 
                 // Update stable tab mapping and get orphaned tabs
