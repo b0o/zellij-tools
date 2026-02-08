@@ -270,18 +270,13 @@ fn tree(plugin: &str) -> std::io::Result<()> {
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    // The tree response is emitted from pipe(), so it arrives immediately
-    // without needing heartbeats. But we still need a single heartbeat
-    // to flush the response if it was buffered.
+    // The tree response is emitted from pipe(), so it arrives immediately.
+    // Send a single heartbeat to flush buffered output, then close stdin.
     if let Some(mut stdin) = child.stdin.take() {
-        // Send one heartbeat then close stdin so the pipe closes after response
+        // Send one heartbeat then close stdin so the pipe closes after response.
         let _ = stdin.write_all(b"\n");
         let _ = stdin.flush();
-        // Keep stdin open briefly to allow the response to flush
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(500));
-            drop(stdin);
-        });
+        drop(stdin);
 
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
@@ -300,8 +295,6 @@ fn tree(plugin: &str) -> std::io::Result<()> {
                 }
             }
         }
-
-        handle.join().ok();
     }
 
     let _ = child.kill();
