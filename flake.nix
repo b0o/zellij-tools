@@ -8,19 +8,17 @@
     };
   };
 
-  outputs =
-    {
-      nixpkgs,
-      flake-utils,
-      rust-overlay,
-      ...
-    }:
+  outputs = {
+    nixpkgs,
+    flake-utils,
+    rust-overlay,
+    ...
+  }:
     flake-utils.lib.eachDefaultSystem (
-      system:
-      let
+      system: let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ (import rust-overlay) ];
+          overlays = [(import rust-overlay)];
         };
         inherit (pkgs) mkShell;
 
@@ -42,8 +40,8 @@
           '';
 
           installPhase = ''
-            mkdir -p $out/lib/zellij/plugins
-            cp target/${buildTarget}/release/${name}.wasm $out/lib/zellij/plugins
+            mkdir -p $out/share/zellij/plugins
+            cp target/${buildTarget}/release/${name}.wasm $out/share/zellij/plugins
           '';
         };
 
@@ -60,8 +58,7 @@
             "zellij-tools-cli"
           ];
         };
-      in
-      {
+      in {
         inherit packages;
 
         devShells.default = mkShell {
@@ -77,7 +74,7 @@
           ];
         };
 
-        nixosModules.default = import ./. { inherit (packages) default; };
+        nixosModules.default = import ./. {inherit (packages) default;};
       }
     );
 }
