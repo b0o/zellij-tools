@@ -1,3 +1,8 @@
+docs/plans/
+docs/compact/
+docs/session-handoffs/
+docs/deep-work-handoffs/
+
 # Created by https://www.toptal.com/developers/gitignore/api/rust,linux
 # Edit at https://www.toptal.com/developers/gitignore?templates=rust,linux
 
