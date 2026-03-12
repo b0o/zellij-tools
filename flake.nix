@@ -37,9 +37,6 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.openssl ];
-
           # Tests can't run on the host — zellij_tile declares WASI FFI
           # symbols (e.g. host_run_plugin_command) that only exist in the
           # Zellij WASI runtime.
@@ -59,9 +56,6 @@
           name = "zellij-tools-cli";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-
-          nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.openssl ];
 
           cargoBuildFlags = [
             "-p"
@@ -88,8 +82,6 @@
             rust
             pkgs.just
             pkgs.curl
-            pkgs.pkg-config
-            pkgs.openssl
             packages.cli
           ];
         };

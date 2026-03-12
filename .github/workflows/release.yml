@@ -7,30 +7,80 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-release:
-    name: build-release
+  build-plugin:
+    name: Build Plugin
     runs-on: ubuntu-latest
-    env:
-      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3 # v17
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@87b14cf437d03d37989d87f0fa5ce4f5dc1a330b # v8
+
+      - name: Build plugin
+        run: nix build .#default
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zellij-tools.wasm
+          path: result/share/zellij/plugins/zellij-tools.wasm
+
+  build-cli:
+    name: Build CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux
+          - os: macos-13
+            target: x86_64-darwin
+          - os: macos-latest
+            target: aarch64-darwin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3 # v17
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@87b14cf437d03d37989d87f0fa5ce4f5dc1a330b # v8
+
+      - name: Build CLI
+        run: nix build .#cli
+
+      - name: Package CLI
+        run: tar czf zellij-tools-${{ matrix.target }}.tar.gz -C result/bin zellij-tools
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zellij-tools-${{ matrix.target }}
+          path: zellij-tools-${{ matrix.target }}.tar.gz
+
+  release:
+    name: Create Release
+    needs: [build-plugin, build-cli]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           fetch-tags: false # https://github.com/actions/checkout/issues/1467
 
-      - run: git fetch --tags --all --force && git pull origin ${{ github.ref }}  --unshallow --force
+      - run: git fetch --tags --all --force && git pull origin ${{ github.ref }} --unshallow --force
         name: Fetch tags manually as a workaround. See https://github.com/actions/checkout/issues/1467
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4f647fc679bcd3b11499ccb42104547c83dabe96 # stable
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          profile: minimal
-          override: true
-          toolchain: "1.85.0"
-          target: wasm32-wasip1
-
-      - name: Build release binary
-        run: cargo build --release --target=wasm32-wasip1
+          path: artifacts
 
       - name: Generate a changelog
         uses: orhun/git-cliff-action@4a4a951bc43fafe41cd2348d181853f52356bee7 # v3
@@ -50,4 +100,5 @@ jobs:
           body: ${{ steps.git-cliff.outputs.content }}
           prerelease: false
           files: |
-            ./target/wasm32-wasip1/release/zellij-tools.wasm
+            artifacts/zellij-tools.wasm/zellij-tools.wasm
+            artifacts/zellij-tools-*/zellij-tools-*.tar.gz
