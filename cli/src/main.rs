@@ -36,6 +36,11 @@ enum Commands {
         #[command(subcommand)]
         target: FocusTarget,
     },
+    /// Control scratchpad panes
+    Scratchpad {
+        #[command(subcommand)]
+        action: ScratchpadAction,
+    },
     /// Subscribe to the event stream from the zellij-tools plugin
     Subscribe {
         /// Include full object details in each event
@@ -79,6 +84,30 @@ enum FocusTarget {
         /// Interpret the value as tab position (default, 1-based)
         #[arg(short = 'p', long, conflicts_with = "id")]
         position: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScratchpadAction {
+    /// Toggle a scratchpad (show if hidden, hide if focused)
+    Toggle {
+        /// Scratchpad name (if omitted, toggles the last-focused scratchpad)
+        name: Option<String>,
+    },
+    /// Show a scratchpad
+    Show {
+        /// Scratchpad name
+        name: String,
+    },
+    /// Hide a scratchpad
+    Hide {
+        /// Scratchpad name
+        name: String,
+    },
+    /// Close a scratchpad (terminates the pane)
+    Close {
+        /// Scratchpad name
+        name: String,
     },
 }
 
@@ -167,6 +196,26 @@ fn send_pipe_message(plugin: &str, msg: &str) -> std::io::Result<()> {
             status
         )))
     }
+}
+
+fn scratchpad(plugin: &str, action: ScratchpadAction) -> std::io::Result<()> {
+    let msg = match action {
+        ScratchpadAction::Toggle { name: Some(name) } => {
+            format!("zellij-tools::scratchpad::toggle::{}", name)
+        }
+        ScratchpadAction::Toggle { name: None } => "zellij-tools::scratchpad::toggle".to_string(),
+        ScratchpadAction::Show { name } => {
+            format!("zellij-tools::scratchpad::show::{}", name)
+        }
+        ScratchpadAction::Hide { name } => {
+            format!("zellij-tools::scratchpad::hide::{}", name)
+        }
+        ScratchpadAction::Close { name } => {
+            format!("zellij-tools::scratchpad::close::{}", name)
+        }
+    };
+
+    send_pipe_message(plugin, &msg)
 }
 
 fn focus(plugin: &str, target: FocusTarget) -> std::io::Result<()> {
@@ -444,6 +493,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Focus { target } => focus(&plugin, target),
+        Commands::Scratchpad { action } => scratchpad(&plugin, action),
         Commands::Subscribe {
             full,
             events,
@@ -620,5 +670,65 @@ mod tests {
         assert!(value.get("events").is_none());
         assert!(value.get("pane_ids").is_none());
         assert!(value.get("tab_ids").is_none());
+    }
+
+    #[test]
+    fn parses_scratchpad_toggle_with_name() {
+        let cli = Cli::try_parse_from(["zellij-tools", "scratchpad", "toggle", "term"]).unwrap();
+
+        match cli.command {
+            Commands::Scratchpad {
+                action: ScratchpadAction::Toggle { name },
+            } => assert_eq!(name.as_deref(), Some("term")),
+            _ => panic!("expected scratchpad toggle command"),
+        }
+    }
+
+    #[test]
+    fn parses_scratchpad_toggle_without_name() {
+        let cli = Cli::try_parse_from(["zellij-tools", "scratchpad", "toggle"]).unwrap();
+
+        match cli.command {
+            Commands::Scratchpad {
+                action: ScratchpadAction::Toggle { name },
+            } => assert_eq!(name, None),
+            _ => panic!("expected scratchpad toggle command"),
+        }
+    }
+
+    #[test]
+    fn parses_scratchpad_show() {
+        let cli = Cli::try_parse_from(["zellij-tools", "scratchpad", "show", "htop"]).unwrap();
+
+        match cli.command {
+            Commands::Scratchpad {
+                action: ScratchpadAction::Show { name },
+            } => assert_eq!(name, "htop"),
+            _ => panic!("expected scratchpad show command"),
+        }
+    }
+
+    #[test]
+    fn parses_scratchpad_hide() {
+        let cli = Cli::try_parse_from(["zellij-tools", "scratchpad", "hide", "htop"]).unwrap();
+
+        match cli.command {
+            Commands::Scratchpad {
+                action: ScratchpadAction::Hide { name },
+            } => assert_eq!(name, "htop"),
+            _ => panic!("expected scratchpad hide command"),
+        }
+    }
+
+    #[test]
+    fn parses_scratchpad_close() {
+        let cli = Cli::try_parse_from(["zellij-tools", "scratchpad", "close", "term"]).unwrap();
+
+        match cli.command {
+            Commands::Scratchpad {
+                action: ScratchpadAction::Close { name },
+            } => assert_eq!(name, "term"),
+            _ => panic!("expected scratchpad close command"),
+        }
     }
 }
