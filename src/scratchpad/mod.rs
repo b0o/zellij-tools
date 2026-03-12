@@ -2,8 +2,8 @@ mod config;
 mod persistence;
 
 pub use config::{
-    is_valid_scratchpad_name, parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadAction,
-    ScratchpadConfig,
+    is_valid_scratchpad_name, parse_scratchpad_action, parse_scratchpads_kdl, AxisOrigin, Origin,
+    ResolvedCoordinates, ScratchpadAction, ScratchpadConfig,
 };
 pub use persistence::{delete_state_file, load_state, save_state, PersistedState};
 
@@ -15,16 +15,24 @@ use crate::stable_tabs::StableTabId;
 /// Commands returned by ScratchpadManager for the caller to execute
 #[derive(Debug)]
 pub enum ScratchpadCommand {
-    /// Open a new floating pane with the given command
-    OpenFloating { command: CommandToRun },
-    /// Show a pane (make visible and focus)
-    ShowPane { pane_id: u32 },
+    /// Open a new floating pane with the given command and resolved coordinates
+    OpenFloating {
+        command: CommandToRun,
+        coordinates: ResolvedCoordinates,
+    },
+    /// Show a pane (make visible and focus), optionally re-applying coordinates
+    ShowPane {
+        pane_id: u32,
+        coordinates: Option<ResolvedCoordinates>,
+    },
     /// Hide a pane (suppress)
     HidePane { pane_id: u32 },
     /// Close a pane
     ClosePane { pane_id: u32 },
     /// Move a pane to a different tab
     MovePaneToTab { pane_id: u32, tab_position: usize },
+    /// Rename a pane (set its title in the Zellij UI)
+    RenamePane { pane_id: u32, name: String },
 }
 
 /// Context needed by ScratchpadManager to make decisions
@@ -34,6 +42,10 @@ pub struct ScratchpadContext<'a> {
     pub current_stable_tab_id: Option<StableTabId>,
     pub are_floating_panes_visible: bool,
     pub stable_tab_to_position: &'a HashMap<StableTabId, usize>,
+    /// Viewport width in columns (from TabInfo).
+    pub viewport_cols: usize,
+    /// Viewport height in rows (from TabInfo).
+    pub viewport_rows: usize,
 }
 
 /// Manages scratchpad state and returns commands to execute
@@ -92,7 +104,10 @@ impl ScratchpadManager {
                 for (&stable_id, &pane_id) in inner {
                     let orphaned_set = self.orphaned.get(name);
                     if !orphaned_set.is_some_and(|s| s.contains(&stable_id)) {
-                        commands.push(ScratchpadCommand::ShowPane { pane_id });
+                        commands.push(ScratchpadCommand::ShowPane {
+                            pane_id,
+                            coordinates: None,
+                        });
                         // Defer insertion to avoid borrow conflict
                     }
                 }
@@ -196,7 +211,10 @@ impl ScratchpadManager {
                         .get(name)
                         .is_some_and(|s| s.contains(&stable_id));
                     if !is_already_orphaned {
-                        commands.push(ScratchpadCommand::ShowPane { pane_id });
+                        commands.push(ScratchpadCommand::ShowPane {
+                            pane_id,
+                            coordinates: None,
+                        });
                         self.orphaned
                             .entry(name.clone())
                             .or_default()
@@ -321,11 +339,18 @@ impl ScratchpadManager {
 
             self.pending.insert(pending_key);
             let cmd = self.build_shim_command(name, &config);
-            return vec![ScratchpadCommand::OpenFloating { command: cmd }];
+            let coordinates = config.resolve_coordinates(ctx.viewport_cols, ctx.viewport_rows);
+            return vec![ScratchpadCommand::OpenFloating {
+                command: cmd,
+                coordinates,
+            }];
         }
 
-        let pane_id = existing_pane_id.unwrap();
-        self.show_pane(name, pane_id, stable_tab_id, ctx)
+        let Some(pane_id) = existing_pane_id else {
+            unreachable!("guarded by is_none check above");
+        };
+        let coordinates = config.resolve_coordinates(ctx.viewport_cols, ctx.viewport_rows);
+        self.show_pane(name, pane_id, stable_tab_id, ctx, coordinates)
     }
 
     fn handle_hide(&mut self, name: &str, ctx: &ScratchpadContext) -> Vec<ScratchpadCommand> {
@@ -406,6 +431,17 @@ impl ScratchpadManager {
             }
         }
 
+        // Rename pane: use configured title, or fall back to scratchpad name
+        let title = self
+            .configs
+            .get(name)
+            .and_then(|c| c.title.clone())
+            .unwrap_or_else(|| name.to_string());
+        commands.push(ScratchpadCommand::RenamePane {
+            pane_id,
+            name: title,
+        });
+
         self.panes
             .entry(name.to_string())
             .or_default()
@@ -435,11 +471,15 @@ impl ScratchpadManager {
         pane_id: u32,
         stable_tab_id: StableTabId,
         ctx: &ScratchpadContext,
+        coordinates: ResolvedCoordinates,
     ) -> Vec<ScratchpadCommand> {
         let mut commands = Vec::new();
         let hidden_before = self.get_hidden_floating_pane_ids(ctx);
 
-        commands.push(ScratchpadCommand::ShowPane { pane_id });
+        commands.push(ScratchpadCommand::ShowPane {
+            pane_id,
+            coordinates: Some(coordinates),
+        });
         self.just_shown = Some(pane_id);
 
         // Re-hide panes that were hidden before
@@ -473,7 +513,11 @@ impl ScratchpadManager {
         ];
         args.extend(config.command.clone());
 
-        CommandToRun::new_with_args("sh", args)
+        let mut cmd = CommandToRun::new_with_args("sh", args);
+        if let Some(ref cwd) = config.cwd {
+            cmd.cwd = Some(std::path::PathBuf::from(cwd));
+        }
+        cmd
     }
 
     fn get_pane(&self, name: &str, ctx: &ScratchpadContext) -> Option<u32> {
@@ -717,6 +761,13 @@ mod tests {
     fn make_config(cmd: &str) -> ScratchpadConfig {
         ScratchpadConfig {
             command: vec![cmd.to_string()],
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            origin: Origin::default(),
+            title: None,
+            cwd: None,
         }
     }
 
@@ -740,6 +791,8 @@ mod tests {
             current_stable_tab_id: stable_tab_id,
             are_floating_panes_visible: floating_visible,
             stable_tab_to_position,
+            viewport_cols: 200,
+            viewport_rows: 50,
         }
     }
 
@@ -810,7 +863,7 @@ mod tests {
 
         assert!(commands
             .iter()
-            .any(|c| matches!(c, ScratchpadCommand::ShowPane { pane_id: 42 })));
+            .any(|c| matches!(c, ScratchpadCommand::ShowPane { pane_id: 42, .. })));
     }
 
     #[test]
@@ -908,7 +961,7 @@ mod tests {
 
         assert!(commands
             .iter()
-            .any(|c| matches!(c, ScratchpadCommand::ShowPane { pane_id: 42 })));
+            .any(|c| matches!(c, ScratchpadCommand::ShowPane { pane_id: 42, .. })));
     }
 
     #[test]
@@ -1069,7 +1122,7 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert!(matches!(
             commands[0],
-            ScratchpadCommand::ShowPane { pane_id: 99 }
+            ScratchpadCommand::ShowPane { pane_id: 99, .. }
         ));
     }
 
@@ -1109,7 +1162,7 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert!(matches!(
             commands[0],
-            ScratchpadCommand::ShowPane { pane_id: 99 }
+            ScratchpadCommand::ShowPane { pane_id: 99, .. }
         ));
 
         // Toggle on htop should be a no-op now
@@ -1237,5 +1290,92 @@ mod tests {
             manager.get_pane("term", &ctx).is_none(),
             "Held pane should be removed from tracking"
         );
+    }
+
+    #[test]
+    fn register_with_title_emits_rename() {
+        let mut config = make_config("bash");
+        config.title = Some("My Shell".to_string());
+        let configs = HashMap::from([("term".to_string(), config)]);
+        let mut manager = ScratchpadManager::new(configs);
+
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+
+        assert!(
+            commands.iter().any(
+                |c| matches!(c, ScratchpadCommand::RenamePane { pane_id: 42, name } if name == "My Shell")
+            ),
+            "Should emit RenamePane with the configured title"
+        );
+    }
+
+    #[test]
+    fn register_without_title_uses_scratchpad_name() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+
+        assert!(
+            commands.iter().any(
+                |c| matches!(c, ScratchpadCommand::RenamePane { pane_id: 42, name } if name == "term")
+            ),
+            "Should emit RenamePane with the scratchpad name as fallback"
+        );
+    }
+
+    #[test]
+    fn register_with_cwd_sets_cwd_on_command() {
+        let mut config = make_config("bash");
+        config.cwd = Some("/tmp/work".to_string());
+        let configs = HashMap::from([("term".to_string(), config)]);
+        let mut manager = ScratchpadManager::new(configs);
+
+        let manifest = HashMap::new();
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Show {
+                name: "term".to_string(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            ScratchpadCommand::OpenFloating { command, .. } => {
+                assert_eq!(
+                    command.cwd.as_deref(),
+                    Some(std::path::Path::new("/tmp/work")),
+                    "CommandToRun should have cwd set"
+                );
+            }
+            other => panic!("Expected OpenFloating, got {:?}", other),
+        }
     }
 }

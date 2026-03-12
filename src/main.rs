@@ -139,22 +139,59 @@ impl State {
     }
 
     fn build_scratchpad_context(&self) -> ScratchpadContext<'_> {
+        let (viewport_cols, viewport_rows) = self
+            .tab_infos
+            .iter()
+            .find(|t| t.active)
+            .map(|t| (t.viewport_columns, t.viewport_rows))
+            .unwrap_or((0, 0));
+
         ScratchpadContext {
             pane_manifest: &self.pane_manifest,
             current_tab_position: self.current_tab_position,
             current_stable_tab_id: self.tab_tracker.get_stable_id(self.current_tab_position),
             are_floating_panes_visible: self.are_floating_panes_visible,
             stable_tab_to_position: &self.tab_tracker.stable_tab_to_position,
+            viewport_cols,
+            viewport_rows,
         }
     }
 
     fn execute_scratchpad_commands(&self, commands: Vec<ScratchpadCommand>) {
         for cmd in commands {
             match cmd {
-                ScratchpadCommand::OpenFloating { command } => {
-                    open_command_pane_floating(command, None, BTreeMap::new());
+                ScratchpadCommand::OpenFloating {
+                    command,
+                    coordinates,
+                } => {
+                    let coords = FloatingPaneCoordinates::new(
+                        coordinates.x,
+                        coordinates.y,
+                        coordinates.width,
+                        coordinates.height,
+                        None,
+                    );
+                    open_command_pane_floating(command, coords, BTreeMap::new());
                 }
-                ScratchpadCommand::ShowPane { pane_id } => {
+                ScratchpadCommand::ShowPane {
+                    pane_id,
+                    coordinates,
+                } => {
+                    if let Some(resolved) = coordinates {
+                        let coords = FloatingPaneCoordinates::new(
+                            resolved.x,
+                            resolved.y,
+                            resolved.width,
+                            resolved.height,
+                            None,
+                        );
+                        if let Some(coords) = coords {
+                            change_floating_panes_coordinates(vec![(
+                                PaneId::Terminal(pane_id),
+                                coords,
+                            )]);
+                        }
+                    }
                     show_pane_with_id(PaneId::Terminal(pane_id), true);
                 }
                 ScratchpadCommand::HidePane { pane_id } => {
@@ -172,6 +209,9 @@ impl State {
                         tab_position,
                         false,
                     );
+                }
+                ScratchpadCommand::RenamePane { pane_id, name } => {
+                    rename_terminal_pane(pane_id, &name);
                 }
             }
         }
