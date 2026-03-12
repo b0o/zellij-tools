@@ -54,11 +54,11 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 - `src/tree.rs` - Session tree snapshot serialization (tabs/panes/stable IDs)
 - `src/events.rs` - Subscription state machine and pane/tab event diffing
 - `src/config.rs` - WASI-safe env/config path resolution via `/host/proc/self/environ`
-- `cli/src/main.rs` - User CLI (`focus`, `subscribe`, `tree`) and heartbeat-driven stream client
+- `cli/src/main.rs` - User CLI (`focus`, `scratchpad`, `subscribe`, `tree`) and heartbeat-driven stream client
 
 ### Key Features
 
-**Scratchpads**: Floating terminal panes that can be toggled on/off. They follow you across tabs and persist state.
+**Scratchpads**: Floating terminal panes that can be toggled on/off. They follow you across tabs and persist state. Scratchpads support configurable coordinates (`x`, `y`, `width`, `height`), origin anchoring (`center`, `top`, `bottom`, etc.), custom titles, and working directories.
 
 **External Config Hot-Reload**: Scratchpad definitions can be loaded from an external KDL file that is polled for changes. Inline and external configs are merged; external entries override inline entries with the same scratchpad name.
 

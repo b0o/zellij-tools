@@ -33,6 +33,14 @@ plugins {
             term { command "zsh"; }
             btop { command "btop"; }
             notes { command "nvim" "+cd ~/notes"; }
+            popup {
+                command "zsh"
+                width "80%"
+                height "60%"
+                origin "center"
+                title "Popup Shell"
+                cwd "/home/user/projects"
+            }
         }
     }
 }
@@ -57,7 +65,12 @@ Then create `~/.config/zellij/zellij-tools.kdl`:
 ```kdl
 scratchpads {
     term { command "zsh"; }
-    btop { command "btop"; }
+    btop {
+        command "btop"
+        width "120"
+        height "40"
+        origin "center"
+    }
 }
 ```
 
@@ -85,6 +98,46 @@ The config directory is determined by (in order):
 | `config_dir`  | Override base directory for relative includes          | Auto-detected |      Yes      |          No          |
 | `watch_ms`    | Polling interval in ms. `"false"` or `"0"` to disable. | `2000`        |      Yes      |          No          |
 | `scratchpads` | Scratchpad definitions                                 | -             |      Yes      |         Yes          |
+
+### Scratchpad Options
+
+Each scratchpad supports these options:
+
+| Option    | Description                                                                     |    Required     |
+| --------- | ------------------------------------------------------------------------------- | :-------------: |
+| `command` | Command and arguments to run (e.g. `command "zsh"` or `command "nvim" "+cd ~"`) |       Yes       |
+| `width`   | Pane width: fixed columns (`"80"`) or percent (`"50%"`)                         |       No        |
+| `height`  | Pane height: fixed rows (`"24"`) or percent (`"50%"`)                           |       No        |
+| `x`       | Horizontal offset: fixed columns or percent                                     |       No        |
+| `y`       | Vertical offset: fixed rows or percent                                          |       No        |
+| `origin`  | Anchor point for x/y coordinates (see below)                                    |   `"center"`    |
+| `title`   | Pane title displayed in the Zellij UI                                           | Scratchpad name |
+| `cwd`     | Working directory for the command                                               |       No        |
+
+### Origin
+
+The `origin` option sets the reference point for `x` and `y` coordinates. It accepts one or two arguments:
+
+- **One argument:** `"center"` (both axes), `"top"`, `"bottom"`, `"left"`, `"right"`
+- **Two arguments:** vertical then horizontal, e.g. `origin "bottom" "center"`, `origin "top" "right"`
+
+| Vertical | Horizontal | Description                              |
+| -------- | ---------- | ---------------------------------------- |
+| `top`    | `left`     | Offset from top-left corner              |
+| `center` | `center`   | Centered, offset shifts away from center |
+| `bottom` | `right`    | Offset inward from bottom-right corner   |
+
+### Scratchpad CLI
+
+Control scratchpads from the command line:
+
+```sh
+zellij-tools scratchpad toggle         # Toggle the last-focused scratchpad
+zellij-tools scratchpad toggle term    # Toggle a named scratchpad
+zellij-tools scratchpad show term      # Show a scratchpad
+zellij-tools scratchpad hide term      # Hide a scratchpad
+zellij-tools scratchpad close term     # Close a scratchpad (terminates the pane)
+```
 
 ## Other Actions
 
