@@ -38,10 +38,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-linux
-          - os: macos-13
+            package: cli
+          - os: macos-latest
             target: x86_64-darwin
+            package: packages.x86_64-darwin.cli
           - os: macos-latest
             target: aarch64-darwin
+            package: cli
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
@@ -53,7 +56,7 @@ jobs:
         uses: DeterminateSystems/magic-nix-cache-action@87b14cf437d03d37989d87f0fa5ce4f5dc1a330b # v8
 
       - name: Build CLI
-        run: nix build .#cli
+        run: nix build .#${{ matrix.package }}
 
       - name: Package CLI
         run: tar czf zellij-tools-${{ matrix.target }}.tar.gz -C result/bin zellij-tools
