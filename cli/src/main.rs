@@ -187,8 +187,17 @@ fn build_subscribe_init_json(
     serde_json::to_string(&spec).expect("subscribe init json should serialize")
 }
 
-fn send_pipe_message(plugin: &str, msg: &str) -> std::io::Result<()> {
-    let status = Command::new("zellij")
+/// Build a `Command` for `zellij`, optionally targeting a specific session.
+fn zellij_cmd(session: Option<&str>) -> Command {
+    let mut cmd = Command::new("zellij");
+    if let Some(s) = session {
+        cmd.env("ZELLIJ_SESSION_NAME", s);
+    }
+    cmd
+}
+
+fn send_pipe_message(plugin: &str, msg: &str, session: Option<&str>) -> std::io::Result<()> {
+    let status = zellij_cmd(session)
         .args(["pipe", "--plugin", plugin, "--", msg])
         .status()?;
 
@@ -202,7 +211,11 @@ fn send_pipe_message(plugin: &str, msg: &str) -> std::io::Result<()> {
     }
 }
 
-fn scratchpad(plugin: &str, action: ScratchpadAction) -> std::io::Result<()> {
+fn scratchpad(
+    plugin: &str,
+    action: ScratchpadAction,
+    session: Option<&str>,
+) -> std::io::Result<()> {
     let msg = match action {
         ScratchpadAction::Toggle { name: Some(name) } => {
             format!("zellij-tools::scratchpad::toggle::{}", name)
@@ -219,10 +232,10 @@ fn scratchpad(plugin: &str, action: ScratchpadAction) -> std::io::Result<()> {
         }
     };
 
-    send_pipe_message(plugin, &msg)
+    send_pipe_message(plugin, &msg, session)
 }
 
-fn focus(plugin: &str, target: FocusTarget) -> std::io::Result<()> {
+fn focus(plugin: &str, target: FocusTarget, session: Option<&str>) -> std::io::Result<()> {
     let msg = match target {
         FocusTarget::Pane {
             pane_id,
@@ -245,7 +258,7 @@ fn focus(plugin: &str, target: FocusTarget) -> std::io::Result<()> {
         }
     };
 
-    send_pipe_message(plugin, &msg)
+    send_pipe_message(plugin, &msg, session)
 }
 
 fn subscribe(
@@ -255,6 +268,7 @@ fn subscribe(
     pane_ids: Vec<u32>,
     plugin_pane_ids: Vec<u32>,
     tab_ids: Vec<u64>,
+    session: Option<&str>,
 ) -> std::io::Result<()> {
     let pipe_name = format!("zellij-tools-events-{}", uuid::Uuid::new_v4());
 
@@ -265,7 +279,7 @@ fn subscribe(
     };
 
     // Spawn zellij pipe with subscribe message as positional payload.
-    let mut child = Command::new("zellij")
+    let mut child = zellij_cmd(session)
         .args([
             "pipe",
             "--name",
@@ -292,11 +306,16 @@ fn subscribe(
     let pipe_name_clone = pipe_name.clone();
     let plugin_clone = plugin.to_string();
     let child_clone = Arc::clone(&child);
+    let session_owned = session.map(String::from);
 
     ctrlc::set_handler(move || {
         eprintln!("\nUnsubscribing...");
         // Send unsubscribe (best effort, ignore errors)
-        let _ = Command::new("zellij")
+        let mut cmd = Command::new("zellij");
+        if let Some(ref s) = session_owned {
+            cmd.env("ZELLIJ_SESSION_NAME", s);
+        }
+        let _ = cmd
             .args([
                 "pipe",
                 "--plugin",
@@ -447,11 +466,11 @@ fn subscribe(
 }
 
 /// Send a one-shot request to the plugin and read a single JSON response.
-fn tree(plugin: &str) -> std::io::Result<()> {
+fn tree(plugin: &str, session: Option<&str>) -> std::io::Result<()> {
     let pipe_name = format!("zellij-tools-tree-{}", uuid::Uuid::new_v4());
     let msg = "zellij-tools::tree".to_string();
 
-    let mut child = Command::new("zellij")
+    let mut child = zellij_cmd(session)
         .args(["pipe", "--name", &pipe_name, "--plugin", plugin, "--", &msg])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -493,24 +512,28 @@ fn tree(plugin: &str) -> std::io::Result<()> {
 fn main() {
     let cli = Cli::parse();
 
-    if let Some(ref session) = cli.session {
-        // SAFETY: called before spawning any threads.
-        unsafe { std::env::set_var("ZELLIJ_SESSION_NAME", session) };
-    }
-
     let plugin = resolve_plugin(cli.plugin.as_deref());
+    let session = cli.session.as_deref();
 
     let result = match cli.command {
-        Commands::Focus { target } => focus(&plugin, target),
-        Commands::Scratchpad { action } => scratchpad(&plugin, action),
+        Commands::Focus { target } => focus(&plugin, target, session),
+        Commands::Scratchpad { action } => scratchpad(&plugin, action, session),
         Commands::Subscribe {
             full,
             events,
             pane_ids,
             plugin_pane_ids,
             tab_ids,
-        } => subscribe(&plugin, full, events, pane_ids, plugin_pane_ids, tab_ids),
-        Commands::Tree => tree(&plugin),
+        } => subscribe(
+            &plugin,
+            full,
+            events,
+            pane_ids,
+            plugin_pane_ids,
+            tab_ids,
+            session,
+        ),
+        Commands::Tree => tree(&plugin, session),
     };
 
     if let Err(e) = result {
