@@ -25,6 +25,10 @@ struct Cli {
     #[arg(long = "zellij-plugin", global = true)]
     plugin: Option<String>,
 
+    /// Zellij session to target [env: ZELLIJ_SESSION_NAME]
+    #[arg(short = 's', long = "session", global = true)]
+    session: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -489,6 +493,11 @@ fn tree(plugin: &str) -> std::io::Result<()> {
 fn main() {
     let cli = Cli::parse();
 
+    if let Some(ref session) = cli.session {
+        // SAFETY: called before spawning any threads.
+        unsafe { std::env::set_var("ZELLIJ_SESSION_NAME", session) };
+    }
+
     let plugin = resolve_plugin(cli.plugin.as_deref());
 
     let result = match cli.command {
@@ -730,5 +739,24 @@ mod tests {
             } => assert_eq!(name, "term"),
             _ => panic!("expected scratchpad close command"),
         }
+    }
+
+    #[test]
+    fn parses_session_flag_before_subcommand() {
+        let cli = Cli::try_parse_from(["zellij-tools", "-s", "my-session", "tree"]).unwrap();
+        assert_eq!(cli.session.as_deref(), Some("my-session"));
+    }
+
+    #[test]
+    fn parses_session_long_flag() {
+        let cli = Cli::try_parse_from(["zellij-tools", "--session", "other", "focus", "pane", "1"])
+            .unwrap();
+        assert_eq!(cli.session.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn session_flag_is_optional() {
+        let cli = Cli::try_parse_from(["zellij-tools", "tree"]).unwrap();
+        assert!(cli.session.is_none());
     }
 }
