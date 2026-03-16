@@ -247,6 +247,27 @@ impl ScratchpadManager {
         }
     }
 
+    /// If the given terminal pane belongs to a scratchpad, run the show logic
+    /// to ensure its size/position is correct and return the commands.
+    /// Returns `None` if the pane is not a known scratchpad.
+    pub fn handle_focus_pane(
+        &mut self,
+        terminal_pane_id: u32,
+        ctx: &ScratchpadContext,
+    ) -> Option<Vec<ScratchpadCommand>> {
+        // Reverse-look up the scratchpad name and tab from the pane ID
+        let (name, stable_tab_id) = self.find_scratchpad_by_pane_id(terminal_pane_id)?;
+
+        // Skip orphaned scratchpads
+        if self.is_orphaned(&name, stable_tab_id) {
+            return None;
+        }
+
+        let config = self.configs.get(&name)?.clone();
+        let coordinates = config.resolve_coordinates(ctx.viewport_cols, ctx.viewport_rows);
+        Some(self.show_pane(&name, terminal_pane_id, stable_tab_id, ctx, coordinates))
+    }
+
     /// Called on PaneUpdate to sync state and clean up
     pub fn on_pane_update(
         &mut self,
@@ -523,6 +544,19 @@ impl ScratchpadManager {
     fn get_pane(&self, name: &str, ctx: &ScratchpadContext) -> Option<u32> {
         let stable_tab_id = ctx.current_stable_tab_id?;
         self.panes.get(name)?.get(&stable_tab_id).copied()
+    }
+
+    /// Reverse-look up a terminal pane ID to find the scratchpad name and tab it belongs to.
+    fn find_scratchpad_by_pane_id(&self, terminal_pane_id: u32) -> Option<(String, StableTabId)> {
+        self.panes
+            .iter()
+            .flat_map(|(name, inner)| {
+                inner
+                    .iter()
+                    .map(move |(&stable_id, &pid)| (name.clone(), stable_id, pid))
+            })
+            .find(|(_, _, pid)| *pid == terminal_pane_id)
+            .map(|(name, stable_id, _)| (name, stable_id))
     }
 
     fn get_pane_tab(&self, pane_id: u32, ctx: &ScratchpadContext) -> Option<usize> {
@@ -1377,5 +1411,125 @@ mod tests {
             }
             other => panic!("Expected OpenFloating, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn focus_pane_for_scratchpad_returns_show_commands() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        // Register the scratchpad
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+        manager.clear_just_shown();
+
+        // focus-pane for a scratchpad should return show commands
+        let result = manager.handle_focus_pane(42, &ctx);
+        assert!(
+            result.is_some(),
+            "Should return commands for a scratchpad pane"
+        );
+
+        let commands = result.unwrap();
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, ScratchpadCommand::ShowPane { pane_id: 42, .. })),
+            "Should emit ShowPane with coordinates for the scratchpad"
+        );
+    }
+
+    #[test]
+    fn focus_pane_for_non_scratchpad_returns_none() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+        let manifest = HashMap::new();
+        let positions = HashMap::new();
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        // Pane 99 is not a scratchpad
+        let result = manager.handle_focus_pane(99, &ctx);
+        assert!(
+            result.is_none(),
+            "Should return None for non-scratchpad pane"
+        );
+    }
+
+    #[test]
+    fn focus_pane_for_orphaned_scratchpad_returns_none() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term", "htop"]));
+
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(99, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        // Register htop
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "htop".to_string(),
+                pane_id: 99,
+            },
+            &ctx,
+        );
+
+        // Remove htop from config (orphan it)
+        manager.reconcile_config(make_configs(&["term"]));
+
+        // focus-pane for an orphaned scratchpad should return None
+        let result = manager.handle_focus_pane(99, &ctx);
+        assert!(
+            result.is_none(),
+            "Should return None for orphaned scratchpad pane"
+        );
+    }
+
+    #[test]
+    fn focus_pane_scratchpad_on_different_tab() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        // Register scratchpad on tab 0 (stable id 0)
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        manifest.insert(1, vec![]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        positions.insert(1, 1);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        manager.handle_action(
+            ScratchpadAction::Register {
+                name: "term".to_string(),
+                pane_id: 42,
+            },
+            &ctx,
+        );
+        manager.clear_just_shown();
+
+        // Now we're on tab 1, but focusing a scratchpad on tab 0
+        let ctx = make_context(&manifest, 1, Some(1), true, &positions);
+        let result = manager.handle_focus_pane(42, &ctx);
+        assert!(
+            result.is_some(),
+            "Should return commands even when scratchpad is on a different tab"
+        );
+
+        let commands = result.unwrap();
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, ScratchpadCommand::ShowPane { pane_id: 42, .. })),
+            "Should emit ShowPane for cross-tab scratchpad focus"
+        );
     }
 }

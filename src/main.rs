@@ -234,6 +234,19 @@ impl State {
                     .parse::<PaneId>()
                     .map_err(|e| ParseError::InvalidArgs(format!("Invalid pane ID: {}", e)))?;
 
+                // If the pane is a scratchpad, use show logic to ensure correct size/position
+                if let PaneId::Terminal(terminal_id) = pane_id {
+                    if let Some(mut scratchpad) = self.scratchpad.take() {
+                        let ctx = self.build_scratchpad_context();
+                        let result = scratchpad.handle_focus_pane(terminal_id, &ctx);
+                        self.scratchpad = Some(scratchpad);
+                        if let Some(commands) = result {
+                            self.execute_scratchpad_commands(commands);
+                            return Ok(());
+                        }
+                    }
+                }
+
                 show_pane_with_id(pane_id, true);
                 Ok(())
             }
