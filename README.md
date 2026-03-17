@@ -14,6 +14,39 @@ load_plugins {
 }
 ```
 
+### Nix Flake
+
+The plugin and CLI are available as flake outputs:
+
+```sh
+# Build the plugin
+nix build github:b0o/zellij-tools          # → result/share/zellij/plugins/zellij-tools.wasm
+
+# Build the CLI
+nix build github:b0o/zellij-tools#cli      # → result/bin/zellij-tools
+
+# Run the CLI without installing
+nix run github:b0o/zellij-tools#cli -- scratchpad list
+
+# Enter a dev shell with the Rust toolchain and CLI
+nix develop github:b0o/zellij-tools
+```
+
+To use the plugin from your Nix-managed Zellij config, add the flake as an input and reference the wasm path:
+
+```nix
+# flake.nix
+{
+  inputs.zellij-tools.url = "github:b0o/zellij-tools";
+
+  # ...in your outputs:
+  # The plugin wasm is at:
+  #   zellij-tools.packages.${system}.default + "/share/zellij/plugins/zellij-tools.wasm"
+  # The CLI binary is at:
+  #   zellij-tools.packages.${system}.cli + "/bin/zellij-tools"
+}
+```
+
 ## Scratchpads
 
 Scratchpads are floating terminal panes that can be quickly toggled on and off. They follow you across tabs and persist their state.
