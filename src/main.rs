@@ -12,7 +12,7 @@ use zellij_tools::focus::{parse_focus_tab_target, FocusTabTarget};
 use zellij_tools::message::{parse_message, ParseError};
 use zellij_tools::scratchpad::{
     parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadCommand, ScratchpadContext,
-    ScratchpadManager,
+    ScratchpadListQuery, ScratchpadManager,
 };
 use zellij_tools::stable_tabs::StableTabTracker;
 use zellij_tools::tree;
@@ -274,6 +274,51 @@ impl State {
                     }
                 };
                 go_to_tab(tab_index);
+                Ok(())
+            }
+            "scratchpad" if message.args.first().copied() == Some("list") => {
+                let cli_pipe_id = match &pipe_message.source {
+                    PipeSource::Cli(id) => id.clone(),
+                    _ => {
+                        return Err(ParseError::InvalidArgs(
+                            "scratchpad list only works from CLI pipes".to_string(),
+                        ))
+                    }
+                };
+
+                let rest = &message.args[1..];
+                let mut full = false;
+                let mut tab_id: Option<u64> = None;
+                let mut names = Vec::new();
+
+                for &arg in rest {
+                    if arg == "full" {
+                        full = true;
+                    } else if let Some(id_str) = arg.strip_prefix("tab=") {
+                        tab_id = id_str.parse().ok();
+                    } else {
+                        names.push(arg.to_string());
+                    }
+                }
+
+                let query = ScratchpadListQuery {
+                    names,
+                    tab_id,
+                    full,
+                };
+
+                let entries = if let Some(ref scratchpad) = self.scratchpad {
+                    scratchpad.list(
+                        &query,
+                        &self.pane_manifest,
+                        &self.tab_tracker.stable_tab_to_position,
+                    )
+                } else {
+                    Vec::new()
+                };
+
+                let json = serde_json::to_string(&entries).unwrap_or_default();
+                self.emit_event(&cli_pipe_id, &json);
                 Ok(())
             }
             "scratchpad" => {

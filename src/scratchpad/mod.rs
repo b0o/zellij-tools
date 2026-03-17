@@ -1,10 +1,12 @@
 mod config;
+mod list;
 mod persistence;
 
 pub use config::{
     is_valid_scratchpad_name, parse_scratchpad_action, parse_scratchpads_kdl, AxisOrigin, Origin,
     ResolvedCoordinates, ScratchpadAction, ScratchpadConfig,
 };
+pub use list::{ScratchpadInstanceInfo, ScratchpadListEntry, ScratchpadListQuery};
 pub use persistence::{delete_state_file, load_state, save_state, PersistedState};
 
 use std::collections::{HashMap, HashSet};

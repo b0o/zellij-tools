@@ -113,6 +113,17 @@ enum ScratchpadAction {
         /// Scratchpad name
         name: String,
     },
+    /// List scratchpads as JSON
+    List {
+        /// Only list specific scratchpads by name
+        names: Vec<String>,
+        /// Filter to a specific tab by stable tab ID
+        #[arg(long = "tab")]
+        tab_id: Option<u64>,
+        /// Include full pane info for each instance
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
@@ -230,6 +241,7 @@ fn scratchpad(
         ScratchpadAction::Close { name } => {
             format!("zellij-tools::scratchpad::close::{}", name)
         }
+        ScratchpadAction::List { .. } => unreachable!("list is handled separately"),
     };
 
     send_pipe_message(plugin, &msg, session)
@@ -465,6 +477,67 @@ fn subscribe(
     Ok(())
 }
 
+/// Send a one-shot scratchpad list request and read a single JSON response.
+fn scratchpad_list(
+    plugin: &str,
+    names: Vec<String>,
+    tab_id: Option<u64>,
+    full: bool,
+    session: Option<&str>,
+) -> std::io::Result<()> {
+    let pipe_name = format!("zellij-tools-scratchpad-list-{}", uuid::Uuid::new_v4());
+
+    // Build payload: zellij-tools::scratchpad::list[::full][::tab=<id>][::name1::name2::...]
+    let mut parts = vec!["zellij-tools", "scratchpad", "list"];
+    let tab_str;
+    if full {
+        parts.push("full");
+    }
+    if let Some(id) = tab_id {
+        tab_str = format!("tab={}", id);
+        parts.push(&tab_str);
+    }
+    let name_strs: Vec<String> = names;
+    for name in &name_strs {
+        parts.push(name);
+    }
+    let msg = parts.join("::");
+
+    let mut child = zellij_cmd(session)
+        .args(["pipe", "--name", &pipe_name, "--plugin", plugin, "--", &msg])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(b"\n");
+        let _ = stdin.flush();
+        drop(stdin);
+
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) if !l.is_empty() => {
+                        println!("{}", l);
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        eprintln!("Error reading: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
 /// Send a one-shot request to the plugin and read a single JSON response.
 fn tree(plugin: &str, session: Option<&str>) -> std::io::Result<()> {
     let pipe_name = format!("zellij-tools-tree-{}", uuid::Uuid::new_v4());
@@ -517,6 +590,14 @@ fn main() {
 
     let result = match cli.command {
         Commands::Focus { target } => focus(&plugin, target, session),
+        Commands::Scratchpad {
+            action:
+                ScratchpadAction::List {
+                    names,
+                    tab_id,
+                    full,
+                },
+        } => scratchpad_list(&plugin, names, tab_id, full, session),
         Commands::Scratchpad { action } => scratchpad(&plugin, action, session),
         Commands::Subscribe {
             full,
@@ -761,6 +842,102 @@ mod tests {
                 action: ScratchpadAction::Close { name },
             } => assert_eq!(name, "term"),
             _ => panic!("expected scratchpad close command"),
+        }
+    }
+
+    #[test]
+    fn parses_scratchpad_list_no_args() {
+        let cli = Cli::try_parse_from(["zellij-tools", "scratchpad", "list"]).unwrap();
+
+        match cli.command {
+            Commands::Scratchpad {
+                action:
+                    ScratchpadAction::List {
+                        names,
+                        tab_id,
+                        full,
+                    },
+            } => {
+                assert!(names.is_empty());
+                assert_eq!(tab_id, None);
+                assert!(!full);
+            }
+            _ => panic!("expected scratchpad list command"),
+        }
+    }
+
+    #[test]
+    fn parses_scratchpad_list_with_names() {
+        let cli =
+            Cli::try_parse_from(["zellij-tools", "scratchpad", "list", "term", "htop"]).unwrap();
+
+        match cli.command {
+            Commands::Scratchpad {
+                action: ScratchpadAction::List { names, .. },
+            } => {
+                assert_eq!(names, vec!["term", "htop"]);
+            }
+            _ => panic!("expected scratchpad list command"),
+        }
+    }
+
+    #[test]
+    fn parses_scratchpad_list_with_tab_filter() {
+        let cli =
+            Cli::try_parse_from(["zellij-tools", "scratchpad", "list", "--tab", "42"]).unwrap();
+
+        match cli.command {
+            Commands::Scratchpad {
+                action: ScratchpadAction::List { tab_id, .. },
+            } => {
+                assert_eq!(tab_id, Some(42));
+            }
+            _ => panic!("expected scratchpad list command"),
+        }
+    }
+
+    #[test]
+    fn parses_scratchpad_list_with_full_flag() {
+        let cli = Cli::try_parse_from(["zellij-tools", "scratchpad", "list", "--full"]).unwrap();
+
+        match cli.command {
+            Commands::Scratchpad {
+                action: ScratchpadAction::List { full, .. },
+            } => {
+                assert!(full);
+            }
+            _ => panic!("expected scratchpad list command"),
+        }
+    }
+
+    #[test]
+    fn parses_scratchpad_list_all_options() {
+        let cli = Cli::try_parse_from([
+            "zellij-tools",
+            "scratchpad",
+            "list",
+            "--full",
+            "--tab",
+            "7",
+            "term",
+            "htop",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Scratchpad {
+                action:
+                    ScratchpadAction::List {
+                        names,
+                        tab_id,
+                        full,
+                    },
+            } => {
+                assert!(full);
+                assert_eq!(tab_id, Some(7));
+                assert_eq!(names, vec!["term", "htop"]);
+            }
+            _ => panic!("expected scratchpad list command"),
         }
     }
 
