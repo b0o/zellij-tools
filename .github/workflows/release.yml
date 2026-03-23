@@ -24,7 +24,7 @@ jobs:
         run: nix build .#default
 
       - name: Upload plugin artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: zellij-tools.wasm
           path: result/share/zellij/plugins/zellij-tools.wasm
@@ -62,7 +62,7 @@ jobs:
         run: tar czf zellij-tools-${{ matrix.target }}.tar.gz -C result/bin zellij-tools
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: zellij-tools-${{ matrix.target }}
           path: zellij-tools-${{ matrix.target }}.tar.gz
