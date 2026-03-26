@@ -191,7 +191,7 @@ zellij-tools focus pane --plugin 7
 
 Focuses a tab by position (1-based) by default.
 
-Use `--id` to focus by stable tab ID.
+Use `--id` to focus by tab ID.
 
 ```sh
 zellij-tools focus tab 2
@@ -228,6 +228,6 @@ The plugin requires the following permissions:
 
 ## License
 
-&copy; 2025 Maddison Hellstrom
+&copy; 2025-2026 Maddison Hellstrom
 
 MIT License
