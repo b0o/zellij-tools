@@ -14,7 +14,6 @@ use zellij_tools::scratchpad::{
     parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadCommand, ScratchpadContext,
     ScratchpadListQuery, ScratchpadManager,
 };
-use zellij_tools::stable_tabs::StableTabTracker;
 use zellij_tools::tree;
 
 #[derive(Default)]
@@ -27,8 +26,11 @@ struct State {
     current_tab_position: usize,
     are_floating_panes_visible: bool,
 
+    // Tab ID maps (rebuilt from TabUpdate events using Zellij's native tab_id)
+    tab_id_to_position: HashMap<usize, usize>,
+    position_to_tab_id: HashMap<usize, usize>,
+
     // Managers
-    tab_tracker: StableTabTracker,
     scratchpad: Option<ScratchpadManager>,
     event_stream: EventStream,
 
@@ -72,17 +74,11 @@ impl State {
         let event_tabs: Vec<EventTabInfo> = self
             .tab_infos
             .iter()
-            .map(|t| {
-                let stable_id = self
-                    .tab_tracker
-                    .get_stable_id(t.position)
-                    .unwrap_or(t.position as u64);
-                EventTabInfo {
-                    stable_id,
-                    position: t.position,
-                    name: t.name.clone(),
-                    active: t.active,
-                }
+            .map(|t| EventTabInfo {
+                tab_id: t.tab_id,
+                position: t.position,
+                name: t.name.clone(),
+                active: t.active,
             })
             .collect();
         (event_panes, event_tabs)
@@ -149,9 +145,12 @@ impl State {
         ScratchpadContext {
             pane_manifest: &self.pane_manifest,
             current_tab_position: self.current_tab_position,
-            current_stable_tab_id: self.tab_tracker.get_stable_id(self.current_tab_position),
+            current_tab_id: self
+                .position_to_tab_id
+                .get(&self.current_tab_position)
+                .copied(),
             are_floating_panes_visible: self.are_floating_panes_visible,
-            stable_tab_to_position: &self.tab_tracker.stable_tab_to_position,
+            tab_id_to_position: &self.tab_id_to_position,
             viewport_cols,
             viewport_rows,
         }
@@ -255,16 +254,16 @@ impl State {
             "focus-tab" => {
                 let tab_index = match parse_focus_tab_target(&message.args)? {
                     FocusTabTarget::Position(position) => position,
-                    FocusTabTarget::StableId(stable_id) => {
+                    FocusTabTarget::TabId(tab_id) => {
                         let position = self
-                            .tab_tracker
-                            .stable_tab_to_position
-                            .get(&stable_id)
-                            .copied()
+                            .tab_infos
+                            .iter()
+                            .find(|t| t.tab_id == tab_id)
+                            .map(|t| t.position)
                             .ok_or_else(|| {
                                 ParseError::InvalidArgs(format!(
-                                    "No tab found for stable ID {}",
-                                    stable_id
+                                    "No tab found for tab ID {}",
+                                    tab_id
                                 ))
                             })?;
                         u32::try_from(position).map_err(|_| {
@@ -290,7 +289,7 @@ impl State {
 
                 let rest = &message.args[1..];
                 let mut full = false;
-                let mut tab_id: Option<u64> = None;
+                let mut tab_id: Option<usize> = None;
                 let mut names = Vec::new();
 
                 for &arg in rest {
@@ -310,11 +309,7 @@ impl State {
                 };
 
                 let entries = if let Some(ref scratchpad) = self.scratchpad {
-                    scratchpad.list(
-                        &query,
-                        &self.pane_manifest,
-                        &self.tab_tracker.stable_tab_to_position,
-                    )
+                    scratchpad.list(&query, &self.pane_manifest, &self.tab_id_to_position)
                 } else {
                     Vec::new()
                 };
@@ -375,8 +370,7 @@ impl State {
                     }
                 };
 
-                let session_tree =
-                    tree::build_tree(&self.tab_infos, &self.pane_manifest, &self.tab_tracker);
+                let session_tree = tree::build_tree(&self.tab_infos, &self.pane_manifest);
                 let json = serde_json::to_string(&session_tree).unwrap_or_default();
                 self.emit_event(&cli_pipe_id, &json);
                 Ok(())
@@ -491,8 +485,16 @@ impl ZellijPlugin for State {
                         .update_pane_state(&cheap_panes, self.current_tab_position);
                 }
 
-                // Update stable tab mapping and get orphaned tabs
-                let orphaned_tabs = self.tab_tracker.update(&self.pane_manifest);
+                // Detect orphaned tabs by comparing current tab_id set with pane manifest keys
+                // Tabs that exist in tab_id_to_position but not in pane_manifest are orphaned
+                let current_tab_positions: std::collections::HashSet<usize> =
+                    self.pane_manifest.keys().copied().collect();
+                let orphaned_tabs: std::collections::HashSet<usize> = self
+                    .tab_id_to_position
+                    .iter()
+                    .filter(|(_, pos)| !current_tab_positions.contains(pos))
+                    .map(|(tab_id, _)| *tab_id)
+                    .collect();
 
                 // Update scratchpad manager
                 if let Some(mut scratchpad) = self.scratchpad.take() {
@@ -513,17 +515,11 @@ impl ZellijPlugin for State {
                     // Emit tab events (focus, create, close, move)
                     let event_tabs: Vec<EventTabInfo> = tab_infos
                         .iter()
-                        .map(|t| {
-                            let stable_id = self
-                                .tab_tracker
-                                .get_stable_id(t.position)
-                                .unwrap_or(t.position as u64);
-                            EventTabInfo {
-                                stable_id,
-                                position: t.position,
-                                name: t.name.clone(),
-                                active: t.active,
-                            }
+                        .map(|t| EventTabInfo {
+                            tab_id: t.tab_id,
+                            position: t.position,
+                            name: t.name.clone(),
+                            active: t.active,
                         })
                         .collect();
                     let events = self.event_stream.on_tab_update(&event_tabs);
@@ -535,20 +531,22 @@ impl ZellijPlugin for State {
                     // but skip expensive String clones for tab names.
                     let cheap_tabs: Vec<EventTabInfo> = tab_infos
                         .iter()
-                        .map(|t| {
-                            let stable_id = self
-                                .tab_tracker
-                                .get_stable_id(t.position)
-                                .unwrap_or(t.position as u64);
-                            EventTabInfo {
-                                stable_id,
-                                position: t.position,
-                                name: String::new(),
-                                active: t.active,
-                            }
+                        .map(|t| EventTabInfo {
+                            tab_id: t.tab_id,
+                            position: t.position,
+                            name: String::new(),
+                            active: t.active,
                         })
                         .collect();
                     self.event_stream.update_tab_state(&cheap_tabs);
+                }
+
+                // Rebuild tab ID maps
+                self.tab_id_to_position.clear();
+                self.position_to_tab_id.clear();
+                for t in &tab_infos {
+                    self.tab_id_to_position.insert(t.tab_id, t.position);
+                    self.position_to_tab_id.insert(t.position, t.tab_id);
                 }
 
                 self.tab_infos = tab_infos;

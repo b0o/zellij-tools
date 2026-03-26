@@ -2,8 +2,6 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::stable_tabs::StableTabTracker;
-
 /// The full session tree returned by the `tree` command.
 #[derive(Debug, Serialize)]
 pub struct SessionTree {
@@ -13,8 +11,8 @@ pub struct SessionTree {
 /// A tab in the session tree, with all zellij TabInfo fields plus extras.
 #[derive(Debug, Serialize)]
 pub struct TabNode {
-    // Our stable ID
-    pub stable_id: Option<u64>,
+    // Zellij's native tab ID
+    pub tab_id: usize,
 
     // All zellij TabInfo fields
     pub position: usize,
@@ -26,7 +24,6 @@ pub struct TabNode {
     pub are_floating_panes_visible: bool,
     pub active_swap_layout_name: Option<String>,
     pub is_swap_layout_dirty: bool,
-    pub tab_id: usize,
     pub has_bell_notification: bool,
     pub is_flashing_bell: bool,
 
@@ -68,12 +65,10 @@ pub struct PaneNode {
 pub fn build_tree(
     tab_infos: &[zellij_tile::prelude::TabInfo],
     pane_manifest: &HashMap<usize, Vec<zellij_tile::prelude::PaneInfo>>,
-    tab_tracker: &StableTabTracker,
 ) -> SessionTree {
     let mut tabs: Vec<TabNode> = tab_infos
         .iter()
         .map(|tab| {
-            let stable_id = tab_tracker.get_stable_id(tab.position);
             let panes = pane_manifest.get(&tab.position);
 
             let mut tiled_panes = Vec::new();
@@ -116,7 +111,7 @@ pub fn build_tree(
             }
 
             TabNode {
-                stable_id,
+                tab_id: tab.tab_id,
                 position: tab.position,
                 name: tab.name.clone(),
                 active: tab.active,
@@ -126,7 +121,6 @@ pub fn build_tree(
                 are_floating_panes_visible: tab.are_floating_panes_visible,
                 active_swap_layout_name: tab.active_swap_layout_name.clone(),
                 is_swap_layout_dirty: tab.is_swap_layout_dirty,
-                tab_id: tab.tab_id,
                 has_bell_notification: tab.has_bell_notification,
                 is_flashing_bell: tab.is_flashing_bell,
                 tiled_panes,
@@ -149,7 +143,7 @@ mod tests {
     fn session_tree_serializes_to_json() {
         let tree = SessionTree {
             tabs: vec![TabNode {
-                stable_id: Some(1),
+                tab_id: 0,
                 position: 0,
                 name: "tab1".to_string(),
                 active: true,
@@ -159,7 +153,6 @@ mod tests {
                 are_floating_panes_visible: false,
                 active_swap_layout_name: None,
                 is_swap_layout_dirty: false,
-                tab_id: 0,
                 has_bell_notification: false,
                 is_flashing_bell: false,
                 tiled_panes: vec![PaneNode {
@@ -196,7 +189,7 @@ mod tests {
         // Verify it parses back as valid JSON
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(value["tabs"].is_array());
-        assert_eq!(value["tabs"][0]["stable_id"], 1);
+        assert_eq!(value["tabs"][0]["tab_id"], 0);
         assert_eq!(value["tabs"][0]["name"], "tab1");
         assert_eq!(value["tabs"][0]["tiled_panes"][0]["id"], 0);
         assert_eq!(value["tabs"][0]["tiled_panes"][0]["title"], "zsh");

@@ -2,7 +2,7 @@ use crate::message::ParseError;
 
 pub enum FocusTabTarget {
     Position(u32),
-    StableId(u64),
+    TabId(usize),
 }
 
 pub fn parse_focus_tab_target(args: &[&str]) -> Result<FocusTabTarget, ParseError> {
@@ -15,12 +15,12 @@ pub fn parse_focus_tab_target(args: &[&str]) -> Result<FocusTabTarget, ParseErro
             .parse::<u32>()
             .map(FocusTabTarget::Position)
             .map_err(|e| ParseError::InvalidArgs(format!("Invalid tab index: {}", e))),
-        ["id", stable_id] => stable_id
-            .parse::<u64>()
-            .map(FocusTabTarget::StableId)
-            .map_err(|e| ParseError::InvalidArgs(format!("Invalid tab stable ID: {}", e))),
+        ["id", tab_id] => tab_id
+            .parse::<usize>()
+            .map(FocusTabTarget::TabId)
+            .map_err(|e| ParseError::InvalidArgs(format!("Invalid tab ID: {}", e))),
         _ => Err(ParseError::InvalidArgs(format!(
-            "focus-tab requires 1 argument (position) or 2 arguments (position::<n> / id::<stable_id>), got {}",
+            "focus-tab requires 1 argument (position) or 2 arguments (position::<n> / id::<id>), got {}",
             args.len()
         ))),
     }
@@ -35,7 +35,7 @@ mod tests {
         let target = parse_focus_tab_target(&["3"]).expect("should parse");
         match target {
             FocusTabTarget::Position(tab) => assert_eq!(tab, 3),
-            FocusTabTarget::StableId(_) => panic!("expected position target"),
+            FocusTabTarget::TabId(_) => panic!("expected position target"),
         }
     }
 
@@ -44,16 +44,16 @@ mod tests {
         let target = parse_focus_tab_target(&["position", "3"]).expect("should parse");
         match target {
             FocusTabTarget::Position(tab) => assert_eq!(tab, 3),
-            FocusTabTarget::StableId(_) => panic!("expected position target"),
+            FocusTabTarget::TabId(_) => panic!("expected position target"),
         }
     }
 
     #[test]
-    fn parse_focus_tab_stable_id_form() {
+    fn parse_focus_tab_id_form() {
         let target = parse_focus_tab_target(&["id", "42"]).expect("should parse");
         match target {
-            FocusTabTarget::StableId(tab) => assert_eq!(tab, 42),
-            FocusTabTarget::Position(_) => panic!("expected stable ID target"),
+            FocusTabTarget::TabId(tab) => assert_eq!(tab, 42),
+            FocusTabTarget::Position(_) => panic!("expected tab ID target"),
         }
     }
 }

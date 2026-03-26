@@ -5,7 +5,6 @@ resolver = "2"
 [package]
 name = "zellij-tools"
 version = "0.2.1"
-authors = ["Maddison Hellstrom <hi@maddison.io>"]
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
@@ -24,3 +23,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zellij-tile = "0.44"
 zellij-tile-utils = "0.44"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

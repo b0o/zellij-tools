@@ -12,8 +12,6 @@ pub use persistence::{delete_state_file, load_state, save_state, PersistedState}
 use std::collections::{HashMap, HashSet};
 use zellij_tile::prelude::{CommandToRun, PaneInfo};
 
-use crate::stable_tabs::StableTabId;
-
 /// Commands returned by ScratchpadManager for the caller to execute
 #[derive(Debug)]
 pub enum ScratchpadCommand {
@@ -41,9 +39,9 @@ pub enum ScratchpadCommand {
 pub struct ScratchpadContext<'a> {
     pub pane_manifest: &'a HashMap<usize, Vec<PaneInfo>>,
     pub current_tab_position: usize,
-    pub current_stable_tab_id: Option<StableTabId>,
+    pub current_tab_id: Option<usize>,
     pub are_floating_panes_visible: bool,
-    pub stable_tab_to_position: &'a HashMap<StableTabId, usize>,
+    pub tab_id_to_position: &'a HashMap<usize, usize>,
     /// Viewport width in columns (from TabInfo).
     pub viewport_cols: usize,
     /// Viewport height in rows (from TabInfo).
@@ -53,19 +51,19 @@ pub struct ScratchpadContext<'a> {
 /// Manages scratchpad state and returns commands to execute
 pub struct ScratchpadManager {
     configs: HashMap<String, ScratchpadConfig>,
-    /// name -> (stable_tab_id -> pane_id)
-    panes: HashMap<String, HashMap<StableTabId, u32>>,
-    /// Pending registrations: (name, stable_tab_id)
-    pending: HashSet<(String, StableTabId)>,
+    /// name -> (tab_id -> pane_id)
+    panes: HashMap<String, HashMap<usize, u32>>,
+    /// Pending registrations: (name, tab_id)
+    pending: HashSet<(String, usize)>,
     /// Monotonic counter for focus tracking
     focus_counter: u64,
-    /// name -> (stable_tab_id -> last focus timestamp)
-    focus_times: HashMap<String, HashMap<StableTabId, u64>>,
+    /// name -> (tab_id -> last focus timestamp)
+    focus_times: HashMap<String, HashMap<usize, u64>>,
     /// Track scratchpad we just showed (for focus detection before PaneUpdate)
     just_shown: Option<u32>,
     /// Scratchpads that were removed from config but still have active panes
-    /// name -> set of stable_tab_ids
-    orphaned: HashMap<String, HashSet<StableTabId>>,
+    /// name -> set of tab_ids
+    orphaned: HashMap<String, HashSet<usize>>,
 }
 
 impl ScratchpadManager {
@@ -119,8 +117,8 @@ impl ScratchpadManager {
         // Now insert orphaned entries (separate loop to avoid borrow conflict)
         for name in &removed_names {
             if let Some(inner) = self.panes.get(*name) {
-                let stable_ids: Vec<StableTabId> = inner.keys().copied().collect();
-                for stable_id in stable_ids {
+                let tab_ids: Vec<usize> = inner.keys().copied().collect();
+                for stable_id in tab_ids {
                     let orphaned_set = self.orphaned.entry((*name).clone()).or_default();
                     if orphaned_set.insert(stable_id) {
                         eprintln!(
@@ -153,10 +151,8 @@ impl ScratchpadManager {
     }
 
     /// Check if a scratchpad is orphaned (removed from config but has active panes)
-    fn is_orphaned(&self, name: &str, stable_tab_id: StableTabId) -> bool {
-        self.orphaned
-            .get(name)
-            .is_some_and(|s| s.contains(&stable_tab_id))
+    fn is_orphaned(&self, name: &str, tab_id: usize) -> bool {
+        self.orphaned.get(name).is_some_and(|s| s.contains(&tab_id))
     }
 
     /// Extract state that should be persisted across reloads.
@@ -258,23 +254,23 @@ impl ScratchpadManager {
         ctx: &ScratchpadContext,
     ) -> Option<Vec<ScratchpadCommand>> {
         // Reverse-look up the scratchpad name and tab from the pane ID
-        let (name, stable_tab_id) = self.find_scratchpad_by_pane_id(terminal_pane_id)?;
+        let (name, tab_id) = self.find_scratchpad_by_pane_id(terminal_pane_id)?;
 
         // Skip orphaned scratchpads
-        if self.is_orphaned(&name, stable_tab_id) {
+        if self.is_orphaned(&name, tab_id) {
             return None;
         }
 
         let config = self.configs.get(&name)?.clone();
         let coordinates = config.resolve_coordinates(ctx.viewport_cols, ctx.viewport_rows);
-        Some(self.show_pane(&name, terminal_pane_id, stable_tab_id, ctx, coordinates))
+        Some(self.show_pane(&name, terminal_pane_id, tab_id, ctx, coordinates))
     }
 
     /// Called on PaneUpdate to sync state and clean up
     pub fn on_pane_update(
         &mut self,
         ctx: &ScratchpadContext,
-        orphaned_tabs: &HashSet<StableTabId>,
+        orphaned_tabs: &HashSet<usize>,
     ) -> Vec<ScratchpadCommand> {
         let mut commands = Vec::new();
 
@@ -321,8 +317,8 @@ impl ScratchpadManager {
         }
 
         // No-op for orphaned scratchpads
-        if let Some(stable_tab_id) = ctx.current_stable_tab_id {
-            if self.is_orphaned(&target_name, stable_tab_id) {
+        if let Some(tab_id) = ctx.current_tab_id {
+            if self.is_orphaned(&target_name, tab_id) {
                 return Vec::new();
             }
         }
@@ -343,19 +339,19 @@ impl ScratchpadManager {
             None => return Vec::new(),
         };
 
-        let Some(stable_tab_id) = ctx.current_stable_tab_id else {
+        let Some(tab_id) = ctx.current_tab_id else {
             return Vec::new();
         };
 
         // No-op for orphaned scratchpads
-        if self.is_orphaned(name, stable_tab_id) {
+        if self.is_orphaned(name, tab_id) {
             return Vec::new();
         }
 
         let existing_pane_id = self.get_pane(name, ctx);
 
         if existing_pane_id.is_none() {
-            let pending_key = (name.to_string(), stable_tab_id);
+            let pending_key = (name.to_string(), tab_id);
             if self.pending.contains(&pending_key) {
                 return Vec::new();
             }
@@ -373,13 +369,13 @@ impl ScratchpadManager {
             unreachable!("guarded by is_none check above");
         };
         let coordinates = config.resolve_coordinates(ctx.viewport_cols, ctx.viewport_rows);
-        self.show_pane(name, pane_id, stable_tab_id, ctx, coordinates)
+        self.show_pane(name, pane_id, tab_id, ctx, coordinates)
     }
 
     fn handle_hide(&mut self, name: &str, ctx: &ScratchpadContext) -> Vec<ScratchpadCommand> {
         // No-op for orphaned scratchpads
-        if let Some(stable_tab_id) = ctx.current_stable_tab_id {
-            if self.is_orphaned(name, stable_tab_id) {
+        if let Some(tab_id) = ctx.current_tab_id {
+            if self.is_orphaned(name, tab_id) {
                 return Vec::new();
             }
         }
@@ -392,14 +388,14 @@ impl ScratchpadManager {
     }
 
     fn handle_close(&mut self, name: &str, ctx: &ScratchpadContext) -> Vec<ScratchpadCommand> {
-        let Some(stable_tab_id) = ctx.current_stable_tab_id else {
+        let Some(tab_id) = ctx.current_tab_id else {
             return Vec::new();
         };
 
         let pane_id = self
             .panes
             .get_mut(name)
-            .and_then(|inner| inner.remove(&stable_tab_id));
+            .and_then(|inner| inner.remove(&tab_id));
 
         if let Some(pane_id) = pane_id {
             // Clean up empty outer entries
@@ -407,7 +403,7 @@ impl ScratchpadManager {
                 self.panes.remove(name);
             }
             if let Some(inner) = self.focus_times.get_mut(name) {
-                inner.remove(&stable_tab_id);
+                inner.remove(&tab_id);
                 if inner.is_empty() {
                     self.focus_times.remove(name);
                 }
@@ -428,21 +424,21 @@ impl ScratchpadManager {
 
         let pane_tab_position = self.get_pane_tab(pane_id, ctx);
 
-        // Find which stable tab ID this pane was intended for
-        let intended_stable_id = self
+        // Find which tab ID this pane was intended for
+        let intended_tab_id = self
             .pending
             .iter()
             .find(|(n, _)| n == name)
-            .map(|(_, stable_id)| *stable_id);
+            .map(|(_, tab_id)| *tab_id);
 
-        let target_stable_id = intended_stable_id.or(ctx.current_stable_tab_id);
-        let Some(stable_tab_id) = target_stable_id else {
+        let target_tab_id = intended_tab_id.or(ctx.current_tab_id);
+        let Some(tab_id) = target_tab_id else {
             return commands;
         };
 
-        self.pending.remove(&(name.to_string(), stable_tab_id));
+        self.pending.remove(&(name.to_string(), tab_id));
 
-        let target_tab_position = ctx.stable_tab_to_position.get(&stable_tab_id).copied();
+        let target_tab_position = ctx.tab_id_to_position.get(&tab_id).copied();
 
         // Move pane if on wrong tab
         if let (Some(actual_tab), Some(target_tab)) = (pane_tab_position, target_tab_position) {
@@ -468,13 +464,13 @@ impl ScratchpadManager {
         self.panes
             .entry(name.to_string())
             .or_default()
-            .insert(stable_tab_id, pane_id);
+            .insert(tab_id, pane_id);
         self.just_shown = Some(pane_id);
         self.focus_counter += 1;
         self.focus_times
             .entry(name.to_string())
             .or_default()
-            .insert(stable_tab_id, self.focus_counter);
+            .insert(tab_id, self.focus_counter);
 
         // Re-hide any floating panes that should be hidden
         for hidden_pane_id in self.get_hidden_floating_pane_ids(ctx) {
@@ -492,7 +488,7 @@ impl ScratchpadManager {
         &mut self,
         name: &str,
         pane_id: u32,
-        stable_tab_id: StableTabId,
+        tab_id: usize,
         ctx: &ScratchpadContext,
         coordinates: ResolvedCoordinates,
     ) -> Vec<ScratchpadCommand> {
@@ -518,7 +514,7 @@ impl ScratchpadManager {
         self.focus_times
             .entry(name.to_string())
             .or_default()
-            .insert(stable_tab_id, self.focus_counter);
+            .insert(tab_id, self.focus_counter);
 
         commands
     }
@@ -544,12 +540,12 @@ impl ScratchpadManager {
     }
 
     fn get_pane(&self, name: &str, ctx: &ScratchpadContext) -> Option<u32> {
-        let stable_tab_id = ctx.current_stable_tab_id?;
-        self.panes.get(name)?.get(&stable_tab_id).copied()
+        let tab_id = ctx.current_tab_id?;
+        self.panes.get(name)?.get(&tab_id).copied()
     }
 
     /// Reverse-look up a terminal pane ID to find the scratchpad name and tab it belongs to.
-    fn find_scratchpad_by_pane_id(&self, terminal_pane_id: u32) -> Option<(String, StableTabId)> {
+    fn find_scratchpad_by_pane_id(&self, terminal_pane_id: u32) -> Option<(String, usize)> {
         self.panes
             .iter()
             .flat_map(|(name, inner)| {
@@ -636,11 +632,11 @@ impl ScratchpadManager {
     }
 
     fn get_last_focused_on_current_tab(&self, ctx: &ScratchpadContext) -> Option<String> {
-        let stable_tab_id = ctx.current_stable_tab_id?;
+        let tab_id = ctx.current_tab_id?;
 
         self.focus_times
             .iter()
-            .filter_map(|(name, inner)| inner.get(&stable_tab_id).map(|&time| (name, time)))
+            .filter_map(|(name, inner)| inner.get(&tab_id).map(|&time| (name, time)))
             .max_by_key(|(_, focus_time)| *focus_time)
             .map(|(name, _)| name.clone())
     }
@@ -694,7 +690,7 @@ impl ScratchpadManager {
         }
 
         let mut commands = Vec::new();
-        let keys_to_remove: Vec<(String, StableTabId, u32)> = self
+        let keys_to_remove: Vec<(String, usize, u32)> = self
             .panes
             .iter()
             .flat_map(|(name, inner)| {
@@ -738,9 +734,9 @@ impl ScratchpadManager {
 
     fn close_orphaned_scratchpads(
         &mut self,
-        orphaned_tabs: &HashSet<StableTabId>,
+        orphaned_tabs: &HashSet<usize>,
     ) -> Vec<ScratchpadCommand> {
-        let orphaned_tab_panes: Vec<(String, StableTabId, u32)> = self
+        let orphaned_tab_panes: Vec<(String, usize, u32)> = self
             .panes
             .iter()
             .flat_map(|(name, inner)| {
@@ -817,16 +813,16 @@ mod tests {
     fn make_context<'a>(
         pane_manifest: &'a HashMap<usize, Vec<PaneInfo>>,
         current_tab: usize,
-        stable_tab_id: Option<StableTabId>,
+        tab_id: Option<usize>,
         floating_visible: bool,
-        stable_tab_to_position: &'a HashMap<StableTabId, usize>,
+        tab_id_to_position: &'a HashMap<usize, usize>,
     ) -> ScratchpadContext<'a> {
         ScratchpadContext {
             pane_manifest,
             current_tab_position: current_tab,
-            current_stable_tab_id: stable_tab_id,
+            current_tab_id: tab_id,
             are_floating_panes_visible: floating_visible,
-            stable_tab_to_position,
+            tab_id_to_position,
             viewport_cols: 200,
             viewport_rows: 50,
         }

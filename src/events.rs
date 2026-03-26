@@ -83,14 +83,14 @@ pub struct SubscribeSpec {
     #[serde(default)]
     pub pane_ids: Option<Vec<TypedPaneId>>,
     #[serde(default)]
-    pub tab_ids: Option<Vec<u64>>,
+    pub tab_ids: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct EventFilter {
     event_kinds: Option<HashSet<EventKind>>,
     pane_ids: Option<HashSet<TypedPaneId>>,
-    tab_ids: Option<HashSet<u64>>,
+    tab_ids: Option<HashSet<usize>>,
 }
 
 impl EventFilter {
@@ -129,16 +129,16 @@ impl EventFilter {
         true
     }
 
-    fn matches_tab_id(&self, stable_id: Option<u64>) -> bool {
+    fn matches_tab_id(&self, tab_id: Option<usize>) -> bool {
         match &self.tab_ids {
             None => true,
-            Some(tab_ids) => stable_id.map(|id| tab_ids.contains(&id)).unwrap_or(false),
+            Some(tab_ids) => tab_id.map(|id| tab_ids.contains(&id)).unwrap_or(false),
         }
     }
 
     #[cfg(test)]
     fn matches(&self, event: &Event) -> bool {
-        self.matches_event_and_pane(event) && self.matches_tab_id(event.tab_stable_id())
+        self.matches_event_and_pane(event) && self.matches_tab_id(event.tab_id())
     }
 }
 
@@ -166,27 +166,27 @@ pub enum Event {
         pane_type: PaneType,
     },
     TabFocused {
-        stable_id: u64,
+        tab_id: usize,
         position: usize,
         name: String,
     },
     TabUnfocused {
-        stable_id: u64,
+        tab_id: usize,
         position: usize,
         name: String,
     },
     TabCreated {
-        stable_id: u64,
+        tab_id: usize,
         position: usize,
         name: String,
     },
     TabClosed {
-        stable_id: u64,
+        tab_id: usize,
         position: usize,
         name: String,
     },
     TabMoved {
-        stable_id: u64,
+        tab_id: usize,
         old_position: usize,
         new_position: usize,
         name: String,
@@ -231,13 +231,13 @@ impl Event {
         }
     }
 
-    fn tab_stable_id(&self) -> Option<u64> {
+    fn tab_id(&self) -> Option<usize> {
         match self {
-            Self::TabFocused { stable_id, .. }
-            | Self::TabUnfocused { stable_id, .. }
-            | Self::TabCreated { stable_id, .. }
-            | Self::TabClosed { stable_id, .. }
-            | Self::TabMoved { stable_id, .. } => Some(*stable_id),
+            Self::TabFocused { tab_id, .. }
+            | Self::TabUnfocused { tab_id, .. }
+            | Self::TabCreated { tab_id, .. }
+            | Self::TabClosed { tab_id, .. }
+            | Self::TabMoved { tab_id, .. } => Some(*tab_id),
             _ => None,
         }
     }
@@ -267,16 +267,16 @@ impl Event {
                     Self::merge_pane_detail(&mut value, pane);
                 }
             }
-            Event::TabFocused { stable_id, .. }
-            | Event::TabUnfocused { stable_id, .. }
-            | Event::TabCreated { stable_id, .. }
-            | Event::TabClosed { stable_id, .. } => {
-                if let Some(tab) = tabs.iter().find(|t| t.stable_id == *stable_id) {
+            Event::TabFocused { tab_id, .. }
+            | Event::TabUnfocused { tab_id, .. }
+            | Event::TabCreated { tab_id, .. }
+            | Event::TabClosed { tab_id, .. } => {
+                if let Some(tab) = tabs.iter().find(|t| t.tab_id == *tab_id) {
                     Self::merge_tab_detail(&mut value, tab);
                 }
             }
-            Event::TabMoved { stable_id, .. } => {
-                if let Some(tab) = tabs.iter().find(|t| t.stable_id == *stable_id) {
+            Event::TabMoved { tab_id, .. } => {
+                if let Some(tab) = tabs.iter().find(|t| t.tab_id == *tab_id) {
                     Self::merge_tab_detail(&mut value, tab);
                 }
             }
@@ -323,7 +323,7 @@ impl Event {
 
     /// Merge tab detail fields into the event's inner object
     fn merge_tab_detail(value: &mut serde_json::Value, _tab: &TabInfo) {
-        // TabInfo already has all fields in the event (stable_id, position, name)
+        // TabInfo already has all fields in the event (tab_id, position, name)
         // Nothing extra to merge for now
         let _ = value;
     }
@@ -447,22 +447,22 @@ pub struct EventStream {
     /// Uses (id, is_plugin) to distinguish terminal from plugin panes,
     /// since zellij allows overlapping numeric IDs between the two namespaces.
     known_panes: HashSet<PaneKey>,
-    /// Last known active tab (by stable_id)
-    last_active_tab: Option<u64>,
-    /// Known tabs by stable_id: stable_id -> (position, name)
-    known_tabs: HashMap<u64, (usize, String)>,
+    /// Last known active tab (by tab_id)
+    last_active_tab: Option<usize>,
+    /// Known tabs by tab_id: tab_id -> (position, name)
+    known_tabs: HashMap<usize, (usize, String)>,
     /// Lightweight snapshot of pane focus state for recomputing focus on tab switch.
     /// Updated on each PaneUpdate.
     pane_focus_snapshot: Vec<PaneFocusSnapshot>,
-    /// Last known active tab position (by tab index, not stable_id).
-    /// Used for pane focus filtering — we need the position, not stable_id,
+    /// Last known active tab position (by tab index, not tab_id).
+    /// Used for pane focus filtering — we need the position, not tab_id,
     /// because PaneInfo.tab_position uses position.
     active_tab_position: Option<usize>,
 }
 
 /// Information about a tab, used for diffing
 pub struct TabInfo {
-    pub stable_id: u64,
+    pub tab_id: usize,
     pub position: usize,
     pub name: String,
     pub active: bool,
@@ -587,17 +587,15 @@ impl EventStream {
             .collect()
     }
 
-    fn stable_id_for_tab_position(&self, tab_position: usize) -> Option<u64> {
+    fn tab_id_for_position(&self, tab_position: usize) -> Option<usize> {
         self.known_tabs
             .iter()
-            .find_map(|(stable_id, (position, _))| {
-                (*position == tab_position).then_some(*stable_id)
-            })
+            .find_map(|(tab_id, (position, _))| (*position == tab_position).then_some(*tab_id))
     }
 
-    fn event_stable_tab_id(&self, event: &Event, panes: &[PaneInfo]) -> Option<u64> {
-        if let Some(stable_id) = event.tab_stable_id() {
-            return Some(stable_id);
+    fn event_tab_id(&self, event: &Event, panes: &[PaneInfo]) -> Option<usize> {
+        if let Some(tab_id) = event.tab_id() {
+            return Some(tab_id);
         }
 
         let pane_key = event.pane_key()?;
@@ -613,23 +611,23 @@ impl EventStream {
                 .map(|pane| pane.tab_position)
         })?;
 
-        self.stable_id_for_tab_position(tab_position)
+        self.tab_id_for_position(tab_position)
     }
 
     fn matches_filter(&self, filter: &EventFilter, event: &Event, panes: &[PaneInfo]) -> bool {
         if !filter.matches_event_and_pane(event) {
             return false;
         }
-        filter.matches_tab_id(self.event_stable_tab_id(event, panes))
+        filter.matches_tab_id(self.event_tab_id(event, panes))
     }
 
     fn current_focus_events(&self) -> Vec<Event> {
         let mut initial_events = Vec::new();
 
-        if let Some(stable_id) = self.last_active_tab {
-            if let Some((position, name)) = self.known_tabs.get(&stable_id) {
+        if let Some(tab_id) = self.last_active_tab {
+            if let Some((position, name)) = self.known_tabs.get(&tab_id) {
                 initial_events.push(Event::TabFocused {
-                    stable_id,
+                    tab_id,
                     position: *position,
                     name: name.clone(),
                 });
@@ -712,12 +710,12 @@ impl EventStream {
     /// PaneUpdate and TabUpdate arrive in arbitrary order from zellij. A tab
     /// switch must trigger pane focus recomputation even without a new PaneUpdate.
     pub fn on_tab_update(&mut self, tabs: &[TabInfo]) -> Vec<(String, String)> {
-        let new_active_stable = tabs.iter().find(|t| t.active).map(|t| t.stable_id);
+        let new_active_tab_id = tabs.iter().find(|t| t.active).map(|t| t.tab_id);
         let new_active_position = tabs.iter().find(|t| t.active).map(|t| t.position);
 
         if !self.has_subscribers() {
             // Still recompute pane focus so last_focused_pane stays correct
-            if new_active_stable != self.last_active_tab {
+            if new_active_tab_id != self.last_active_tab {
                 if let Some(pos) = new_active_position {
                     self.active_tab_position = Some(pos);
                     self.last_focused_pane =
@@ -730,8 +728,8 @@ impl EventStream {
 
         let mut events = self.compute_tab_events(tabs);
 
-        // If active tab position changed, recompute pane focus from stored snapshot
-        if new_active_stable != self.last_active_tab {
+        // If active tab changed, recompute pane focus from stored snapshot
+        if new_active_tab_id != self.last_active_tab {
             if let Some(new_pos) = new_active_position {
                 let new_focused =
                     Self::find_focused_from_snapshot(&self.pane_focus_snapshot, new_pos);
@@ -794,40 +792,40 @@ impl EventStream {
     }
 
     /// Compute tab events by diffing old vs new tab state.
-    /// Tracks tabs by stable_id to detect moves vs create/close.
+    /// Tracks tabs by tab_id to detect moves vs create/close.
     fn compute_tab_events(&self, tabs: &[TabInfo]) -> Vec<Event> {
         let mut events = Vec::new();
 
-        let new_ids: HashSet<u64> = tabs.iter().map(|t| t.stable_id).collect();
+        let new_ids: HashSet<usize> = tabs.iter().map(|t| t.tab_id).collect();
 
-        // Created tabs (new stable_id not in old)
+        // Created tabs (new tab_id not in old)
         for tab in tabs {
-            if !self.known_tabs.contains_key(&tab.stable_id) {
+            if !self.known_tabs.contains_key(&tab.tab_id) {
                 events.push(Event::TabCreated {
-                    stable_id: tab.stable_id,
+                    tab_id: tab.tab_id,
                     position: tab.position,
                     name: tab.name.clone(),
                 });
             }
         }
 
-        // Closed tabs (old stable_id not in new)
+        // Closed tabs (old tab_id not in new)
         for (&old_id, (position, name)) in &self.known_tabs {
             if !new_ids.contains(&old_id) {
                 events.push(Event::TabClosed {
-                    stable_id: old_id,
+                    tab_id: old_id,
                     position: *position,
                     name: name.clone(),
                 });
             }
         }
 
-        // Moved tabs (same stable_id, different position)
+        // Moved tabs (same tab_id, different position)
         for tab in tabs {
-            if let Some((old_position, _)) = self.known_tabs.get(&tab.stable_id) {
+            if let Some((old_position, _)) = self.known_tabs.get(&tab.tab_id) {
                 if *old_position != tab.position {
                     events.push(Event::TabMoved {
-                        stable_id: tab.stable_id,
+                        tab_id: tab.tab_id,
                         old_position: *old_position,
                         new_position: tab.position,
                         name: tab.name.clone(),
@@ -836,20 +834,20 @@ impl EventStream {
             }
         }
 
-        // Focus changes (by stable_id, not position)
-        let new_active = tabs.iter().find(|t| t.active).map(|t| t.stable_id);
+        // Focus changes (by tab_id, not position)
+        let new_active = tabs.iter().find(|t| t.active).map(|t| t.tab_id);
 
         match (self.last_active_tab, new_active) {
             (Some(old_id), Some(new_id)) if old_id != new_id => {
                 let (old_pos, old_name) = self.known_tabs.get(&old_id).cloned().unwrap_or_default();
                 events.push(Event::TabUnfocused {
-                    stable_id: old_id,
+                    tab_id: old_id,
                     position: old_pos,
                     name: old_name,
                 });
-                if let Some(tab) = tabs.iter().find(|t| t.stable_id == new_id) {
+                if let Some(tab) = tabs.iter().find(|t| t.tab_id == new_id) {
                     events.push(Event::TabFocused {
-                        stable_id: new_id,
+                        tab_id: new_id,
                         position: tab.position,
                         name: tab.name.clone(),
                     });
@@ -858,15 +856,15 @@ impl EventStream {
             (Some(old_id), None) => {
                 let (old_pos, old_name) = self.known_tabs.get(&old_id).cloned().unwrap_or_default();
                 events.push(Event::TabUnfocused {
-                    stable_id: old_id,
+                    tab_id: old_id,
                     position: old_pos,
                     name: old_name,
                 });
             }
             (None, Some(new_id)) => {
-                if let Some(tab) = tabs.iter().find(|t| t.stable_id == new_id) {
+                if let Some(tab) = tabs.iter().find(|t| t.tab_id == new_id) {
                     events.push(Event::TabFocused {
-                        stable_id: new_id,
+                        tab_id: new_id,
                         position: tab.position,
                         name: tab.name.clone(),
                     });
@@ -883,9 +881,9 @@ impl EventStream {
         self.known_tabs.clear();
         for t in tabs {
             self.known_tabs
-                .insert(t.stable_id, (t.position, t.name.clone()));
+                .insert(t.tab_id, (t.position, t.name.clone()));
         }
-        self.last_active_tab = tabs.iter().find(|t| t.active).map(|t| t.stable_id);
+        self.last_active_tab = tabs.iter().find(|t| t.active).map(|t| t.tab_id);
     }
 
     /// Compute the events that should be emitted for this pane update
@@ -1073,7 +1071,7 @@ mod tests {
             pane_type: PaneType::Terminal,
         }));
         assert!(filter.matches(&Event::TabMoved {
-            stable_id: 42,
+            tab_id: 42,
             old_position: 0,
             new_position: 1,
             name: "dev".to_string(),
@@ -1111,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_tab_stable_ids_match_tab_events() {
+    fn filter_tab_ids_match_tab_events() {
         let filter = EventFilter::from_spec(&SubscribeSpec {
             events: None,
             pane_ids: None,
@@ -1120,12 +1118,12 @@ mod tests {
         });
 
         assert!(filter.matches(&Event::TabFocused {
-            stable_id: 101,
+            tab_id: 101,
             position: 0,
             name: "main".to_string(),
         }));
         assert!(!filter.matches(&Event::TabFocused {
-            stable_id: 202,
+            tab_id: 202,
             position: 1,
             name: "other".to_string(),
         }));
@@ -1177,7 +1175,7 @@ mod tests {
             full: None,
         });
         assert!(!tab_filter.matches(&Event::TabFocused {
-            stable_id: 101,
+            tab_id: 101,
             position: 0,
             name: "main".to_string(),
         }));
@@ -1270,7 +1268,7 @@ mod tests {
 
         let initial = stream.initial_events_for("pipe-1");
         assert!(initial.contains(&Event::TabFocused {
-            stable_id: 100,
+            tab_id: 100,
             position: 0,
             name: "main".to_string(),
         }));
@@ -1721,61 +1719,61 @@ mod tests {
     #[test]
     fn event_tab_focused_serializes() {
         let event = Event::TabFocused {
-            stable_id: 100,
+            tab_id: 100,
             position: 0,
             name: "tab1".to_string(),
         };
         assert_eq!(
             event.to_json(),
-            r#"{"TabFocused":{"stable_id":100,"position":0,"name":"tab1"}}"#
+            r#"{"TabFocused":{"tab_id":100,"position":0,"name":"tab1"}}"#
         );
     }
 
     #[test]
     fn event_tab_created_serializes() {
         let event = Event::TabCreated {
-            stable_id: 200,
+            tab_id: 200,
             position: 2,
             name: "new-tab".to_string(),
         };
         assert_eq!(
             event.to_json(),
-            r#"{"TabCreated":{"stable_id":200,"position":2,"name":"new-tab"}}"#
+            r#"{"TabCreated":{"tab_id":200,"position":2,"name":"new-tab"}}"#
         );
     }
 
     #[test]
     fn event_tab_closed_serializes() {
         let event = Event::TabClosed {
-            stable_id: 300,
+            tab_id: 300,
             position: 1,
             name: "old-tab".to_string(),
         };
         assert_eq!(
             event.to_json(),
-            r#"{"TabClosed":{"stable_id":300,"position":1,"name":"old-tab"}}"#
+            r#"{"TabClosed":{"tab_id":300,"position":1,"name":"old-tab"}}"#
         );
     }
 
     #[test]
     fn event_tab_moved_serializes() {
         let event = Event::TabMoved {
-            stable_id: 100,
+            tab_id: 100,
             old_position: 0,
             new_position: 1,
             name: "tab1".to_string(),
         };
         assert_eq!(
             event.to_json(),
-            r#"{"TabMoved":{"stable_id":100,"old_position":0,"new_position":1,"name":"tab1"}}"#
+            r#"{"TabMoved":{"tab_id":100,"old_position":0,"new_position":1,"name":"tab1"}}"#
         );
     }
 
     // --- Tab focus detection ---
 
-    fn make_tab(stable_id: u64, position: usize, name: &str, active: bool) -> TabInfo {
+    fn make_tab(tab_id: usize, position: usize, name: &str, active: bool) -> TabInfo {
         TabInfo {
-            stable_id,
+            tab_id,
             position,
             name: name.to_string(),
             active,
@@ -1802,8 +1800,8 @@ mod tests {
         let output = stream.on_tab_update(&tabs);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
-        assert!(jsons.contains(&r#"{"TabUnfocused":{"stable_id":100,"position":0,"name":"tab1"}}"#));
-        assert!(jsons.contains(&r#"{"TabFocused":{"stable_id":101,"position":1,"name":"tab2"}}"#));
+        assert!(jsons.contains(&r#"{"TabUnfocused":{"tab_id":100,"position":0,"name":"tab1"}}"#));
+        assert!(jsons.contains(&r#"{"TabFocused":{"tab_id":101,"position":1,"name":"tab2"}}"#));
     }
 
     #[test]
@@ -1836,7 +1834,7 @@ mod tests {
         let output = stream.on_tab_update(&tabs);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
-        assert!(jsons.contains(&r#"{"TabCreated":{"stable_id":101,"position":1,"name":"tab2"}}"#));
+        assert!(jsons.contains(&r#"{"TabCreated":{"tab_id":101,"position":1,"name":"tab2"}}"#));
     }
 
     #[test]
@@ -1855,7 +1853,7 @@ mod tests {
         let output = stream.on_tab_update(&tabs);
 
         let jsons: Vec<&str> = output.iter().map(|(_, json)| json.as_str()).collect();
-        assert!(jsons.contains(&r#"{"TabClosed":{"stable_id":101,"position":1,"name":"tab2"}}"#));
+        assert!(jsons.contains(&r#"{"TabClosed":{"tab_id":101,"position":1,"name":"tab2"}}"#));
     }
 
     #[test]
@@ -1868,7 +1866,7 @@ mod tests {
 
         let events = stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
         assert!(events.contains(&Event::TabFocused {
-            stable_id: 100,
+            tab_id: 100,
             position: 0,
             name: "tab1".to_string(),
         }));
@@ -2185,7 +2183,7 @@ mod tests {
         // State should be tracked: subscribing now returns current focus
         let events = stream.subscribe("pipe-1".to_string(), SubscribeMode::Compact);
         assert!(events.contains(&Event::TabFocused {
-            stable_id: 100,
+            tab_id: 100,
             position: 0,
             name: "tab1".to_string(),
         }));

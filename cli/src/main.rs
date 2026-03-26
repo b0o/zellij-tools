@@ -59,9 +59,9 @@ enum Commands {
         /// Filter by plugin pane IDs
         #[arg(long = "plugin-pane-id", value_delimiter = ',', num_args = 1..)]
         plugin_pane_ids: Vec<u32>,
-        /// Filter by stable tab IDs
+        /// Filter by tab IDs
         #[arg(long = "tab-id", value_delimiter = ',', num_args = 1..)]
-        tab_ids: Vec<u64>,
+        tab_ids: Vec<usize>,
     },
     /// Print the session tree (tabs, panes, stable IDs) as JSON
     Tree,
@@ -79,10 +79,10 @@ enum FocusTarget {
         #[arg(short = 't', long = "terminal", conflicts_with = "plugin_pane")]
         terminal_pane: bool,
     },
-    /// Focus a tab (position by default, or stable ID with --id)
+    /// Focus a tab (position by default, or tab ID with --id)
     Tab {
-        tab: u64,
-        /// Interpret the value as stable tab ID (mutually exclusive with --position)
+        tab: usize,
+        /// Interpret the value as tab ID (mutually exclusive with --position)
         #[arg(short = 'i', long, conflicts_with = "position")]
         id: bool,
         /// Interpret the value as tab position (default, 1-based)
@@ -117,9 +117,9 @@ enum ScratchpadAction {
     List {
         /// Only list specific scratchpads by name
         names: Vec<String>,
-        /// Filter to a specific tab by stable tab ID
+        /// Filter to a specific tab by tab ID
         #[arg(long = "tab")]
-        tab_id: Option<u64>,
+        tab_id: Option<usize>,
         /// Include full pane info for each instance
         #[arg(long)]
         full: bool,
@@ -172,7 +172,7 @@ struct SubscribeInitSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pane_ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tab_ids: Option<Vec<u64>>,
+    tab_ids: Option<Vec<usize>>,
 }
 
 fn build_subscribe_init_json(
@@ -180,7 +180,7 @@ fn build_subscribe_init_json(
     events: &[SubscribeEventKind],
     pane_ids: &[u32],
     plugin_pane_ids: &[u32],
-    tab_ids: &[u64],
+    tab_ids: &[usize],
 ) -> String {
     let typed_pane_ids: Vec<String> = pane_ids
         .iter()
@@ -279,7 +279,7 @@ fn subscribe(
     events: Vec<SubscribeEventKind>,
     pane_ids: Vec<u32>,
     plugin_pane_ids: Vec<u32>,
-    tab_ids: Vec<u64>,
+    tab_ids: Vec<usize>,
     session: Option<&str>,
 ) -> std::io::Result<()> {
     let pipe_name = format!("zellij-tools-events-{}", uuid::Uuid::new_v4());
@@ -481,7 +481,7 @@ fn subscribe(
 fn scratchpad_list(
     plugin: &str,
     names: Vec<String>,
-    tab_id: Option<u64>,
+    tab_id: Option<usize>,
     full: bool,
     session: Option<&str>,
 ) -> std::io::Result<()> {

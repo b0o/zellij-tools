@@ -6,10 +6,10 @@ use std::path::PathBuf;
 /// Uses Vec instead of HashMap because JSON keys must be strings.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PersistedState {
-    /// (scratchpad_name, stable_tab_id) -> pane_id
-    pub panes: Vec<((String, u64), u32)>,
-    /// (scratchpad_name, stable_tab_id) -> last focus timestamp
-    pub focus_times: Vec<((String, u64), u64)>,
+    /// (scratchpad_name, tab_id) -> pane_id
+    pub panes: Vec<((String, usize), u32)>,
+    /// (scratchpad_name, tab_id) -> last focus timestamp
+    pub focus_times: Vec<((String, usize), u64)>,
     /// Monotonic counter for focus tracking
     pub focus_counter: u64,
 }

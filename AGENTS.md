@@ -48,10 +48,9 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 
 - `src/main.rs` - Plugin entrypoint, permission/event subscriptions, pipe routing, config watch loop
 - `src/message.rs` - Parses payloads and validates plugin prefix/format
-- `src/focus.rs` - `focus-tab` target parsing (`position` and stable `id` forms)
+- `src/focus.rs` - `focus-tab` target parsing (`position` and `id` forms)
 - `src/scratchpad/` - Scratchpad actions, config parsing, persistence/reconciliation
-- `src/stable_tabs.rs` - Stable tab identity tracking across tab moves/reorders
-- `src/tree.rs` - Session tree snapshot serialization (tabs/panes/stable IDs)
+- `src/tree.rs` - Session tree snapshot serialization (tabs/panes/tab IDs)
 - `src/events.rs` - Subscription state machine and pane/tab event diffing
 - `src/config.rs` - WASI-safe env/config path resolution via `/host/proc/self/environ`
 - `cli/src/main.rs` - User CLI (`focus`, `scratchpad`, `subscribe`, `tree`) and heartbeat-driven stream client
@@ -62,7 +61,7 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 
 **External Config Hot-Reload**: Scratchpad definitions can be loaded from an external KDL file that is polled for changes. Inline and external configs are merged; external entries override inline entries with the same scratchpad name.
 
-**Focus Helpers**: Focus pane by typed pane ID (`terminal_N` / `plugin_N`) and focus tab by position or stable tab ID.
+**Focus Helpers**: Focus pane by typed pane ID (`terminal_N` / `plugin_N`) and focus tab by position or Zellij's native tab ID.
 
 **Event Subscription + Tree API**: Subscribe to pane/tab lifecycle/focus events (compact or full mode) and query a full JSON session tree snapshot.
 
@@ -77,7 +76,7 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 - `focus-pane::<pane_id>` where `pane_id` parses as Zellij `PaneId` (eg `terminal_2`, `plugin_7`)
 - `focus-tab::<position>` (short form)
 - `focus-tab::position::<n>`
-- `focus-tab::id::<stable_id>`
+- `focus-tab::id::<tab_id>`
 - `scratchpad::toggle[::<name>]`
 - `scratchpad::show::<name>`
 - `scratchpad::hide::<name>`

@@ -4,14 +4,13 @@ use serde::Serialize;
 use zellij_tile::prelude::PaneInfo;
 
 use super::ScratchpadManager;
-use crate::stable_tabs::StableTabId;
 
 /// Query parameters for scratchpad list.
 pub struct ScratchpadListQuery {
     /// Only include scratchpads with these names (empty = all).
     pub names: Vec<String>,
     /// Only include instances on this tab (None = all tabs).
-    pub tab_id: Option<StableTabId>,
+    pub tab_id: Option<usize>,
     /// Include full pane info for each instance.
     pub full: bool,
 }
@@ -29,7 +28,7 @@ pub struct ScratchpadListEntry {
 /// Info about a scratchpad instance on a specific tab.
 #[derive(Debug, Serialize)]
 pub struct ScratchpadInstanceInfo {
-    pub tab_id: u64,
+    pub tab_id: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_position: Option<usize>,
     pub pane_id: u32,
@@ -89,7 +88,7 @@ impl ScratchpadManager {
         &self,
         query: &ScratchpadListQuery,
         pane_manifest: &HashMap<usize, Vec<PaneInfo>>,
-        stable_tab_to_position: &HashMap<StableTabId, usize>,
+        tab_id_to_position: &HashMap<usize, usize>,
     ) -> Vec<ScratchpadListEntry> {
         // Build a lookup: pane_id -> &PaneInfo (across all tabs)
         let pane_lookup: HashMap<u32, &PaneInfo> = pane_manifest
@@ -98,8 +97,8 @@ impl ScratchpadManager {
             .map(|p| (p.id, p))
             .collect();
 
-        // Build reverse lookup: stable_tab_id -> tab_position
-        let position_lookup = stable_tab_to_position;
+        // Build reverse lookup: tab_id -> tab_position
+        let position_lookup = tab_id_to_position;
 
         let name_filter: Option<std::collections::HashSet<&str>> = if query.names.is_empty() {
             None
@@ -169,10 +168,10 @@ impl ScratchpadManager {
     fn build_instances(
         &self,
         name: &str,
-        tab_filter: Option<StableTabId>,
+        tab_filter: Option<usize>,
         full: bool,
         pane_lookup: &HashMap<u32, &PaneInfo>,
-        position_lookup: &HashMap<StableTabId, usize>,
+        position_lookup: &HashMap<usize, usize>,
     ) -> Vec<ScratchpadInstanceInfo> {
         let Some(tab_panes) = self.panes.get(name) else {
             return Vec::new();
@@ -180,16 +179,16 @@ impl ScratchpadManager {
 
         tab_panes
             .iter()
-            .filter(|(&stable_id, _)| tab_filter.is_none() || tab_filter == Some(stable_id))
-            .map(|(&stable_id, &pane_id)| {
+            .filter(|(&tab_id, _)| tab_filter.is_none() || tab_filter == Some(tab_id))
+            .map(|(&tab_id, &pane_id)| {
                 let pane_info = pane_lookup.get(&pane_id);
                 let visible = pane_info
                     .map(|p| p.is_floating && !p.is_suppressed && !p.exited && !p.is_held)
                     .unwrap_or(false);
 
                 ScratchpadInstanceInfo {
-                    tab_id: stable_id,
-                    tab_position: position_lookup.get(&stable_id).copied(),
+                    tab_id,
+                    tab_position: position_lookup.get(&tab_id).copied(),
                     pane_id,
                     visible,
                     pane: if full {
@@ -205,11 +204,11 @@ impl ScratchpadManager {
     fn build_orphaned_instances(
         &self,
         name: &str,
-        _orphaned_tabs: &std::collections::HashSet<StableTabId>,
-        tab_filter: Option<StableTabId>,
+        _orphaned_tabs: &std::collections::HashSet<usize>,
+        tab_filter: Option<usize>,
         full: bool,
         pane_lookup: &HashMap<u32, &PaneInfo>,
-        position_lookup: &HashMap<StableTabId, usize>,
+        position_lookup: &HashMap<usize, usize>,
     ) -> Vec<ScratchpadInstanceInfo> {
         // Orphaned scratchpads still have entries in self.panes
         self.build_instances(name, tab_filter, full, pane_lookup, position_lookup)
@@ -291,7 +290,7 @@ mod tests {
 
         let mut manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
         manifest.insert(0, vec![make_pane_info(42, true, false)]);
-        let positions = HashMap::from([(1_u64, 0_usize)]);
+        let positions = HashMap::from([(1_usize, 0_usize)]);
 
         let query = ScratchpadListQuery {
             names: vec![],
@@ -319,7 +318,7 @@ mod tests {
 
         let mut manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
         manifest.insert(0, vec![make_pane_info(42, true, true)]); // suppressed
-        let positions = HashMap::from([(1_u64, 0_usize)]);
+        let positions = HashMap::from([(1_usize, 0_usize)]);
 
         let query = ScratchpadListQuery {
             names: vec![],
@@ -367,7 +366,7 @@ mod tests {
         let mut manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
         manifest.insert(0, vec![make_pane_info(42, true, false)]);
         manifest.insert(1, vec![make_pane_info(99, true, false)]);
-        let positions = HashMap::from([(1_u64, 0_usize), (2_u64, 1_usize)]);
+        let positions = HashMap::from([(1_usize, 0_usize), (2_usize, 1_usize)]);
 
         let query = ScratchpadListQuery {
             names: vec![],
@@ -393,7 +392,7 @@ mod tests {
         pane.title = "my terminal".to_string();
         let mut manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
         manifest.insert(0, vec![pane]);
-        let positions = HashMap::from([(1_u64, 0_usize)]);
+        let positions = HashMap::from([(1_usize, 0_usize)]);
 
         let query = ScratchpadListQuery {
             names: vec![],
