@@ -26,6 +26,9 @@ pub struct TabNode {
     pub are_floating_panes_visible: bool,
     pub active_swap_layout_name: Option<String>,
     pub is_swap_layout_dirty: bool,
+    pub tab_id: usize,
+    pub has_bell_notification: bool,
+    pub is_flashing_bell: bool,
 
     // Nested panes
     pub tiled_panes: Vec<PaneNode>,
@@ -57,6 +60,8 @@ pub struct PaneNode {
     pub terminal_command: Option<String>,
     pub plugin_url: Option<String>,
     pub is_selectable: bool,
+    pub default_fg: Option<String>,
+    pub default_bg: Option<String>,
 }
 
 /// Build a session tree from the current plugin state.
@@ -99,6 +104,8 @@ pub fn build_tree(
                         terminal_command: pane.terminal_command.clone(),
                         plugin_url: pane.plugin_url.clone(),
                         is_selectable: pane.is_selectable,
+                        default_fg: pane.default_fg.clone(),
+                        default_bg: pane.default_bg.clone(),
                     };
                     if pane.is_floating {
                         floating_panes.push(node);
@@ -119,6 +126,9 @@ pub fn build_tree(
                 are_floating_panes_visible: tab.are_floating_panes_visible,
                 active_swap_layout_name: tab.active_swap_layout_name.clone(),
                 is_swap_layout_dirty: tab.is_swap_layout_dirty,
+                tab_id: tab.tab_id,
+                has_bell_notification: tab.has_bell_notification,
+                is_flashing_bell: tab.is_flashing_bell,
                 tiled_panes,
                 floating_panes,
             }
@@ -149,6 +159,9 @@ mod tests {
                 are_floating_panes_visible: false,
                 active_swap_layout_name: None,
                 is_swap_layout_dirty: false,
+                tab_id: 0,
+                has_bell_notification: false,
+                is_flashing_bell: false,
                 tiled_panes: vec![PaneNode {
                     id: 0,
                     is_plugin: false,
@@ -172,6 +185,8 @@ mod tests {
                     terminal_command: Some("zsh".to_string()),
                     plugin_url: None,
                     is_selectable: true,
+                    default_fg: None,
+                    default_bg: None,
                 }],
                 floating_panes: vec![],
             }],

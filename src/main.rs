@@ -170,6 +170,7 @@ impl State {
                         coordinates.width,
                         coordinates.height,
                         None,
+                        None,
                     );
                     open_command_pane_floating(command, coords, BTreeMap::new());
                 }
@@ -184,6 +185,7 @@ impl State {
                             resolved.width,
                             resolved.height,
                             None,
+                            None,
                         );
                         if let Some(coords) = coords {
                             change_floating_panes_coordinates(vec![(
@@ -192,7 +194,7 @@ impl State {
                             )]);
                         }
                     }
-                    show_pane_with_id(PaneId::Terminal(pane_id), true);
+                    show_pane_with_id(PaneId::Terminal(pane_id), true, true);
                 }
                 ScratchpadCommand::HidePane { pane_id } => {
                     hide_pane_with_id(PaneId::Terminal(pane_id));
@@ -247,7 +249,7 @@ impl State {
                     }
                 }
 
-                show_pane_with_id(pane_id, true);
+                show_pane_with_id(pane_id, true, true);
                 Ok(())
             }
             "focus-tab" => {
