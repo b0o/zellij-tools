@@ -156,12 +156,14 @@ impl State {
         }
     }
 
-    fn execute_scratchpad_commands(&self, commands: Vec<ScratchpadCommand>) {
+    fn execute_scratchpad_commands(&mut self, commands: Vec<ScratchpadCommand>) {
         for cmd in commands {
             match cmd {
                 ScratchpadCommand::OpenFloating {
                     command,
                     coordinates,
+                    name,
+                    tab_id,
                 } => {
                     let coords = FloatingPaneCoordinates::new(
                         coordinates.x,
@@ -171,7 +173,22 @@ impl State {
                         None,
                         None,
                     );
-                    open_command_pane_floating(command, coords, BTreeMap::new());
+                    let opened = open_command_pane_floating(command, coords, BTreeMap::new());
+                    if let Some(PaneId::Terminal(pane_id)) = opened {
+                        if let Some(ref mut mgr) = self.scratchpad {
+                            let register_cmds = mgr.register_pane(&name, tab_id, pane_id);
+                            // register_pane only returns RenamePane commands, execute them directly
+                            for register_cmd in register_cmds {
+                                if let ScratchpadCommand::RenamePane {
+                                    pane_id,
+                                    name: title,
+                                } = register_cmd
+                                {
+                                    rename_terminal_pane(pane_id, &title);
+                                }
+                            }
+                        }
+                    }
                 }
                 ScratchpadCommand::ShowPane {
                     pane_id,
@@ -200,16 +217,6 @@ impl State {
                 }
                 ScratchpadCommand::ClosePane { pane_id } => {
                     close_terminal_pane(pane_id);
-                }
-                ScratchpadCommand::MovePaneToTab {
-                    pane_id,
-                    tab_position,
-                } => {
-                    break_panes_to_tab_with_index(
-                        &[PaneId::Terminal(pane_id)],
-                        tab_position,
-                        false,
-                    );
                 }
                 ScratchpadCommand::RenamePane { pane_id, name } => {
                     rename_terminal_pane(pane_id, &name);

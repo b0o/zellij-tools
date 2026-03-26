@@ -15,10 +15,14 @@ use zellij_tile::prelude::{CommandToRun, PaneInfo};
 /// Commands returned by ScratchpadManager for the caller to execute
 #[derive(Debug)]
 pub enum ScratchpadCommand {
-    /// Open a new floating pane with the given command and resolved coordinates
+    /// Open a new floating pane with the given command and resolved coordinates.
+    /// Carries the scratchpad `name` and `tab_id` so the caller can register
+    /// the pane once `open_command_pane_floating` returns the `PaneId`.
     OpenFloating {
         command: CommandToRun,
         coordinates: ResolvedCoordinates,
+        name: String,
+        tab_id: usize,
     },
     /// Show a pane (make visible and focus), optionally re-applying coordinates
     ShowPane {
@@ -29,8 +33,7 @@ pub enum ScratchpadCommand {
     HidePane { pane_id: u32 },
     /// Close a pane
     ClosePane { pane_id: u32 },
-    /// Move a pane to a different tab
-    MovePaneToTab { pane_id: u32, tab_position: usize },
+
     /// Rename a pane (set its title in the Zellij UI)
     RenamePane { pane_id: u32, name: String },
 }
@@ -53,8 +56,6 @@ pub struct ScratchpadManager {
     configs: HashMap<String, ScratchpadConfig>,
     /// name -> (tab_id -> pane_id)
     panes: HashMap<String, HashMap<usize, u32>>,
-    /// Pending registrations: (name, tab_id)
-    pending: HashSet<(String, usize)>,
     /// Monotonic counter for focus tracking
     focus_counter: u64,
     /// name -> (tab_id -> last focus timestamp)
@@ -71,7 +72,6 @@ impl ScratchpadManager {
         Self {
             configs,
             panes: HashMap::new(),
-            pending: HashSet::new(),
             focus_counter: 0,
             focus_times: HashMap::new(),
             just_shown: None,
@@ -239,9 +239,6 @@ impl ScratchpadManager {
             ScratchpadAction::Show { name } => self.handle_show(&name, ctx),
             ScratchpadAction::Hide { name } => self.handle_hide(&name, ctx),
             ScratchpadAction::Close { name } => self.handle_close(&name, ctx),
-            ScratchpadAction::Register { name, pane_id } => {
-                self.handle_register(&name, pane_id, ctx)
-            }
         }
     }
 
@@ -279,10 +276,6 @@ impl ScratchpadManager {
 
         // Close exited scratchpads and clean up closed panes in a single pass
         commands.extend(self.cleanup_panes(ctx));
-
-        // Clean up pending registrations for orphaned tabs
-        self.pending
-            .retain(|(_, stable_id)| !orphaned_tabs.contains(stable_id));
 
         // Close scratchpads for orphaned tabs
         commands.extend(self.close_orphaned_scratchpads(orphaned_tabs));
@@ -351,17 +344,18 @@ impl ScratchpadManager {
         let existing_pane_id = self.get_pane(name, ctx);
 
         if existing_pane_id.is_none() {
-            let pending_key = (name.to_string(), tab_id);
-            if self.pending.contains(&pending_key) {
-                return Vec::new();
+            let program = &config.command[0];
+            let args: Vec<String> = config.command[1..].to_vec();
+            let mut cmd = CommandToRun::new_with_args(program, args);
+            if let Some(ref cwd) = config.cwd {
+                cmd.cwd = Some(std::path::PathBuf::from(cwd));
             }
-
-            self.pending.insert(pending_key);
-            let cmd = self.build_shim_command(name, &config);
             let coordinates = config.resolve_coordinates(ctx.viewport_cols, ctx.viewport_rows);
             return vec![ScratchpadCommand::OpenFloating {
                 command: cmd,
                 coordinates,
+                name: name.to_string(),
+                tab_id,
             }];
         }
 
@@ -414,57 +408,20 @@ impl ScratchpadManager {
         }
     }
 
-    fn handle_register(
+    /// Register a pane that was just opened for a scratchpad.
+    /// Called by the plugin after `open_command_pane_floating` returns the `PaneId`.
+    pub fn register_pane(
         &mut self,
         name: &str,
+        tab_id: usize,
         pane_id: u32,
-        ctx: &ScratchpadContext,
     ) -> Vec<ScratchpadCommand> {
-        let mut commands = Vec::new();
-
-        let pane_tab_position = self.get_pane_tab(pane_id, ctx);
-
-        // Find which tab ID this pane was intended for
-        let intended_tab_id = self
-            .pending
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, tab_id)| *tab_id);
-
-        let target_tab_id = intended_tab_id.or(ctx.current_tab_id);
-        let Some(tab_id) = target_tab_id else {
-            return commands;
-        };
-
-        self.pending.remove(&(name.to_string(), tab_id));
-
-        let target_tab_position = ctx.tab_id_to_position.get(&tab_id).copied();
-
-        // Move pane if on wrong tab
-        if let (Some(actual_tab), Some(target_tab)) = (pane_tab_position, target_tab_position) {
-            if actual_tab != target_tab {
-                commands.push(ScratchpadCommand::MovePaneToTab {
-                    pane_id,
-                    tab_position: target_tab,
-                });
-            }
-        }
-
-        // Rename pane: use configured title, or fall back to scratchpad name
-        let title = self
-            .configs
-            .get(name)
-            .and_then(|c| c.title.clone())
-            .unwrap_or_else(|| name.to_string());
-        commands.push(ScratchpadCommand::RenamePane {
-            pane_id,
-            name: title,
-        });
-
+        // Record the mapping
         self.panes
             .entry(name.to_string())
             .or_default()
             .insert(tab_id, pane_id);
+
         self.just_shown = Some(pane_id);
         self.focus_counter += 1;
         self.focus_times
@@ -472,16 +429,17 @@ impl ScratchpadManager {
             .or_default()
             .insert(tab_id, self.focus_counter);
 
-        // Re-hide any floating panes that should be hidden
-        for hidden_pane_id in self.get_hidden_floating_pane_ids(ctx) {
-            if hidden_pane_id != pane_id {
-                commands.push(ScratchpadCommand::HidePane {
-                    pane_id: hidden_pane_id,
-                });
-            }
-        }
+        // Rename pane: use configured title, or fall back to scratchpad name
+        let title = self
+            .configs
+            .get(name)
+            .and_then(|c| c.title.clone())
+            .unwrap_or_else(|| name.to_string());
 
-        commands
+        vec![ScratchpadCommand::RenamePane {
+            pane_id,
+            name: title,
+        }]
     }
 
     fn show_pane(
@@ -519,26 +477,6 @@ impl ScratchpadManager {
         commands
     }
 
-    fn build_shim_command(&self, name: &str, config: &ScratchpadConfig) -> CommandToRun {
-        let register_msg = format!(
-            r#"zellij pipe "zellij-tools::scratchpad::register::{}::$ZELLIJ_PANE_ID""#,
-            name
-        );
-
-        let mut args = vec![
-            "-c".to_string(),
-            format!(r#"{} && exec "$@""#, register_msg),
-            "_".to_string(),
-        ];
-        args.extend(config.command.clone());
-
-        let mut cmd = CommandToRun::new_with_args("sh", args);
-        if let Some(ref cwd) = config.cwd {
-            cmd.cwd = Some(std::path::PathBuf::from(cwd));
-        }
-        cmd
-    }
-
     fn get_pane(&self, name: &str, ctx: &ScratchpadContext) -> Option<u32> {
         let tab_id = ctx.current_tab_id?;
         self.panes.get(name)?.get(&tab_id).copied()
@@ -555,13 +493,6 @@ impl ScratchpadManager {
             })
             .find(|(_, _, pid)| *pid == terminal_pane_id)
             .map(|(name, stable_id, _)| (name, stable_id))
-    }
-
-    fn get_pane_tab(&self, pane_id: u32, ctx: &ScratchpadContext) -> Option<usize> {
-        ctx.pane_manifest
-            .iter()
-            .find(|(_, panes)| panes.iter().any(|p| p.id == pane_id))
-            .map(|(tab, _)| *tab)
     }
 
     fn get_hidden_floating_pane_ids(&self, ctx: &ScratchpadContext) -> HashSet<u32> {
@@ -877,13 +808,7 @@ mod tests {
         positions.insert(0, 0);
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
 
         // Now show it
         let commands = manager.handle_action(
@@ -908,13 +833,7 @@ mod tests {
         positions.insert(0, 0);
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
 
         let commands = manager.handle_action(
             ScratchpadAction::Hide {
@@ -940,13 +859,7 @@ mod tests {
         positions.insert(0, 0);
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
 
         let commands = manager.handle_action(
             ScratchpadAction::Close {
@@ -975,13 +888,7 @@ mod tests {
         positions.insert(0, 0);
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
         manager.clear_just_shown(); // Simulate PaneUpdate
 
         let commands = manager.handle_action(
@@ -1006,13 +913,7 @@ mod tests {
         positions.insert(0, 0);
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
 
         let commands = manager.handle_action(
             ScratchpadAction::Toggle {
@@ -1035,15 +936,8 @@ mod tests {
         manifest.insert(0, vec![make_floating_pane(42, true)]);
         let mut positions = HashMap::new();
         positions.insert(0, 0);
-        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
 
         // Pane has exited
         let mut exited_pane = make_floating_pane(42, false);
@@ -1068,13 +962,7 @@ mod tests {
         positions.insert(0, 0);
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
 
         // Tab 0 is now orphaned
         let mut orphaned = HashSet::new();
@@ -1097,24 +985,10 @@ mod tests {
         let mut positions = HashMap::new();
         positions.insert(0, 0);
         positions.insert(1, 1);
-        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
         // Register two scratchpads
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
-        let ctx = make_context(&manifest, 1, Some(1), true, &positions);
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "htop".to_string(),
-                pane_id: 99,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
+        manager.register_pane("htop", 1, 99);
 
         // Get persisted state
         let state = manager.persisted_state();
@@ -1172,20 +1046,8 @@ mod tests {
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
         // Register both
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "htop".to_string(),
-                pane_id: 99,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
+        manager.register_pane("htop", 0, 99);
 
         // Reconcile with config that only has "term"
         let commands = manager.reconcile_config(make_configs(&["term"]));
@@ -1218,13 +1080,7 @@ mod tests {
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
         // Register htop
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "htop".to_string(),
-                pane_id: 99,
-            },
-            &ctx,
-        );
+        manager.register_pane("htop", 0, 99);
 
         // Remove htop from config (orphan it)
         manager.reconcile_config(make_configs(&["term"]));
@@ -1252,15 +1108,8 @@ mod tests {
         manifest.insert(0, vec![make_floating_pane(42, true)]);
         let mut positions = HashMap::new();
         positions.insert(0, 0);
-        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
 
         // Pane 42 is gone from manifest entirely (closed externally)
         let empty_manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
@@ -1292,15 +1141,8 @@ mod tests {
         manifest.insert(0, vec![make_floating_pane(42, true)]);
         let mut positions = HashMap::new();
         positions.insert(0, 0);
-        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
 
         // Pane is now held (e.g. command exited with exit-on-close disabled)
         let mut held_pane = make_floating_pane(42, false);
@@ -1331,19 +1173,7 @@ mod tests {
         let configs = HashMap::from([("term".to_string(), config)]);
         let mut manager = ScratchpadManager::new(configs);
 
-        let mut manifest = HashMap::new();
-        manifest.insert(0, vec![make_floating_pane(42, true)]);
-        let mut positions = HashMap::new();
-        positions.insert(0, 0);
-        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
-
-        let commands = manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        let commands = manager.register_pane("term", 0, 42);
 
         assert!(
             commands.iter().any(
@@ -1357,19 +1187,7 @@ mod tests {
     fn register_without_title_uses_scratchpad_name() {
         let mut manager = ScratchpadManager::new(make_configs(&["term"]));
 
-        let mut manifest = HashMap::new();
-        manifest.insert(0, vec![make_floating_pane(42, true)]);
-        let mut positions = HashMap::new();
-        positions.insert(0, 0);
-        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
-
-        let commands = manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        let commands = manager.register_pane("term", 0, 42);
 
         assert!(
             commands.iter().any(
@@ -1422,13 +1240,7 @@ mod tests {
         positions.insert(0, 0);
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
         manager.clear_just_shown();
 
         // focus-pane for a scratchpad should return show commands
@@ -1473,13 +1285,7 @@ mod tests {
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
         // Register htop
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "htop".to_string(),
-                pane_id: 99,
-            },
-            &ctx,
-        );
+        manager.register_pane("htop", 0, 99);
 
         // Remove htop from config (orphan it)
         manager.reconcile_config(make_configs(&["term"]));
@@ -1503,15 +1309,8 @@ mod tests {
         let mut positions = HashMap::new();
         positions.insert(0, 0);
         positions.insert(1, 1);
-        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        manager.handle_action(
-            ScratchpadAction::Register {
-                name: "term".to_string(),
-                pane_id: 42,
-            },
-            &ctx,
-        );
+        manager.register_pane("term", 0, 42);
         manager.clear_just_shown();
 
         // Now we're on tab 1, but focusing a scratchpad on tab 0

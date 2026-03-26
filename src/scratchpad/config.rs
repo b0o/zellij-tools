@@ -189,7 +189,6 @@ pub enum ScratchpadAction {
     Show { name: String },
     Hide { name: String },
     Close { name: String },
-    Register { name: String, pane_id: u32 },
 }
 
 /// Check if a scratchpad name is valid (alphanumeric, underscore, hyphen)
@@ -245,25 +244,6 @@ pub fn parse_scratchpad_action(args: &[&str]) -> Result<ScratchpadAction, ParseE
             }
             Ok(ScratchpadAction::Close {
                 name: name.to_string(),
-            })
-        }
-        "register" => {
-            // Format: register::<name>::<pane_id>
-            let name = args
-                .get(1)
-                .ok_or_else(|| ParseError::InvalidArgs("register requires a name".to_string()))?;
-            let pane_id_str = args.get(2).ok_or_else(|| {
-                ParseError::InvalidArgs("register requires a pane_id".to_string())
-            })?;
-            let pane_id = pane_id_str.parse::<u32>().map_err(|e| {
-                ParseError::InvalidArgs(format!("Invalid pane_id '{}': {}", pane_id_str, e))
-            })?;
-            if !is_valid_scratchpad_name(name) {
-                return Err(ParseError::InvalidScratchpadName(name.to_string()));
-            }
-            Ok(ScratchpadAction::Register {
-                name: name.to_string(),
-                pane_id,
             })
         }
         _ => Err(ParseError::InvalidArgs(format!(
@@ -505,27 +485,6 @@ mod tests {
             action,
             ScratchpadAction::Close { name } if name == "mypad"
         ));
-    }
-
-    #[test]
-    fn parse_register() {
-        let action = parse_scratchpad_action(&args(&["register", "mypad", "42"])).unwrap();
-        assert!(matches!(
-            action,
-            ScratchpadAction::Register { name, pane_id } if name == "mypad" && pane_id == 42
-        ));
-    }
-
-    #[test]
-    fn parse_register_missing_pane_id() {
-        let result = parse_scratchpad_action(&args(&["register", "mypad"]));
-        assert!(matches!(result, Err(ParseError::InvalidArgs(_))));
-    }
-
-    #[test]
-    fn parse_register_invalid_pane_id() {
-        let result = parse_scratchpad_action(&args(&["register", "mypad", "notanumber"]));
-        assert!(matches!(result, Err(ParseError::InvalidArgs(_))));
     }
 
     #[test]

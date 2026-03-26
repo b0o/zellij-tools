@@ -81,7 +81,6 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 - `scratchpad::show::<name>`
 - `scratchpad::hide::<name>`
 - `scratchpad::close::<name>`
-- `scratchpad::register::<name>::<pane_id>`
 - `subscribe` or `subscribe::full` (CLI pipes only)
 - `unsubscribe::<pipe_id>`
 - `tree` (CLI pipes only)
