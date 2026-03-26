@@ -76,9 +76,9 @@ mod tests {
 
     #[test]
     fn parse_message_with_multiple_args() {
-        let msg = parse_message("zellij-tools::scratchpad::register::mypad::123").unwrap();
+        let msg = parse_message("zellij-tools::scratchpad::toggle::mypad::123").unwrap();
         assert_eq!(msg.event, "scratchpad");
-        assert_eq!(msg.args, vec!["register", "mypad", "123"]);
+        assert_eq!(msg.args, vec!["toggle", "mypad", "123"]);
     }
 
     #[test]

@@ -214,7 +214,7 @@ Get a session tree snapshot:
 zellij-tools tree
 ```
 
-For full event formats and examples, see `docs/event-subscription-api.md`.
+For full event formats and filter options, see `zellij-tools subscribe --help`.
 
 ## Permissions
 

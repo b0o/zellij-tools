@@ -101,9 +101,9 @@ impl ScratchpadManager {
 
         for (name, inner) in &self.panes {
             if removed_names.contains(name) {
-                for (&stable_id, &pane_id) in inner {
+                for (&tab_id, &pane_id) in inner {
                     let orphaned_set = self.orphaned.get(name);
-                    if !orphaned_set.is_some_and(|s| s.contains(&stable_id)) {
+                    if !orphaned_set.is_some_and(|s| s.contains(&tab_id)) {
                         commands.push(ScratchpadCommand::ShowPane {
                             pane_id,
                             coordinates: None,
@@ -118,9 +118,9 @@ impl ScratchpadManager {
         for name in &removed_names {
             if let Some(inner) = self.panes.get(*name) {
                 let tab_ids: Vec<usize> = inner.keys().copied().collect();
-                for stable_id in tab_ids {
+                for tab_id in tab_ids {
                     let orphaned_set = self.orphaned.entry((*name).clone()).or_default();
-                    if orphaned_set.insert(stable_id) {
+                    if orphaned_set.insert(tab_id) {
                         eprintln!(
                             "Scratchpad '{}' removed from config but has active panes",
                             name
@@ -164,7 +164,7 @@ impl ScratchpadManager {
                 .flat_map(|(name, inner)| {
                     inner
                         .iter()
-                        .map(move |(&stable_id, &pane_id)| ((name.clone(), stable_id), pane_id))
+                        .map(move |(&tab_id, &pane_id)| ((name.clone(), tab_id), pane_id))
                 })
                 .collect(),
             focus_times: self
@@ -173,7 +173,7 @@ impl ScratchpadManager {
                 .flat_map(|(name, inner)| {
                     inner
                         .iter()
-                        .map(move |(&stable_id, &time)| ((name.clone(), stable_id), time))
+                        .map(move |(&tab_id, &time)| ((name.clone(), tab_id), time))
                 })
                 .collect(),
             focus_counter: self.focus_counter,
@@ -184,18 +184,15 @@ impl ScratchpadManager {
     /// Returns commands to show orphaned panes (panes whose scratchpad names are not in current config).
     pub fn restore_state(&mut self, state: PersistedState) -> Vec<ScratchpadCommand> {
         self.panes.clear();
-        for ((name, stable_id), pane_id) in state.panes {
-            self.panes
-                .entry(name)
-                .or_default()
-                .insert(stable_id, pane_id);
+        for ((name, tab_id), pane_id) in state.panes {
+            self.panes.entry(name).or_default().insert(tab_id, pane_id);
         }
         self.focus_times.clear();
-        for ((name, stable_id), time) in state.focus_times {
+        for ((name, tab_id), time) in state.focus_times {
             self.focus_times
                 .entry(name)
                 .or_default()
-                .insert(stable_id, time);
+                .insert(tab_id, time);
         }
         self.focus_counter = state.focus_counter;
 
@@ -203,11 +200,9 @@ impl ScratchpadManager {
         let mut commands = Vec::new();
         for (name, inner) in &self.panes {
             if !self.configs.contains_key(name) {
-                for (&stable_id, &pane_id) in inner {
-                    let is_already_orphaned = self
-                        .orphaned
-                        .get(name)
-                        .is_some_and(|s| s.contains(&stable_id));
+                for (&tab_id, &pane_id) in inner {
+                    let is_already_orphaned =
+                        self.orphaned.get(name).is_some_and(|s| s.contains(&tab_id));
                     if !is_already_orphaned {
                         commands.push(ScratchpadCommand::ShowPane {
                             pane_id,
@@ -216,7 +211,7 @@ impl ScratchpadManager {
                         self.orphaned
                             .entry(name.clone())
                             .or_default()
-                            .insert(stable_id);
+                            .insert(tab_id);
                         eprintln!(
                             "Scratchpad '{}' removed from config but has active panes",
                             name
@@ -489,10 +484,10 @@ impl ScratchpadManager {
             .flat_map(|(name, inner)| {
                 inner
                     .iter()
-                    .map(move |(&stable_id, &pid)| (name.clone(), stable_id, pid))
+                    .map(move |(&tab_id, &pid)| (name.clone(), tab_id, pid))
             })
             .find(|(_, _, pid)| *pid == terminal_pane_id)
-            .map(|(name, stable_id, _)| (name, stable_id))
+            .map(|(name, tab_id, _)| (name, tab_id))
     }
 
     fn get_hidden_floating_pane_ids(&self, ctx: &ScratchpadContext) -> HashSet<u32> {
@@ -587,23 +582,23 @@ impl ScratchpadManager {
             return;
         };
 
-        // Find the (name, stable_tab_id) for the focused pane
+        // Find the (name, tab_id) for the focused pane
         let found = self
             .panes
             .iter()
             .flat_map(|(name, inner)| {
                 inner
                     .iter()
-                    .map(move |(&stable_id, &pid)| (name.clone(), stable_id, pid))
+                    .map(move |(&tab_id, &pid)| (name.clone(), tab_id, pid))
             })
             .find(|(_, _, pid)| *pid == focused.id);
 
-        if let Some((name, stable_id, _)) = found {
+        if let Some((name, tab_id, _)) = found {
             self.focus_counter += 1;
             self.focus_times
                 .entry(name)
                 .or_default()
-                .insert(stable_id, self.focus_counter);
+                .insert(tab_id, self.focus_counter);
         }
     }
 
@@ -627,7 +622,7 @@ impl ScratchpadManager {
             .flat_map(|(name, inner)| {
                 inner
                     .iter()
-                    .map(move |(&stable_id, &pane_id)| (name.clone(), stable_id, pane_id))
+                    .map(move |(&tab_id, &pane_id)| (name.clone(), tab_id, pane_id))
             })
             .filter(|(_, _, pane_id)| {
                 // Remove if exited/held OR not in manifest at all
@@ -635,25 +630,25 @@ impl ScratchpadManager {
             })
             .collect();
 
-        for (name, stable_id, pane_id) in keys_to_remove {
+        for (name, tab_id, pane_id) in keys_to_remove {
             // Only emit ClosePane for exited/held panes (still in manifest)
             if exited_pane_ids.contains(&pane_id) {
                 commands.push(ScratchpadCommand::ClosePane { pane_id });
             }
             if let Some(inner) = self.panes.get_mut(&name) {
-                inner.remove(&stable_id);
+                inner.remove(&tab_id);
                 if inner.is_empty() {
                     self.panes.remove(&name);
                 }
             }
             if let Some(inner) = self.focus_times.get_mut(&name) {
-                inner.remove(&stable_id);
+                inner.remove(&tab_id);
                 if inner.is_empty() {
                     self.focus_times.remove(&name);
                 }
             }
             if let Some(inner) = self.orphaned.get_mut(&name) {
-                inner.remove(&stable_id);
+                inner.remove(&tab_id);
                 if inner.is_empty() {
                     self.orphaned.remove(&name);
                 }
@@ -673,28 +668,28 @@ impl ScratchpadManager {
             .flat_map(|(name, inner)| {
                 inner
                     .iter()
-                    .map(move |(&stable_id, &pane_id)| (name.clone(), stable_id, pane_id))
+                    .map(move |(&tab_id, &pane_id)| (name.clone(), tab_id, pane_id))
             })
-            .filter(|(_, stable_id, _)| orphaned_tabs.contains(stable_id))
+            .filter(|(_, tab_id, _)| orphaned_tabs.contains(tab_id))
             .collect();
 
         let mut commands = Vec::new();
-        for (name, stable_id, pane_id) in orphaned_tab_panes {
+        for (name, tab_id, pane_id) in orphaned_tab_panes {
             commands.push(ScratchpadCommand::ClosePane { pane_id });
             if let Some(inner) = self.panes.get_mut(&name) {
-                inner.remove(&stable_id);
+                inner.remove(&tab_id);
                 if inner.is_empty() {
                     self.panes.remove(&name);
                 }
             }
             if let Some(inner) = self.focus_times.get_mut(&name) {
-                inner.remove(&stable_id);
+                inner.remove(&tab_id);
                 if inner.is_empty() {
                     self.focus_times.remove(&name);
                 }
             }
             if let Some(inner) = self.orphaned.get_mut(&name) {
-                inner.remove(&stable_id);
+                inner.remove(&tab_id);
                 if inner.is_empty() {
                     self.orphaned.remove(&name);
                 }
@@ -1302,7 +1297,7 @@ mod tests {
     fn focus_pane_scratchpad_on_different_tab() {
         let mut manager = ScratchpadManager::new(make_configs(&["term"]));
 
-        // Register scratchpad on tab 0 (stable id 0)
+        // Register scratchpad on tab 0 (tab id 0)
         let mut manifest = HashMap::new();
         manifest.insert(0, vec![make_floating_pane(42, true)]);
         manifest.insert(1, vec![]);

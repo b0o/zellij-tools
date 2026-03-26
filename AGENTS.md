@@ -109,7 +109,7 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 - `--event` filters by canonical event names (eg `PaneFocused`, `TabMoved`)
 - `--pane-id` filters terminal pane IDs
 - `--plugin-pane-id` filters plugin pane IDs
-- `--tab-id` filters stable tab IDs
+- `--tab-id` filters tab IDs
 - CLI converts pane ID flags to typed IDs (`terminal_N`, `plugin_N`) in init JSON
 
 ### How External Config Works

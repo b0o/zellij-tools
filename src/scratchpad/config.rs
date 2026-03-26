@@ -56,7 +56,7 @@ pub struct ScratchpadConfig {
     pub height: Option<String>,
     /// Reference point for x/y coordinates.
     pub origin: Origin,
-    /// Pane title (displayed in the Zellij UI). Applied on register.
+    /// Pane title (displayed in the Zellij UI). Applied when the pane is opened.
     pub title: Option<String>,
     /// Working directory for the command.
     pub cwd: Option<String>,

@@ -63,7 +63,7 @@ enum Commands {
         #[arg(long = "tab-id", value_delimiter = ',', num_args = 1..)]
         tab_ids: Vec<usize>,
     },
-    /// Print the session tree (tabs, panes, stable IDs) as JSON
+    /// Print the session tree (tabs, panes, tab IDs) as JSON
     Tree,
 }
 
