@@ -99,7 +99,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          draft: true
+          draft: false
           body: ${{ steps.git-cliff.outputs.content }}
           prerelease: false
           files: |
