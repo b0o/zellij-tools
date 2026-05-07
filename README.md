@@ -228,6 +228,6 @@ The plugin requires the following permissions:
 
 ## License
 
-&copy; 2025-2026 Maddison Hellstrom
+&copy; 2025-2026 Maddison Cohodas
 
 MIT License
