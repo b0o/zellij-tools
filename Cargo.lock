@@ -2927,9 +2927,9 @@ dependencies = [
 
 [[package]]
 name = "zellij-tile-utils"
-version = "0.44.0"
+version = "0.44.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "484c034187a29ac6ef013729b20f3ad0700da1b66d1c1ffe1a1339910a755c7d"
+checksum = "e83c66a72ea40614e84816673e22c4179a78ea48f8c150e6fb79b1ca68566e37"
 dependencies = [
  "ansi_term",
 ]
