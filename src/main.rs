@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 use zellij_tile::prelude::*;
@@ -11,8 +12,8 @@ use zellij_tools::events::{
 use zellij_tools::focus::{parse_focus_tab_target, FocusTabTarget};
 use zellij_tools::message::{parse_message, ParseError};
 use zellij_tools::scratchpad::{
-    parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadCommand, ScratchpadContext,
-    ScratchpadListQuery, ScratchpadManager,
+    load_state, parse_scratchpad_action, parse_scratchpads_kdl, save_state, ScratchpadCommand,
+    ScratchpadConfig, ScratchpadContext, ScratchpadListQuery, ScratchpadManager,
 };
 use zellij_tools::tree;
 
@@ -34,6 +35,9 @@ struct State {
     scratchpad: Option<ScratchpadManager>,
     event_stream: EventStream,
 
+    // Zellij server identity, used for cross-client scratchpad state.
+    zellij_pid: Option<u32>,
+
     // Raw include path from config (resolved after /host is mounted)
     raw_include: Option<String>,
     // User-provided config_dir override
@@ -53,6 +57,78 @@ struct State {
 register_plugin!(State);
 
 impl State {
+    fn claim_file_path(&self, pipe_name: &str) -> Option<PathBuf> {
+        let zellij_pid = self.zellij_pid?;
+        let safe_name: String = pipe_name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+
+        Some(PathBuf::from(format!(
+            "/tmp/zellij-tools-{}-pipe-{}",
+            zellij_pid, safe_name
+        )))
+    }
+
+    fn claim_cli_pipe(&self, pipe_message: &PipeMessage) -> bool {
+        if !matches!(pipe_message.source, PipeSource::Cli(_)) {
+            return true;
+        }
+
+        let Some(path) = self.claim_file_path(&pipe_message.name) else {
+            return true;
+        };
+
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .is_ok()
+    }
+
+    fn sync_scratchpad_state_from_disk(&mut self) {
+        let Some(zellij_pid) = self.zellij_pid else {
+            return;
+        };
+        let Some(ref mut scratchpad) = self.scratchpad else {
+            return;
+        };
+        if let Some(state) = load_state(zellij_pid) {
+            scratchpad.replace_persisted_state(state);
+        }
+    }
+
+    fn save_scratchpad_state_to_disk(&self) {
+        let Some(zellij_pid) = self.zellij_pid else {
+            return;
+        };
+        let Some(ref scratchpad) = self.scratchpad else {
+            return;
+        };
+        if let Err(err) = save_state(&scratchpad.persisted_state(), zellij_pid) {
+            eprintln!("Failed to save scratchpad state: {}", err);
+        }
+    }
+
+    fn new_scratchpad_manager(
+        &self,
+        configs: HashMap<String, ScratchpadConfig>,
+    ) -> ScratchpadManager {
+        let mut manager = ScratchpadManager::new(configs);
+        if let Some(zellij_pid) = self.zellij_pid {
+            if let Some(state) = load_state(zellij_pid) {
+                manager.restore_state(state);
+            }
+        }
+        manager
+    }
+
     fn current_event_context(&self) -> (Vec<EventPaneInfo>, Vec<EventTabInfo>) {
         let event_panes: Vec<EventPaneInfo> = self
             .pane_manifest
@@ -157,6 +233,7 @@ impl State {
     }
 
     fn execute_scratchpad_commands(&mut self, commands: Vec<ScratchpadCommand>) {
+        let should_save = !commands.is_empty();
         for cmd in commands {
             match cmd {
                 ScratchpadCommand::OpenFloating {
@@ -223,11 +300,18 @@ impl State {
                 }
             }
         }
+        if should_save {
+            self.save_scratchpad_state_to_disk();
+        }
     }
 
     fn handle_event(&mut self, pipe_message: &PipeMessage) -> Result<(), ParseError> {
         let payload = pipe_message.payload.as_deref().unwrap_or("");
         let message = parse_message(payload)?;
+
+        if !self.claim_cli_pipe(pipe_message) {
+            return Ok(());
+        }
 
         match message.event {
             "focus-pane" => {
@@ -244,6 +328,7 @@ impl State {
 
                 // If the pane is a scratchpad, use show logic to ensure correct size/position
                 if let PaneId::Terminal(terminal_id) = pane_id {
+                    self.sync_scratchpad_state_from_disk();
                     if let Some(mut scratchpad) = self.scratchpad.take() {
                         let ctx = self.build_scratchpad_context();
                         let result = scratchpad.handle_focus_pane(terminal_id, &ctx);
@@ -315,6 +400,7 @@ impl State {
                     full,
                 };
 
+                self.sync_scratchpad_state_from_disk();
                 let entries = if let Some(ref scratchpad) = self.scratchpad {
                     scratchpad.list(&query, &self.pane_manifest, &self.tab_id_to_position)
                 } else {
@@ -327,6 +413,7 @@ impl State {
             }
             "scratchpad" => {
                 let action = parse_scratchpad_action(&message.args)?;
+                self.sync_scratchpad_state_from_disk();
                 if let Some(mut scratchpad) = self.scratchpad.take() {
                     let ctx = self.build_scratchpad_context();
                     let commands = scratchpad.handle_action(action, &ctx);
@@ -394,6 +481,8 @@ impl State {
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.zellij_pid = Some(get_plugin_ids().zellij_pid);
+
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -431,7 +520,7 @@ impl ZellijPlugin for State {
         // Load inline configs immediately (external will load when HostFolderChanged arrives)
         if let Some(ref inline_kdl) = self.inline_scratchpads_kdl {
             if let Ok(configs) = parse_scratchpads_kdl(inline_kdl) {
-                self.scratchpad = Some(ScratchpadManager::new(configs));
+                self.scratchpad = Some(self.new_scratchpad_manager(configs));
             }
         }
     }
@@ -504,12 +593,14 @@ impl ZellijPlugin for State {
                     .collect();
 
                 // Update scratchpad manager
+                self.sync_scratchpad_state_from_disk();
                 if let Some(mut scratchpad) = self.scratchpad.take() {
                     scratchpad.clear_just_shown();
                     let ctx = self.build_scratchpad_context();
                     let commands = scratchpad.on_pane_update(&ctx, &orphaned_tabs);
                     self.scratchpad = Some(scratchpad);
                     self.execute_scratchpad_commands(commands);
+                    self.save_scratchpad_state_to_disk();
                 }
             }
             Event::TabUpdate(tab_infos) => {
@@ -583,7 +674,7 @@ impl ZellijPlugin for State {
                         let commands = scratchpad.reconcile_config(configs);
                         self.execute_scratchpad_commands(commands);
                     } else if !configs.is_empty() {
-                        self.scratchpad = Some(ScratchpadManager::new(configs));
+                        self.scratchpad = Some(self.new_scratchpad_manager(configs));
                     }
 
                     // Start polling timer if watching is enabled
@@ -619,7 +710,7 @@ impl ZellijPlugin for State {
                                 let commands = scratchpad.reconcile_config(new_configs);
                                 self.execute_scratchpad_commands(commands);
                             } else if !new_configs.is_empty() {
-                                self.scratchpad = Some(ScratchpadManager::new(new_configs));
+                                self.scratchpad = Some(self.new_scratchpad_manager(new_configs));
                             }
                         }
                     }

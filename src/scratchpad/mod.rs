@@ -183,18 +183,7 @@ impl ScratchpadManager {
     /// Restore state from a previous session.
     /// Returns commands to show orphaned panes (panes whose scratchpad names are not in current config).
     pub fn restore_state(&mut self, state: PersistedState) -> Vec<ScratchpadCommand> {
-        self.panes.clear();
-        for ((name, tab_id), pane_id) in state.panes {
-            self.panes.entry(name).or_default().insert(tab_id, pane_id);
-        }
-        self.focus_times.clear();
-        for ((name, tab_id), time) in state.focus_times {
-            self.focus_times
-                .entry(name)
-                .or_default()
-                .insert(tab_id, time);
-        }
-        self.focus_counter = state.focus_counter;
+        self.replace_persisted_state(state);
 
         // Detect orphaned scratchpads - panes whose names aren't in current config
         let mut commands = Vec::new();
@@ -221,6 +210,26 @@ impl ScratchpadManager {
             }
         }
         commands
+    }
+
+    /// Replace volatile pane/focus mappings from shared persisted state.
+    ///
+    /// This is used when multiple plugin instances are attached to one Zellij
+    /// server: any instance may receive the next pipe message, so it needs the
+    /// scratchpad registrations created by previous instances.
+    pub fn replace_persisted_state(&mut self, state: PersistedState) {
+        self.panes.clear();
+        for ((name, tab_id), pane_id) in state.panes {
+            self.panes.entry(name).or_default().insert(tab_id, pane_id);
+        }
+        self.focus_times.clear();
+        for ((name, tab_id), time) in state.focus_times {
+            self.focus_times
+                .entry(name)
+                .or_default()
+                .insert(tab_id, time);
+        }
+        self.focus_counter = state.focus_counter;
     }
 
     /// Handle a scratchpad action, returns commands to execute
@@ -1025,6 +1034,38 @@ mod tests {
             commands[0],
             ScratchpadCommand::ShowPane { pane_id: 99, .. }
         ));
+    }
+
+    #[test]
+    fn replace_persisted_state_updates_existing_manager() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        manager.register_pane("term", 0, 41);
+        manager.replace_persisted_state(PersistedState {
+            panes: vec![(("term".to_string(), 0), 42)],
+            focus_times: vec![(("term".to_string(), 0), 7)],
+            focus_counter: 7,
+        });
+
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Toggle {
+                name: Some("term".to_string()),
+            },
+            &ctx,
+        );
+
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, ScratchpadCommand::HidePane { pane_id: 42 })));
+        assert!(!commands
+            .iter()
+            .any(|c| matches!(c, ScratchpadCommand::OpenFloating { .. })));
     }
 
     #[test]
