@@ -63,9 +63,9 @@ struct State {
 register_plugin!(State);
 
 impl State {
-    fn claim_file_path(&self, pipe_name: &str) -> Option<PathBuf> {
+    fn claim_file_path(&self, pipe_id: &str) -> Option<PathBuf> {
         let zellij_pid = self.zellij_pid?;
-        let safe_name: String = pipe_name
+        let safe_pipe_id: String = pipe_id
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -78,7 +78,7 @@ impl State {
 
         Some(PathBuf::from(format!(
             "/tmp/zellij-tools-{}-pipe-{}",
-            zellij_pid, safe_name
+            zellij_pid, safe_pipe_id
         )))
     }
 
@@ -91,8 +91,12 @@ impl State {
             return false;
         }
 
-        let Some(path) = self.claim_file_path(&pipe_message.name) else {
+        let PipeSource::Cli(ref pipe_id) = pipe_message.source else {
             return true;
+        };
+
+        let Some(path) = self.claim_file_path(pipe_id) else {
+            return false;
         };
 
         OpenOptions::new()
