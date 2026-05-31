@@ -17,6 +17,8 @@ use zellij_tools::scratchpad::{
 };
 use zellij_tools::tree;
 
+const CLIENT_LIST_REFRESH_SECONDS: f64 = 2.0;
+
 #[derive(Default)]
 struct State {
     // Pane tracking (from PaneUpdate events)
@@ -37,6 +39,8 @@ struct State {
 
     // Zellij server identity, used for cross-client scratchpad state.
     zellij_pid: Option<u32>,
+    own_client_id: Option<ClientId>,
+    own_client_connected: bool,
 
     // Raw include path from config (resolved after /host is mounted)
     raw_include: Option<String>,
@@ -50,6 +54,8 @@ struct State {
     needs_host_mount: bool,
     // Last modified time of external config (for polling)
     config_last_modified: Option<std::time::SystemTime>,
+    // Last time external config was checked.
+    config_last_checked: Option<std::time::SystemTime>,
     // Watch interval in milliseconds (None = disabled, Some(ms) = poll interval)
     watch_interval_ms: Option<u64>,
 }
@@ -81,6 +87,10 @@ impl State {
             return true;
         }
 
+        if !self.own_client_connected {
+            return false;
+        }
+
         let Some(path) = self.claim_file_path(&pipe_message.name) else {
             return true;
         };
@@ -90,6 +100,18 @@ impl State {
             .create_new(true)
             .open(path)
             .is_ok()
+    }
+
+    fn refresh_client_list(&self) {
+        list_clients();
+    }
+
+    fn schedule_timer(&self) {
+        let seconds = self
+            .watch_interval_ms
+            .map(|ms| (ms as f64 / 1000.0).min(CLIENT_LIST_REFRESH_SECONDS))
+            .unwrap_or(CLIENT_LIST_REFRESH_SECONDS);
+        set_timeout(seconds);
     }
 
     fn sync_scratchpad_state_from_disk(&mut self) {
@@ -481,7 +503,10 @@ impl State {
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
-        self.zellij_pid = Some(get_plugin_ids().zellij_pid);
+        let plugin_ids = get_plugin_ids();
+        self.zellij_pid = Some(plugin_ids.zellij_pid);
+        self.own_client_id = Some(plugin_ids.client_id);
+        self.own_client_connected = true;
 
         request_permission(&[
             PermissionType::ReadApplicationState,
@@ -498,7 +523,11 @@ impl ZellijPlugin for State {
             EventType::FailedToChangeHostFolder,
             EventType::PermissionRequestResult,
             EventType::Timer,
+            EventType::ListClients,
         ]);
+
+        self.refresh_client_list();
+        self.schedule_timer();
 
         // Store inline scratchpads config for merging
         self.inline_scratchpads_kdl = configuration.get("scratchpads").cloned();
@@ -665,6 +694,7 @@ impl ZellijPlugin for State {
                     // Store the initial mtime for polling
                     if let Ok(metadata) = std::fs::metadata(include_path) {
                         self.config_last_modified = metadata.modified().ok();
+                        self.config_last_checked = Some(std::time::SystemTime::now());
                     }
 
                     // Load the config
@@ -678,8 +708,8 @@ impl ZellijPlugin for State {
                     }
 
                     // Start polling timer if watching is enabled
-                    if let Some(interval_ms) = self.watch_interval_ms {
-                        set_timeout(interval_ms as f64 / 1000.0);
+                    if self.watch_interval_ms.is_some() {
+                        self.schedule_timer();
                     }
                 }
             }
@@ -694,29 +724,49 @@ impl ZellijPlugin for State {
                 }
             }
             Event::Timer(_elapsed) => {
+                self.refresh_client_list();
+
                 // Check if config file has changed (only if watching is enabled)
                 if let (Some(ref include_path), Some(interval_ms)) =
                     (&self.include_path, self.watch_interval_ms)
                 {
-                    if let Ok(metadata) = std::fs::metadata(include_path) {
-                        let current_mtime = metadata.modified().ok();
-                        if current_mtime != self.config_last_modified {
-                            self.config_last_modified = current_mtime;
+                    let now = std::time::SystemTime::now();
+                    let should_check = self
+                        .config_last_checked
+                        .and_then(|last| now.duration_since(last).ok())
+                        .map(|elapsed| elapsed.as_millis() >= u128::from(interval_ms))
+                        .unwrap_or(true);
 
-                            // Reload config
-                            let new_configs = self.load_merged_configs();
+                    if should_check {
+                        self.config_last_checked = Some(now);
 
-                            if let Some(ref mut scratchpad) = self.scratchpad {
-                                let commands = scratchpad.reconcile_config(new_configs);
-                                self.execute_scratchpad_commands(commands);
-                            } else if !new_configs.is_empty() {
-                                self.scratchpad = Some(self.new_scratchpad_manager(new_configs));
+                        if let Ok(metadata) = std::fs::metadata(include_path) {
+                            let current_mtime = metadata.modified().ok();
+                            if current_mtime != self.config_last_modified {
+                                self.config_last_modified = current_mtime;
+
+                                // Reload config
+                                let new_configs = self.load_merged_configs();
+
+                                if let Some(ref mut scratchpad) = self.scratchpad {
+                                    let commands = scratchpad.reconcile_config(new_configs);
+                                    self.execute_scratchpad_commands(commands);
+                                } else if !new_configs.is_empty() {
+                                    self.scratchpad =
+                                        Some(self.new_scratchpad_manager(new_configs));
+                                }
                             }
                         }
                     }
+                }
 
-                    // Schedule next poll
-                    set_timeout(interval_ms as f64 / 1000.0);
+                self.schedule_timer();
+            }
+            Event::ListClients(clients) => {
+                if let Some(own_client_id) = self.own_client_id {
+                    self.own_client_connected = clients
+                        .iter()
+                        .any(|client| client.client_id == own_client_id && client.is_current_client);
                 }
             }
             _ => (),
