@@ -662,7 +662,7 @@ pub fn build_scratchpad_keybind_reconfigure(
     let mut mode_binds: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut new_installed = Vec::new();
     let mut configs: Vec<(&String, &ScratchpadConfig)> = configs.iter().collect();
-    configs.sort_by(|(left, _), (right, _)| left.cmp(right));
+    configs.sort_by_key(|(left, _)| *left);
 
     for (scratchpad_name, config) in configs {
         for keybind in &config.keybinds {

@@ -143,16 +143,16 @@ The config directory is determined by (in order):
 
 Each scratchpad supports these options:
 
-| Option    | Description                                                                     |    Required     |
-| --------- | ------------------------------------------------------------------------------- | :-------------: |
-| `command` | Command and arguments to run (e.g. `command "zsh"` or `command "nvim" "+cd ~"`) |       Yes       |
-| `width`   | Pane width: fixed columns (`"80"`) or percent (`"50%"`)                         |       No        |
-| `height`  | Pane height: fixed rows (`"24"`) or percent (`"50%"`)                           |       No        |
-| `x`       | Horizontal offset: fixed columns or percent                                     |       No        |
-| `y`       | Vertical offset: fixed rows or percent                                          |       No        |
-| `origin`  | Anchor point for x/y coordinates (see below)                                    |   `"center"`    |
-| `title`   | Pane title displayed in the Zellij UI                                           | Scratchpad name |
-| `cwd`     | Working directory for the command                                               |       No        |
+| Option     | Description                                                                                              |    Required     |
+| ---------- | -------------------------------------------------------------------------------------------------------- | :-------------: |
+| `command`  | Command and arguments to run (e.g. `command "zsh"` or `command "nvim" "+cd ~"`)                          |       Yes       |
+| `width`    | Pane width: fixed columns (`"80"`) or percent (`"50%"`)                                                  |       No        |
+| `height`   | Pane height: fixed rows (`"24"`) or percent (`"50%"`)                                                    |       No        |
+| `x`        | Horizontal offset: fixed columns or percent                                                              |       No        |
+| `y`        | Vertical offset: fixed rows or percent                                                                   |       No        |
+| `origin`   | Anchor point for x/y coordinates (see below)                                                             |   `"center"`    |
+| `title`    | Pane title displayed in the Zellij UI                                                                    | Scratchpad name |
+| `cwd`      | Working directory for the command                                                                        |       No        |
 | `keybinds` | Client-local keybindings to trigger scratchpad actions (see [Scratchpad Keybinds](#scratchpad-keybinds)) |       No        |
 
 ### Origin
@@ -187,12 +187,12 @@ Unlike the old approach of putting `MessagePlugin { ... }` bindings in Zellij's 
 
 #### Supported actions
 
-| Action         | Description                                |
-| -------------- | ------------------------------------------ |
-| `Toggle`       | Toggle the scratchpad (show if hidden, hide if visible) |
-| `Show`         | Show the scratchpad                        |
-| `Hide`         | Hide the scratchpad                        |
-| `Close`        | Close the scratchpad (terminates the pane) |
+| Action         | Description                                                                                              |
+| -------------- | -------------------------------------------------------------------------------------------------------- |
+| `Toggle`       | Toggle the scratchpad (show if hidden, hide if visible)                                                  |
+| `Show`         | Show the scratchpad                                                                                      |
+| `Hide`         | Hide the scratchpad                                                                                      |
+| `Close`        | Close the scratchpad (terminates the pane)                                                               |
 | `SwitchToMode` | Optional convenience action to switch Zellij's input mode after the action, e.g. `SwitchToMode "locked"` |
 
 #### Mode blocks
