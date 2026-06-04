@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use zellij_tile::prelude::*;
@@ -11,10 +11,16 @@ use zellij_tools::events::{
 use zellij_tools::focus::{parse_focus_tab_target, FocusTabTarget};
 use zellij_tools::message::{parse_message, ParseError};
 use zellij_tools::scratchpad::{
-    parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadCommand, ScratchpadContext,
-    ScratchpadListQuery, ScratchpadManager,
+    build_scratchpad_keybind_reconfigure, parse_scratchpad_action, parse_scratchpads_kdl,
+    acquire_registry_lock, registry_file_path, registry_lock_path, registry_temp_file_path,
+    OpenDecision, RegistryLockMetadata, ScratchpadCommand, ScratchpadConfig, ScratchpadContext,
+    ScratchpadKeybindUnbind, ScratchpadListQuery, ScratchpadManager, ScratchpadRegistry,
+    ScratchpadAction, ScratchpadActionTarget,
 };
 use zellij_tools::tree;
+
+const REGISTRY_LOCK_STALE_TIMEOUT_MS: u64 = 2_000;
+const REGISTRY_PENDING_TIMEOUT_MS: u64 = 2_000;
 
 #[derive(Default)]
 struct State {
@@ -33,6 +39,16 @@ struct State {
     // Managers
     scratchpad: Option<ScratchpadManager>,
     event_stream: EventStream,
+
+    // Zellij runtime identity and permissions
+    zellij_pid: Option<u32>,
+    own_plugin_id: Option<u32>,
+    own_client_id: Option<ClientId>,
+    reconfigure_allowed: bool,
+
+    // Last merged scratchpad config, used for client-local keybind registration.
+    scratchpad_configs: HashMap<String, ScratchpadConfig>,
+    installed_scratchpad_keybinds: Vec<ScratchpadKeybindUnbind>,
 
     // Raw include path from config (resolved after /host is mounted)
     raw_include: Option<String>,
@@ -135,24 +151,200 @@ impl State {
     }
 
     fn build_scratchpad_context(&self) -> ScratchpadContext<'_> {
+        self.build_scratchpad_context_for_tab_id(None)
+    }
+
+    fn build_scratchpad_context_for_tab_id(
+        &self,
+        target_tab_id: Option<usize>,
+    ) -> ScratchpadContext<'_> {
+        let current_tab_id = target_tab_id.or_else(|| {
+            self.position_to_tab_id
+                .get(&self.current_tab_position)
+                .copied()
+        });
+        let current_tab_position = current_tab_id
+            .and_then(|tab_id| self.tab_id_to_position.get(&tab_id).copied())
+            .unwrap_or(self.current_tab_position);
         let (viewport_cols, viewport_rows) = self
             .tab_infos
             .iter()
-            .find(|t| t.active)
+            .find(|t| Some(t.tab_id) == current_tab_id)
+            .or_else(|| self.tab_infos.iter().find(|t| t.active))
             .map(|t| (t.viewport_columns, t.viewport_rows))
             .unwrap_or((0, 0));
 
         ScratchpadContext {
             pane_manifest: &self.pane_manifest,
-            current_tab_position: self.current_tab_position,
-            current_tab_id: self
-                .position_to_tab_id
-                .get(&self.current_tab_position)
-                .copied(),
+            current_tab_position,
+            current_tab_id,
             are_floating_panes_visible: self.are_floating_panes_visible,
             tab_id_to_position: &self.tab_id_to_position,
             viewport_cols,
             viewport_rows,
+        }
+    }
+
+    fn tab_id_for_source_pane(&self, pane_id: PaneId) -> Option<usize> {
+        self.pane_manifest.iter().find_map(|(tab_position, panes)| {
+            let found = panes.iter().any(|pane| match pane_id {
+                PaneId::Terminal(id) => !pane.is_plugin && pane.id == id,
+                PaneId::Plugin(id) => pane.is_plugin && pane.id == id,
+            });
+            found.then(|| self.position_to_tab_id.get(tab_position).copied())?
+        })
+    }
+
+    fn target_tab_id(&self, target: &ScratchpadActionTarget) -> Option<usize> {
+        target
+            .tab_id
+            .or_else(|| target.source_pane.and_then(|pane_id| self.tab_id_for_source_pane(pane_id)))
+    }
+
+    fn scratchpad_action_target_tab_id(&self, action: &ScratchpadAction) -> Option<usize> {
+        match action {
+            ScratchpadAction::Toggle { target, .. }
+            | ScratchpadAction::Show { target, .. }
+            | ScratchpadAction::Hide { target, .. }
+            | ScratchpadAction::Close { target, .. } => self.target_tab_id(target),
+        }
+    }
+
+    fn current_time_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+            .unwrap_or_default()
+    }
+
+    fn live_registry_state(&self) -> (HashSet<usize>, HashMap<u32, usize>) {
+        let live_tabs = self.tab_infos.iter().map(|tab| tab.tab_id).collect();
+        let live_panes = self
+            .pane_manifest
+            .iter()
+            .filter_map(|(tab_position, panes)| {
+                self.position_to_tab_id
+                    .get(tab_position)
+                    .map(|tab_id| (*tab_id, panes))
+            })
+            .flat_map(|(tab_id, panes)| {
+                panes
+                    .iter()
+                    .filter(|pane| !pane.is_plugin)
+                    .map(move |pane| (pane.id, tab_id))
+            })
+            .collect();
+
+        (live_tabs, live_panes)
+    }
+
+    fn with_scratchpad_registry<T>(
+        &self,
+        f: impl FnOnce(&mut ScratchpadRegistry, u32, u64) -> T,
+    ) -> Option<T> {
+        let zellij_pid = self.zellij_pid?;
+        let own_plugin_id = self.own_plugin_id?;
+        let now_ms = Self::current_time_ms();
+        let metadata = RegistryLockMetadata {
+            plugin_id: own_plugin_id,
+            client_id: self.own_client_id.map(|client_id| client_id as u32).unwrap_or_default(),
+            created_ms: now_ms,
+        };
+        let lock_path = registry_lock_path(zellij_pid);
+        let _lock = match acquire_registry_lock(
+            &lock_path,
+            &metadata,
+            REGISTRY_LOCK_STALE_TIMEOUT_MS,
+        ) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return None,
+            Err(err) => {
+                eprintln!("Failed to acquire scratchpad registry lock: {}", err);
+                return None;
+            }
+        };
+
+        let path = registry_file_path(zellij_pid);
+        let temp_path = registry_temp_file_path(zellij_pid, own_plugin_id);
+        let mut registry = match ScratchpadRegistry::read_from_path(&path) {
+            Ok(registry) => registry,
+            Err(err) => {
+                eprintln!("Failed to read scratchpad registry: {}", err);
+                return None;
+            }
+        };
+
+        let (live_tabs, live_panes) = self.live_registry_state();
+        registry.reconcile(
+            &live_tabs,
+            &live_panes,
+            now_ms,
+            REGISTRY_PENDING_TIMEOUT_MS,
+        );
+        let result = f(&mut registry, own_plugin_id, now_ms);
+
+        if let Err(err) = registry.write_atomic_to_path(&path, &temp_path) {
+            eprintln!("Failed to write scratchpad registry: {}", err);
+            return None;
+        }
+
+        Some(result)
+    }
+
+    fn execute_register_commands(commands: Vec<ScratchpadCommand>) {
+        for command in commands {
+            if let ScratchpadCommand::RenamePane { pane_id, name } = command {
+                rename_terminal_pane(pane_id, &name);
+            }
+        }
+    }
+
+    fn register_existing_scratchpad_pane(&mut self, name: &str, tab_id: usize, pane_id: u32) {
+        if let Some(ref mut mgr) = self.scratchpad {
+            let register_cmds = mgr.register_pane(name, tab_id, pane_id);
+            Self::execute_register_commands(register_cmds);
+        }
+    }
+
+    fn register_configured_scratchpad_keybinds(&mut self) {
+        if !self.reconfigure_allowed {
+            return;
+        }
+        let Some(own_plugin_id) = self.own_plugin_id else {
+            return;
+        };
+
+        let (keys_to_unbind, new_installed, keybind_config) =
+            match build_scratchpad_keybind_reconfigure(
+                &self.scratchpad_configs,
+                own_plugin_id,
+                &self.installed_scratchpad_keybinds,
+            ) {
+                Ok(update) => update,
+                Err(err) => {
+                    eprintln!("Failed to build scratchpad keybind config: {}", err);
+                    return;
+                }
+            };
+
+        if !keys_to_unbind.is_empty() {
+            rebind_keys(keys_to_unbind, Vec::new(), false);
+        }
+        if !new_installed.is_empty() {
+            reconfigure(keybind_config, false);
+        }
+        self.installed_scratchpad_keybinds = new_installed;
+    }
+
+    fn replace_scratchpad_configs(&mut self, configs: HashMap<String, ScratchpadConfig>) {
+        self.scratchpad_configs = configs.clone();
+        self.register_configured_scratchpad_keybinds();
+
+        if let Some(ref mut scratchpad) = self.scratchpad {
+            let commands = scratchpad.reconcile_config(configs);
+            self.execute_scratchpad_commands(commands);
+        } else if !configs.is_empty() {
+            self.scratchpad = Some(ScratchpadManager::new(configs));
         }
     }
 
@@ -165,6 +357,26 @@ impl State {
                     name,
                     tab_id,
                 } => {
+                    let open_decision = self.with_scratchpad_registry(|registry, owner, now_ms| {
+                        registry.begin_open(
+                            &name,
+                            tab_id,
+                            owner,
+                            now_ms,
+                            REGISTRY_PENDING_TIMEOUT_MS,
+                        )
+                    });
+
+                    match open_decision {
+                        Some(OpenDecision::UseExisting { pane_id }) => {
+                            self.register_existing_scratchpad_pane(&name, tab_id, pane_id);
+                            show_pane_with_id(PaneId::Terminal(pane_id), true, true);
+                            continue;
+                        }
+                        Some(OpenDecision::Pending) => continue,
+                        Some(OpenDecision::Open) | None => (),
+                    }
+
                     let coords = FloatingPaneCoordinates::new(
                         coordinates.x,
                         coordinates.y,
@@ -175,19 +387,14 @@ impl State {
                     );
                     let opened = open_command_pane_floating(command, coords, BTreeMap::new());
                     if let Some(PaneId::Terminal(pane_id)) = opened {
-                        if let Some(ref mut mgr) = self.scratchpad {
-                            let register_cmds = mgr.register_pane(&name, tab_id, pane_id);
-                            // register_pane only returns RenamePane commands, execute them directly
-                            for register_cmd in register_cmds {
-                                if let ScratchpadCommand::RenamePane {
-                                    pane_id,
-                                    name: title,
-                                } = register_cmd
-                                {
-                                    rename_terminal_pane(pane_id, &title);
-                                }
-                            }
-                        }
+                        self.with_scratchpad_registry(|registry, owner, now_ms| {
+                            registry.finish_open(&name, tab_id, owner, pane_id, now_ms);
+                        });
+                        self.register_existing_scratchpad_pane(&name, tab_id, pane_id);
+                    } else {
+                        self.with_scratchpad_registry(|registry, owner, _now_ms| {
+                            registry.cancel_open(&name, tab_id, owner);
+                        });
                     }
                 }
                 ScratchpadCommand::ShowPane {
@@ -327,8 +534,9 @@ impl State {
             }
             "scratchpad" => {
                 let action = parse_scratchpad_action(&message.args)?;
+                let target_tab_id = self.scratchpad_action_target_tab_id(&action);
                 if let Some(mut scratchpad) = self.scratchpad.take() {
-                    let ctx = self.build_scratchpad_context();
+                    let ctx = self.build_scratchpad_context_for_tab_id(target_tab_id);
                     let commands = scratchpad.handle_action(action, &ctx);
                     self.scratchpad = Some(scratchpad);
                     self.execute_scratchpad_commands(commands);
@@ -394,12 +602,18 @@ impl State {
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
+        let plugin_ids = get_plugin_ids();
+        self.zellij_pid = Some(plugin_ids.zellij_pid);
+        self.own_plugin_id = Some(plugin_ids.plugin_id);
+        self.own_client_id = Some(plugin_ids.client_id);
+
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
             PermissionType::ReadCliPipes,
             PermissionType::FullHdAccess,
+            PermissionType::Reconfigure,
         ]);
 
         subscribe(&[
@@ -431,7 +645,7 @@ impl ZellijPlugin for State {
         // Load inline configs immediately (external will load when HostFolderChanged arrives)
         if let Some(ref inline_kdl) = self.inline_scratchpads_kdl {
             if let Ok(configs) = parse_scratchpads_kdl(inline_kdl) {
-                self.scratchpad = Some(ScratchpadManager::new(configs));
+                self.replace_scratchpad_configs(configs);
             }
         }
     }
@@ -578,13 +792,7 @@ impl ZellijPlugin for State {
 
                     // Load the config
                     let configs = self.load_merged_configs();
-
-                    if let Some(ref mut scratchpad) = self.scratchpad {
-                        let commands = scratchpad.reconcile_config(configs);
-                        self.execute_scratchpad_commands(commands);
-                    } else if !configs.is_empty() {
-                        self.scratchpad = Some(ScratchpadManager::new(configs));
-                    }
+                    self.replace_scratchpad_configs(configs);
 
                     // Start polling timer if watching is enabled
                     if let Some(interval_ms) = self.watch_interval_ms {
@@ -596,6 +804,11 @@ impl ZellijPlugin for State {
                 // Could not mount root filesystem - external config won't be available
             }
             Event::PermissionRequestResult(result) => {
+                if result == PermissionStatus::Granted {
+                    self.reconfigure_allowed = true;
+                    self.register_configured_scratchpad_keybinds();
+                }
+
                 // Mount root filesystem so we can access /proc/self/environ for config resolution
                 if result == PermissionStatus::Granted && self.needs_host_mount {
                     change_host_folder(PathBuf::from("/"));
@@ -614,13 +827,7 @@ impl ZellijPlugin for State {
 
                             // Reload config
                             let new_configs = self.load_merged_configs();
-
-                            if let Some(ref mut scratchpad) = self.scratchpad {
-                                let commands = scratchpad.reconcile_config(new_configs);
-                                self.execute_scratchpad_commands(commands);
-                            } else if !new_configs.is_empty() {
-                                self.scratchpad = Some(ScratchpadManager::new(new_configs));
-                            }
+                            self.replace_scratchpad_configs(new_configs);
                         }
                     }
 

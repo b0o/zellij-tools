@@ -231,6 +231,7 @@ mod tests {
             origin: Origin::default(),
             title: None,
             cwd: None,
+            keybinds: Vec::new(),
         }
     }
 

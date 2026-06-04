@@ -97,21 +97,33 @@ enum ScratchpadAction {
     Toggle {
         /// Scratchpad name (if omitted, toggles the last-focused scratchpad)
         name: Option<String>,
+        /// Target a specific native Zellij tab ID
+        #[arg(long = "tab-id")]
+        tab_id: Option<usize>,
     },
     /// Show a scratchpad
     Show {
         /// Scratchpad name
         name: String,
+        /// Target a specific native Zellij tab ID
+        #[arg(long = "tab-id")]
+        tab_id: Option<usize>,
     },
     /// Hide a scratchpad
     Hide {
         /// Scratchpad name
         name: String,
+        /// Target a specific native Zellij tab ID
+        #[arg(long = "tab-id")]
+        tab_id: Option<usize>,
     },
     /// Close a scratchpad (terminates the pane)
     Close {
         /// Scratchpad name
         name: String,
+        /// Target a specific native Zellij tab ID
+        #[arg(long = "tab-id")]
+        tab_id: Option<usize>,
     },
     /// List scratchpads as JSON
     List {
@@ -222,24 +234,50 @@ fn send_pipe_message(plugin: &str, msg: &str, session: Option<&str>) -> std::io:
     }
 }
 
+fn source_pane_from_env() -> Option<String> {
+    let pane_id = std::env::var("ZELLIJ_PANE_ID").ok()?;
+    let pane_id = pane_id.trim();
+    if pane_id.is_empty() {
+        None
+    } else if pane_id.contains('_') {
+        Some(pane_id.to_string())
+    } else {
+        Some(format!("terminal_{pane_id}"))
+    }
+}
+
+fn append_scratchpad_target(mut msg: String, tab_id: Option<usize>) -> String {
+    if let Some(tab_id) = tab_id {
+        msg.push_str(&format!("::tab-id::{tab_id}"));
+    } else if let Some(source_pane) = source_pane_from_env() {
+        msg.push_str(&format!("::source-pane::{source_pane}"));
+    }
+    msg
+}
+
 fn scratchpad(
     plugin: &str,
     action: ScratchpadAction,
     session: Option<&str>,
 ) -> std::io::Result<()> {
     let msg = match action {
-        ScratchpadAction::Toggle { name: Some(name) } => {
-            format!("zellij-tools::scratchpad::toggle::{}", name)
+        ScratchpadAction::Toggle {
+            name: Some(name),
+            tab_id,
+        } => {
+            append_scratchpad_target(format!("zellij-tools::scratchpad::toggle::{}", name), tab_id)
         }
-        ScratchpadAction::Toggle { name: None } => "zellij-tools::scratchpad::toggle".to_string(),
-        ScratchpadAction::Show { name } => {
-            format!("zellij-tools::scratchpad::show::{}", name)
+        ScratchpadAction::Toggle { name: None, tab_id } => {
+            append_scratchpad_target("zellij-tools::scratchpad::toggle".to_string(), tab_id)
         }
-        ScratchpadAction::Hide { name } => {
-            format!("zellij-tools::scratchpad::hide::{}", name)
+        ScratchpadAction::Show { name, tab_id } => {
+            append_scratchpad_target(format!("zellij-tools::scratchpad::show::{}", name), tab_id)
         }
-        ScratchpadAction::Close { name } => {
-            format!("zellij-tools::scratchpad::close::{}", name)
+        ScratchpadAction::Hide { name, tab_id } => {
+            append_scratchpad_target(format!("zellij-tools::scratchpad::hide::{}", name), tab_id)
+        }
+        ScratchpadAction::Close { name, tab_id } => {
+            append_scratchpad_target(format!("zellij-tools::scratchpad::close::{}", name), tab_id)
         }
         ScratchpadAction::List { .. } => unreachable!("list is handled separately"),
     };
@@ -791,8 +829,11 @@ mod tests {
 
         match cli.command {
             Commands::Scratchpad {
-                action: ScratchpadAction::Toggle { name },
-            } => assert_eq!(name.as_deref(), Some("term")),
+                action: ScratchpadAction::Toggle { name, tab_id },
+            } => {
+                assert_eq!(name.as_deref(), Some("term"));
+                assert_eq!(tab_id, None);
+            }
             _ => panic!("expected scratchpad toggle command"),
         }
     }
@@ -803,8 +844,11 @@ mod tests {
 
         match cli.command {
             Commands::Scratchpad {
-                action: ScratchpadAction::Toggle { name },
-            } => assert_eq!(name, None),
+                action: ScratchpadAction::Toggle { name, tab_id },
+            } => {
+                assert_eq!(name, None);
+                assert_eq!(tab_id, None);
+            }
             _ => panic!("expected scratchpad toggle command"),
         }
     }
@@ -815,8 +859,11 @@ mod tests {
 
         match cli.command {
             Commands::Scratchpad {
-                action: ScratchpadAction::Show { name },
-            } => assert_eq!(name, "htop"),
+                action: ScratchpadAction::Show { name, tab_id },
+            } => {
+                assert_eq!(name, "htop");
+                assert_eq!(tab_id, None);
+            }
             _ => panic!("expected scratchpad show command"),
         }
     }
@@ -827,8 +874,11 @@ mod tests {
 
         match cli.command {
             Commands::Scratchpad {
-                action: ScratchpadAction::Hide { name },
-            } => assert_eq!(name, "htop"),
+                action: ScratchpadAction::Hide { name, tab_id },
+            } => {
+                assert_eq!(name, "htop");
+                assert_eq!(tab_id, None);
+            }
             _ => panic!("expected scratchpad hide command"),
         }
     }
@@ -839,9 +889,35 @@ mod tests {
 
         match cli.command {
             Commands::Scratchpad {
-                action: ScratchpadAction::Close { name },
-            } => assert_eq!(name, "term"),
+                action: ScratchpadAction::Close { name, tab_id },
+            } => {
+                assert_eq!(name, "term");
+                assert_eq!(tab_id, None);
+            }
             _ => panic!("expected scratchpad close command"),
+        }
+    }
+
+    #[test]
+    fn parses_scratchpad_mutation_tab_id() {
+        let cli = Cli::try_parse_from([
+            "zellij-tools",
+            "scratchpad",
+            "toggle",
+            "term",
+            "--tab-id",
+            "42",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Scratchpad {
+                action: ScratchpadAction::Toggle { name, tab_id },
+            } => {
+                assert_eq!(name.as_deref(), Some("term"));
+                assert_eq!(tab_id, Some(42));
+            }
+            _ => panic!("expected scratchpad toggle command"),
         }
     }
 

@@ -1,13 +1,21 @@
 mod config;
 mod list;
 mod persistence;
+mod registry;
 
 pub use config::{
+    build_scratchpad_keybind_reconfigure, build_scratchpad_keybind_update,
     is_valid_scratchpad_name, parse_scratchpad_action, parse_scratchpads_kdl, AxisOrigin, Origin,
-    ResolvedCoordinates, ScratchpadAction, ScratchpadConfig,
+    ResolvedCoordinates, ScratchpadAction, ScratchpadActionTarget, ScratchpadConfig,
+    ScratchpadKeybind, ScratchpadKeybindAction, ScratchpadKeybindRebind, ScratchpadKeybindUnbind,
 };
 pub use list::{ScratchpadInstanceInfo, ScratchpadListEntry, ScratchpadListQuery};
 pub use persistence::{delete_state_file, load_state, save_state, PersistedState};
+pub use registry::{
+    acquire_registry_lock, registry_file_path, registry_lock_path, registry_temp_file_path,
+    OpenDecision, RegistryFileLock, RegistryLockMetadata, RegistryRecord, RegistryRecordState,
+    ScratchpadRegistry,
+};
 
 use std::collections::{HashMap, HashSet};
 use zellij_tile::prelude::{CommandToRun, PaneInfo};
@@ -230,10 +238,10 @@ impl ScratchpadManager {
         ctx: &ScratchpadContext,
     ) -> Vec<ScratchpadCommand> {
         match action {
-            ScratchpadAction::Toggle { name } => self.handle_toggle(name, ctx),
-            ScratchpadAction::Show { name } => self.handle_show(&name, ctx),
-            ScratchpadAction::Hide { name } => self.handle_hide(&name, ctx),
-            ScratchpadAction::Close { name } => self.handle_close(&name, ctx),
+            ScratchpadAction::Toggle { name, .. } => self.handle_toggle(name, ctx),
+            ScratchpadAction::Show { name, .. } => self.handle_show(&name, ctx),
+            ScratchpadAction::Hide { name, .. } => self.handle_hide(&name, ctx),
+            ScratchpadAction::Close { name, .. } => self.handle_close(&name, ctx),
         }
     }
 
@@ -726,6 +734,7 @@ mod tests {
             origin: Origin::default(),
             title: None,
             cwd: None,
+            keybinds: Vec::new(),
         }
     }
 
@@ -764,6 +773,7 @@ mod tests {
         let commands = manager.handle_action(
             ScratchpadAction::Show {
                 name: "unknown".to_string(),
+                target: Default::default(),
             },
             &ctx,
         );
@@ -781,6 +791,7 @@ mod tests {
         let commands = manager.handle_action(
             ScratchpadAction::Show {
                 name: "term".to_string(),
+                target: Default::default(),
             },
             &ctx,
         );
@@ -809,6 +820,7 @@ mod tests {
         let commands = manager.handle_action(
             ScratchpadAction::Show {
                 name: "term".to_string(),
+                target: Default::default(),
             },
             &ctx,
         );
@@ -833,6 +845,7 @@ mod tests {
         let commands = manager.handle_action(
             ScratchpadAction::Hide {
                 name: "term".to_string(),
+                target: Default::default(),
             },
             &ctx,
         );
@@ -859,6 +872,7 @@ mod tests {
         let commands = manager.handle_action(
             ScratchpadAction::Close {
                 name: "term".to_string(),
+                target: Default::default(),
             },
             &ctx,
         );
@@ -889,6 +903,7 @@ mod tests {
         let commands = manager.handle_action(
             ScratchpadAction::Toggle {
                 name: Some("term".to_string()),
+                target: Default::default(),
             },
             &ctx,
         );
@@ -913,6 +928,7 @@ mod tests {
         let commands = manager.handle_action(
             ScratchpadAction::Toggle {
                 name: Some("term".to_string()),
+                target: Default::default(),
             },
             &ctx,
         );
@@ -1058,6 +1074,7 @@ mod tests {
         let commands = manager.handle_action(
             ScratchpadAction::Toggle {
                 name: Some("htop".to_string()),
+                target: Default::default(),
             },
             &ctx,
         );
@@ -1087,6 +1104,7 @@ mod tests {
         let commands = manager.handle_action(
             ScratchpadAction::Toggle {
                 name: Some("htop".to_string()),
+                target: Default::default(),
             },
             &ctx,
         );
@@ -1207,6 +1225,7 @@ mod tests {
         let commands = manager.handle_action(
             ScratchpadAction::Show {
                 name: "term".to_string(),
+                target: Default::default(),
             },
             &ctx,
         );
