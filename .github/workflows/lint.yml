@@ -31,7 +31,7 @@ jobs:
           components: clippy
 
       - name: Run Clippy
-        uses: clechasseur/rs-clippy-check@20aa5e7f5adb540619b801de618c454627247b6a # v6.0.0
+        uses: clechasseur/rs-clippy-check@b418607012136b974dc5c880877df721d630bbc1 # v6.0.2
         with:
           args: --all-features --target=wasm32-wasip1
           toolchain: "1.85.0"
