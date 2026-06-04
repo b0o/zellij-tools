@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
 
 use zellij_tile::prelude::*;
 
@@ -12,7 +11,6 @@ use zellij_tools::events::{
 };
 use zellij_tools::focus::{parse_focus_tab_target, FocusTabTarget};
 use zellij_tools::message::{parse_message, ParseError};
-use zellij_tools::pipe_claim::broadcast_pipe_claim_key;
 use zellij_tools::scratchpad::{
     load_state, parse_scratchpad_action, parse_scratchpads_kdl, save_state, ScratchpadCommand,
     ScratchpadConfig, ScratchpadContext, ScratchpadListQuery, ScratchpadManager,
@@ -20,7 +18,6 @@ use zellij_tools::scratchpad::{
 use zellij_tools::tree;
 
 const CLIENT_LIST_REFRESH_SECONDS: f64 = 2.0;
-const PIPE_CLAIM_STALE_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct State {
@@ -66,9 +63,9 @@ struct State {
 register_plugin!(State);
 
 impl State {
-    fn claim_file_path(&self, claim_key: &str) -> Option<PathBuf> {
+    fn claim_file_path(&self, pipe_id: &str) -> Option<PathBuf> {
         let zellij_pid = self.zellij_pid?;
-        let safe_claim_key: String = claim_key
+        let safe_pipe_id: String = pipe_id
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -80,35 +77,27 @@ impl State {
             .collect();
 
         Some(PathBuf::from(format!(
-            "/tmp/zellij-tools-{}-claim-{}",
-            zellij_pid, safe_claim_key
+            "/tmp/zellij-tools-{}-pipe-{}",
+            zellij_pid, safe_pipe_id
         )))
     }
 
-    fn claim_pipe_message(&self, pipe_message: &PipeMessage) -> bool {
+    fn claim_cli_pipe(&self, pipe_message: &PipeMessage) -> bool {
+        if !matches!(pipe_message.source, PipeSource::Cli(_)) {
+            return true;
+        }
+
         if !self.own_client_connected {
             return false;
         }
 
-        let claim_key = match pipe_message.source {
-            PipeSource::Cli(ref pipe_id) => pipe_id.clone(),
-            PipeSource::Keybind | PipeSource::Plugin(_) => broadcast_pipe_claim_key(pipe_message),
+        let PipeSource::Cli(ref pipe_id) = pipe_message.source else {
+            return true;
         };
 
-        let Some(path) = self.claim_file_path(&claim_key) else {
+        let Some(path) = self.claim_file_path(pipe_id) else {
             return false;
         };
-
-        if let Ok(metadata) = std::fs::metadata(&path) {
-            let is_stale = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                .is_some_and(|age| age > PIPE_CLAIM_STALE_AFTER);
-            if is_stale {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
 
         OpenOptions::new()
             .write(true)
@@ -346,7 +335,7 @@ impl State {
         let payload = pipe_message.payload.as_deref().unwrap_or("");
         let message = parse_message(payload)?;
 
-        if !self.claim_pipe_message(pipe_message) {
+        if !self.claim_cli_pipe(pipe_message) {
             return Ok(());
         }
 
@@ -779,9 +768,9 @@ impl ZellijPlugin for State {
             }
             Event::ListClients(clients) => {
                 if let Some(own_client_id) = self.own_client_id {
-                    self.own_client_connected = clients.iter().any(|client| {
-                        client.client_id == own_client_id && client.is_current_client
-                    });
+                    self.own_client_connected = clients
+                        .iter()
+                        .any(|client| client.client_id == own_client_id && client.is_current_client);
                 }
             }
             _ => (),
