@@ -13,9 +13,9 @@ use zellij_tools::message::{parse_message, ParseError};
 use zellij_tools::scratchpad::{
     build_scratchpad_keybind_reconfigure, parse_scratchpad_action, parse_scratchpads_kdl,
     acquire_registry_lock, registry_file_path, registry_lock_path, registry_temp_file_path,
-    OpenDecision, RegistryLockMetadata, ScratchpadCommand, ScratchpadConfig, ScratchpadContext,
-    ScratchpadKeybindUnbind, ScratchpadListQuery, ScratchpadManager, ScratchpadRegistry,
-    ScratchpadAction, ScratchpadActionTarget,
+    OpenDecision, RegistryLockMetadata, RegistryRecordState, ScratchpadCommand, ScratchpadConfig,
+    ScratchpadContext, ScratchpadKeybindUnbind, ScratchpadListQuery, ScratchpadManager,
+    ScratchpadRegistry, ScratchpadAction, ScratchpadActionTarget,
 };
 use zellij_tools::tree;
 
@@ -306,6 +306,29 @@ impl State {
         }
     }
 
+    /// Refresh the scratchpad manager's pane map from the shared registry so
+    /// toggle/show/hide decisions account for scratchpads opened by other
+    /// clients' plugin instances. Without this, an instance that did not open a
+    /// scratchpad believes no pane exists and re-shows instead of hiding it.
+    fn sync_scratchpad_panes_from_registry(&mut self) {
+        let known = self.with_scratchpad_registry(|registry, _owner, _now_ms| {
+            registry
+                .entries
+                .iter()
+                .filter_map(|record| match record.state {
+                    RegistryRecordState::Present { pane_id } => {
+                        Some((record.name.clone(), record.tab_id, pane_id))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+
+        if let (Some(known), Some(mgr)) = (known, self.scratchpad.as_mut()) {
+            mgr.sync_known_panes(&known);
+        }
+    }
+
     fn register_configured_scratchpad_keybinds(&mut self) {
         if !self.reconfigure_allowed {
             return;
@@ -535,6 +558,9 @@ impl State {
             "scratchpad" => {
                 let action = parse_scratchpad_action(&message.args)?;
                 let target_tab_id = self.scratchpad_action_target_tab_id(&action);
+                // Pull shared registry state so the decision reflects scratchpads
+                // opened by other clients' plugin instances (multi-client).
+                self.sync_scratchpad_panes_from_registry();
                 if let Some(mut scratchpad) = self.scratchpad.take() {
                     let ctx = self.build_scratchpad_context_for_tab_id(target_tab_id);
                     let commands = scratchpad.handle_action(action, &ctx);

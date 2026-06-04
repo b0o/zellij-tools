@@ -411,6 +411,23 @@ impl ScratchpadManager {
         }
     }
 
+    /// Merge externally-known scratchpad panes (from the shared registry) into
+    /// the local pane map.
+    ///
+    /// In a multi-client session each client has its own plugin instance with
+    /// its own `panes` map. A scratchpad opened by one client's instance is only
+    /// recorded in that instance's map plus the shared registry. Before another
+    /// instance makes a toggle/show/hide decision it must learn about those
+    /// panes, otherwise it wrongly believes no pane exists and tries to open one.
+    pub fn sync_known_panes(&mut self, known: &[(String, usize, u32)]) {
+        for (name, tab_id, pane_id) in known {
+            self.panes
+                .entry(name.clone())
+                .or_default()
+                .insert(*tab_id, *pane_id);
+        }
+    }
+
     /// Register a pane that was just opened for a scratchpad.
     /// Called by the plugin after `open_command_pane_floating` returns the `PaneId`.
     pub fn register_pane(
@@ -508,17 +525,18 @@ impl ScratchpadManager {
     }
 
     fn is_visible(&self, name: &str, ctx: &ScratchpadContext) -> bool {
-        if !ctx.are_floating_panes_visible {
-            return false;
-        }
-
         let Some(pane_id) = self.get_pane(name, ctx) else {
             return false;
         };
 
+        // Decide purely from the pane manifest, which is a single coherent
+        // PaneUpdate snapshot. A scratchpad hidden via `hide_pane_with_id` is
+        // marked `is_suppressed` in that same snapshot, so we don't need the
+        // separately-delivered tab-level `are_floating_panes_visible` flag.
+        // That flag arrives via a different event (TabUpdate) and can be stale
+        // relative to the manifest, which produced wrong toggle decisions.
         ctx.pane_manifest
-            .get(&ctx.current_tab_position)
-            .into_iter()
+            .values()
             .flatten()
             .any(|p| {
                 p.id == pane_id && p.is_floating && !p.is_suppressed && !p.exited && !p.is_held
@@ -530,14 +548,14 @@ impl ScratchpadManager {
             return false;
         };
 
-        if !ctx.are_floating_panes_visible {
-            return false;
-        }
-
         if self.just_shown == Some(pane_id) {
             return true;
         }
 
+        // `is_focused` in the manifest is only ever true while the floating
+        // layer is visible (hiding it unfocuses all floating panes), so the
+        // manifest alone is a coherent signal. We deliberately avoid the stale
+        // tab-level `are_floating_panes_visible` flag here.
         ctx.pane_manifest
             .values()
             .flatten()
@@ -547,10 +565,8 @@ impl ScratchpadManager {
     }
 
     fn get_focused_scratchpad(&self, ctx: &ScratchpadContext) -> Option<String> {
-        if !ctx.are_floating_panes_visible {
-            return None;
-        }
-
+        // A focused floating pane in the manifest already implies the floating
+        // layer is visible, so the manifest is sufficient on its own.
         let focused_pane_id = ctx
             .pane_manifest
             .values()
@@ -576,10 +592,8 @@ impl ScratchpadManager {
     }
 
     fn update_focus_tracking(&mut self, ctx: &ScratchpadContext) {
-        if !ctx.are_floating_panes_visible {
-            return;
-        }
-
+        // A focused floating pane in the manifest already implies the floating
+        // layer is visible, so the manifest is sufficient on its own.
         let focused_pane = ctx
             .pane_manifest
             .values()
@@ -924,6 +938,62 @@ mod tests {
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
         manager.register_pane("term", 0, 42);
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Toggle {
+                name: Some("term".to_string()),
+                target: Default::default(),
+            },
+            &ctx,
+        );
+
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, ScratchpadCommand::HidePane { pane_id: 42 })));
+    }
+
+    #[test]
+    fn synced_external_scratchpad_toggle_hides_without_local_open() {
+        // Reproduces the multi-client repro: this instance never opened "term"
+        // (another client's instance did). After syncing the shared registry
+        // state, the first toggle must hide, not re-show.
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+        manager.sync_known_panes(&[("term".to_string(), 0, 42)]);
+
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Toggle {
+                name: Some("term".to_string()),
+                target: Default::default(),
+            },
+            &ctx,
+        );
+
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, ScratchpadCommand::HidePane { pane_id: 42 })));
+    }
+
+    #[test]
+    fn toggle_hides_visible_focused_scratchpad_despite_stale_tab_flag() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        let mut manifest = HashMap::new();
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        // Simulate a stale TabUpdate: `are_floating_panes_visible` is false while
+        // the PaneUpdate manifest already shows the scratchpad floating + focused.
+        // The decision must come from the manifest, so this should still hide.
+        let ctx = make_context(&manifest, 0, Some(0), false, &positions);
+
+        manager.register_pane("term", 0, 42);
+        manager.clear_just_shown(); // force the decision to read the manifest
 
         let commands = manager.handle_action(
             ScratchpadAction::Toggle {
