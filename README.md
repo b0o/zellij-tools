@@ -97,7 +97,14 @@ Then create `~/.config/zellij/zellij-tools.kdl`:
 
 ```kdl
 scratchpads {
-    term { command "zsh"; }
+    term {
+        command "zsh"
+        keybinds {
+            shared_among "normal" "locked" {
+                bind "Ctrl Shift D" { Toggle; SwitchToMode "locked"; }
+            }
+        }
+    }
     btop {
         command "btop"
         width "120"
@@ -146,6 +153,7 @@ Each scratchpad supports these options:
 | `origin`  | Anchor point for x/y coordinates (see below)                                    |   `"center"`    |
 | `title`   | Pane title displayed in the Zellij UI                                           | Scratchpad name |
 | `cwd`     | Working directory for the command                                               |       No        |
+| `keybinds` | Client-local keybindings to trigger scratchpad actions (see [Scratchpad Keybinds](#scratchpad-keybinds)) |       No        |
 
 ### Origin
 
@@ -160,17 +168,80 @@ The `origin` option sets the reference point for `x` and `y` coordinates. It acc
 | `center` | `center`   | Centered, offset shifts away from center |
 | `bottom` | `right`    | Offset inward from bottom-right corner   |
 
+### Scratchpad Keybinds
+
+Scratchpad keybinds are configured inside each scratchpad definition using a `keybinds` block:
+
+```kdl
+term {
+    command "nu"
+    keybinds {
+        shared_among "normal" "locked" {
+            bind "Ctrl Shift D" { Toggle; SwitchToMode "locked"; }
+        }
+    }
+}
+```
+
+Unlike the old approach of putting `MessagePlugin { ... }` bindings in Zellij's global keybinds block, scratchpad-local keybinds are installed by the plugin at runtime and route to the invoking client only. This means they work correctly in multi-client sessions.
+
+#### Supported actions
+
+| Action         | Description                                |
+| -------------- | ------------------------------------------ |
+| `Toggle`       | Toggle the scratchpad (show if hidden, hide if visible) |
+| `Show`         | Show the scratchpad                        |
+| `Hide`         | Hide the scratchpad                        |
+| `Close`        | Close the scratchpad (terminates the pane) |
+| `SwitchToMode` | Optional convenience action to switch Zellij's input mode after the action, e.g. `SwitchToMode "locked"` |
+
+#### Mode blocks
+
+Keybinds can be active in one or more Zellij input modes:
+
+```kdl
+keybinds {
+    normal { bind "Alt t" { Toggle; } }                          // active in normal mode only
+    shared_among "locked" "normal" { bind "Alt s" { Show; } }    // active in locked and normal modes
+    shared_except "scroll" { bind "Alt h" { Hide; } }            // active in all modes except scroll
+    shared { bind "Ctrl Space" { Toggle; } }                     // active in all modes
+}
+```
+
+Supported modes: `normal`, `locked`, `resize`, `pane`, `move`, `tab`, `scroll`, `search`, `entersearch`, `renametab`, `renamepane`, `session`, `tmux`.
+
+#### Migration from old MessagePlugin bindings
+
+Previously, scratchpad keybinds required adding `MessagePlugin` blocks to Zellij's global keybinds config:
+
+```kdl
+// OLD — remove these from config.kdl
+keybinds {
+    shared_except "resize" "scroll" {
+        bind "Ctrl Shift D" {
+            MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::term"; }
+            SwitchToMode "locked"
+        }
+    }
+}
+```
+
+Replace those with `keybinds { ... }` blocks inside each scratchpad definition in your `zellij-tools.kdl` file, as shown above. Then remove the old `MessagePlugin` bindings from `config.kdl`.
+
 ### Scratchpad CLI
 
 Control scratchpads from the command line:
 
 ```sh
-zellij-tools scratchpad toggle         # Toggle the last-focused scratchpad
-zellij-tools scratchpad toggle term    # Toggle a named scratchpad
-zellij-tools scratchpad show term      # Show a scratchpad
-zellij-tools scratchpad hide term      # Hide a scratchpad
-zellij-tools scratchpad close term     # Close a scratchpad (terminates the pane)
+zellij-tools scratchpad toggle              # Toggle the last-focused scratchpad
+zellij-tools scratchpad toggle term         # Toggle a named scratchpad
+zellij-tools scratchpad toggle term --tab-id 7  # Toggle a scratchpad on a specific tab
+zellij-tools scratchpad show term           # Show a scratchpad
+zellij-tools scratchpad hide term           # Hide a scratchpad
+zellij-tools scratchpad close term          # Close a scratchpad (terminates the pane)
 ```
+
+If `ZELLIJ_PANE_ID` is set in your environment (automatic inside Zellij) and no `--tab-id` is provided, the CLI infers the target tab from the calling pane. Otherwise, the receiving plugin instance's current tab is used (may be ambiguous in multi-client sessions).
 
 ## Other Actions
 
@@ -225,6 +296,7 @@ The plugin requires the following permissions:
 - `RunCommands` - Launch scratchpad commands
 - `ReadCliPipes` - Stream events and tree data to CLI pipes
 - `FullHdAccess` - Read external config files
+- `Reconfigure` - Install scratchpad keybinds at runtime
 
 ## License
 
