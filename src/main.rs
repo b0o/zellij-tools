@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap};
-use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 use zellij_tile::prelude::*;
@@ -12,12 +11,10 @@ use zellij_tools::events::{
 use zellij_tools::focus::{parse_focus_tab_target, FocusTabTarget};
 use zellij_tools::message::{parse_message, ParseError};
 use zellij_tools::scratchpad::{
-    load_state, parse_scratchpad_action, parse_scratchpads_kdl, save_state, ScratchpadCommand,
-    ScratchpadConfig, ScratchpadContext, ScratchpadListQuery, ScratchpadManager,
+    parse_scratchpad_action, parse_scratchpads_kdl, ScratchpadCommand, ScratchpadContext,
+    ScratchpadListQuery, ScratchpadManager,
 };
 use zellij_tools::tree;
-
-const CLIENT_LIST_REFRESH_SECONDS: f64 = 2.0;
 
 #[derive(Default)]
 struct State {
@@ -37,11 +34,6 @@ struct State {
     scratchpad: Option<ScratchpadManager>,
     event_stream: EventStream,
 
-    // Zellij server identity, used for cross-client scratchpad state.
-    zellij_pid: Option<u32>,
-    own_client_id: Option<ClientId>,
-    own_client_connected: bool,
-
     // Raw include path from config (resolved after /host is mounted)
     raw_include: Option<String>,
     // User-provided config_dir override
@@ -54,8 +46,6 @@ struct State {
     needs_host_mount: bool,
     // Last modified time of external config (for polling)
     config_last_modified: Option<std::time::SystemTime>,
-    // Last time external config was checked.
-    config_last_checked: Option<std::time::SystemTime>,
     // Watch interval in milliseconds (None = disabled, Some(ms) = poll interval)
     watch_interval_ms: Option<u64>,
 }
@@ -63,98 +53,6 @@ struct State {
 register_plugin!(State);
 
 impl State {
-    fn claim_file_path(&self, pipe_id: &str) -> Option<PathBuf> {
-        let zellij_pid = self.zellij_pid?;
-        let safe_pipe_id: String = pipe_id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-
-        Some(PathBuf::from(format!(
-            "/tmp/zellij-tools-{}-pipe-{}",
-            zellij_pid, safe_pipe_id
-        )))
-    }
-
-    fn claim_cli_pipe(&self, pipe_message: &PipeMessage) -> bool {
-        if !matches!(pipe_message.source, PipeSource::Cli(_)) {
-            return true;
-        }
-
-        if !self.own_client_connected {
-            return false;
-        }
-
-        let PipeSource::Cli(ref pipe_id) = pipe_message.source else {
-            return true;
-        };
-
-        let Some(path) = self.claim_file_path(pipe_id) else {
-            return false;
-        };
-
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .is_ok()
-    }
-
-    fn refresh_client_list(&self) {
-        list_clients();
-    }
-
-    fn schedule_timer(&self) {
-        let seconds = self
-            .watch_interval_ms
-            .map(|ms| (ms as f64 / 1000.0).min(CLIENT_LIST_REFRESH_SECONDS))
-            .unwrap_or(CLIENT_LIST_REFRESH_SECONDS);
-        set_timeout(seconds);
-    }
-
-    fn sync_scratchpad_state_from_disk(&mut self) {
-        let Some(zellij_pid) = self.zellij_pid else {
-            return;
-        };
-        let Some(ref mut scratchpad) = self.scratchpad else {
-            return;
-        };
-        if let Some(state) = load_state(zellij_pid) {
-            scratchpad.replace_persisted_state(state);
-        }
-    }
-
-    fn save_scratchpad_state_to_disk(&self) {
-        let Some(zellij_pid) = self.zellij_pid else {
-            return;
-        };
-        let Some(ref scratchpad) = self.scratchpad else {
-            return;
-        };
-        if let Err(err) = save_state(&scratchpad.persisted_state(), zellij_pid) {
-            eprintln!("Failed to save scratchpad state: {}", err);
-        }
-    }
-
-    fn new_scratchpad_manager(
-        &self,
-        configs: HashMap<String, ScratchpadConfig>,
-    ) -> ScratchpadManager {
-        let mut manager = ScratchpadManager::new(configs);
-        if let Some(zellij_pid) = self.zellij_pid {
-            if let Some(state) = load_state(zellij_pid) {
-                manager.restore_state(state);
-            }
-        }
-        manager
-    }
-
     fn current_event_context(&self) -> (Vec<EventPaneInfo>, Vec<EventTabInfo>) {
         let event_panes: Vec<EventPaneInfo> = self
             .pane_manifest
@@ -259,7 +157,6 @@ impl State {
     }
 
     fn execute_scratchpad_commands(&mut self, commands: Vec<ScratchpadCommand>) {
-        let should_save = !commands.is_empty();
         for cmd in commands {
             match cmd {
                 ScratchpadCommand::OpenFloating {
@@ -326,18 +223,11 @@ impl State {
                 }
             }
         }
-        if should_save {
-            self.save_scratchpad_state_to_disk();
-        }
     }
 
     fn handle_event(&mut self, pipe_message: &PipeMessage) -> Result<(), ParseError> {
         let payload = pipe_message.payload.as_deref().unwrap_or("");
         let message = parse_message(payload)?;
-
-        if !self.claim_cli_pipe(pipe_message) {
-            return Ok(());
-        }
 
         match message.event {
             "focus-pane" => {
@@ -354,7 +244,6 @@ impl State {
 
                 // If the pane is a scratchpad, use show logic to ensure correct size/position
                 if let PaneId::Terminal(terminal_id) = pane_id {
-                    self.sync_scratchpad_state_from_disk();
                     if let Some(mut scratchpad) = self.scratchpad.take() {
                         let ctx = self.build_scratchpad_context();
                         let result = scratchpad.handle_focus_pane(terminal_id, &ctx);
@@ -426,7 +315,6 @@ impl State {
                     full,
                 };
 
-                self.sync_scratchpad_state_from_disk();
                 let entries = if let Some(ref scratchpad) = self.scratchpad {
                     scratchpad.list(&query, &self.pane_manifest, &self.tab_id_to_position)
                 } else {
@@ -439,7 +327,6 @@ impl State {
             }
             "scratchpad" => {
                 let action = parse_scratchpad_action(&message.args)?;
-                self.sync_scratchpad_state_from_disk();
                 if let Some(mut scratchpad) = self.scratchpad.take() {
                     let ctx = self.build_scratchpad_context();
                     let commands = scratchpad.handle_action(action, &ctx);
@@ -507,11 +394,6 @@ impl State {
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
-        let plugin_ids = get_plugin_ids();
-        self.zellij_pid = Some(plugin_ids.zellij_pid);
-        self.own_client_id = Some(plugin_ids.client_id);
-        self.own_client_connected = true;
-
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -527,11 +409,7 @@ impl ZellijPlugin for State {
             EventType::FailedToChangeHostFolder,
             EventType::PermissionRequestResult,
             EventType::Timer,
-            EventType::ListClients,
         ]);
-
-        self.refresh_client_list();
-        self.schedule_timer();
 
         // Store inline scratchpads config for merging
         self.inline_scratchpads_kdl = configuration.get("scratchpads").cloned();
@@ -553,7 +431,7 @@ impl ZellijPlugin for State {
         // Load inline configs immediately (external will load when HostFolderChanged arrives)
         if let Some(ref inline_kdl) = self.inline_scratchpads_kdl {
             if let Ok(configs) = parse_scratchpads_kdl(inline_kdl) {
-                self.scratchpad = Some(self.new_scratchpad_manager(configs));
+                self.scratchpad = Some(ScratchpadManager::new(configs));
             }
         }
     }
@@ -626,14 +504,12 @@ impl ZellijPlugin for State {
                     .collect();
 
                 // Update scratchpad manager
-                self.sync_scratchpad_state_from_disk();
                 if let Some(mut scratchpad) = self.scratchpad.take() {
                     scratchpad.clear_just_shown();
                     let ctx = self.build_scratchpad_context();
                     let commands = scratchpad.on_pane_update(&ctx, &orphaned_tabs);
                     self.scratchpad = Some(scratchpad);
                     self.execute_scratchpad_commands(commands);
-                    self.save_scratchpad_state_to_disk();
                 }
             }
             Event::TabUpdate(tab_infos) => {
@@ -698,7 +574,6 @@ impl ZellijPlugin for State {
                     // Store the initial mtime for polling
                     if let Ok(metadata) = std::fs::metadata(include_path) {
                         self.config_last_modified = metadata.modified().ok();
-                        self.config_last_checked = Some(std::time::SystemTime::now());
                     }
 
                     // Load the config
@@ -708,12 +583,12 @@ impl ZellijPlugin for State {
                         let commands = scratchpad.reconcile_config(configs);
                         self.execute_scratchpad_commands(commands);
                     } else if !configs.is_empty() {
-                        self.scratchpad = Some(self.new_scratchpad_manager(configs));
+                        self.scratchpad = Some(ScratchpadManager::new(configs));
                     }
 
                     // Start polling timer if watching is enabled
-                    if self.watch_interval_ms.is_some() {
-                        self.schedule_timer();
+                    if let Some(interval_ms) = self.watch_interval_ms {
+                        set_timeout(interval_ms as f64 / 1000.0);
                     }
                 }
             }
@@ -728,49 +603,29 @@ impl ZellijPlugin for State {
                 }
             }
             Event::Timer(_elapsed) => {
-                self.refresh_client_list();
-
                 // Check if config file has changed (only if watching is enabled)
                 if let (Some(ref include_path), Some(interval_ms)) =
                     (&self.include_path, self.watch_interval_ms)
                 {
-                    let now = std::time::SystemTime::now();
-                    let should_check = self
-                        .config_last_checked
-                        .and_then(|last| now.duration_since(last).ok())
-                        .map(|elapsed| elapsed.as_millis() >= u128::from(interval_ms))
-                        .unwrap_or(true);
+                    if let Ok(metadata) = std::fs::metadata(include_path) {
+                        let current_mtime = metadata.modified().ok();
+                        if current_mtime != self.config_last_modified {
+                            self.config_last_modified = current_mtime;
 
-                    if should_check {
-                        self.config_last_checked = Some(now);
+                            // Reload config
+                            let new_configs = self.load_merged_configs();
 
-                        if let Ok(metadata) = std::fs::metadata(include_path) {
-                            let current_mtime = metadata.modified().ok();
-                            if current_mtime != self.config_last_modified {
-                                self.config_last_modified = current_mtime;
-
-                                // Reload config
-                                let new_configs = self.load_merged_configs();
-
-                                if let Some(ref mut scratchpad) = self.scratchpad {
-                                    let commands = scratchpad.reconcile_config(new_configs);
-                                    self.execute_scratchpad_commands(commands);
-                                } else if !new_configs.is_empty() {
-                                    self.scratchpad =
-                                        Some(self.new_scratchpad_manager(new_configs));
-                                }
+                            if let Some(ref mut scratchpad) = self.scratchpad {
+                                let commands = scratchpad.reconcile_config(new_configs);
+                                self.execute_scratchpad_commands(commands);
+                            } else if !new_configs.is_empty() {
+                                self.scratchpad = Some(ScratchpadManager::new(new_configs));
                             }
                         }
                     }
-                }
 
-                self.schedule_timer();
-            }
-            Event::ListClients(clients) => {
-                if let Some(own_client_id) = self.own_client_id {
-                    self.own_client_connected = clients
-                        .iter()
-                        .any(|client| client.client_id == own_client_id && client.is_current_client);
+                    // Schedule next poll
+                    set_timeout(interval_ms as f64 / 1000.0);
                 }
             }
             _ => (),
