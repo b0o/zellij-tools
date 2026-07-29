@@ -78,7 +78,6 @@
             rust
             pkgs.just
             pkgs.curl
-            packages.cli
           ];
         };
 
