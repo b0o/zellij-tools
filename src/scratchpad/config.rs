@@ -249,6 +249,7 @@ pub enum ScratchpadAction {
 #[derive(Debug, Clone, Default)]
 pub struct ScratchpadActionTarget {
     pub tab_id: Option<usize>,
+    pub current_tab: bool,
     pub source_pane: Option<PaneId>,
 }
 
@@ -285,6 +286,10 @@ pub fn parse_scratchpad_action(args: &[&str]) -> Result<ScratchpadAction, ParseE
                     ParseError::InvalidArgs(format!("Invalid source pane ID: {}", err))
                 })?);
                 index += 2;
+            }
+            "current-tab" => {
+                target.current_tab = true;
+                index += 1;
             }
             arg => {
                 action_args.push(arg);
@@ -905,6 +910,7 @@ mod tests {
             ScratchpadAction::Toggle { name, target } => {
                 assert_eq!(name.as_deref(), Some("term"));
                 assert_eq!(target.tab_id, Some(7));
+                assert!(!target.current_tab);
                 assert_eq!(target.source_pane, None);
             }
             other => panic!("expected toggle action, got {other:?}"),
@@ -923,7 +929,21 @@ mod tests {
         match action {
             ScratchpadAction::Show { target, .. } => {
                 assert_eq!(target.tab_id, None);
+                assert!(!target.current_tab);
                 assert_eq!(target.source_pane, Some(PaneId::Terminal(12)));
+            }
+            other => panic!("expected show action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_action_with_current_tab_target() {
+        let action = parse_scratchpad_action(&args(&["show", "term", "current-tab"])).unwrap();
+        match action {
+            ScratchpadAction::Show { target, .. } => {
+                assert_eq!(target.tab_id, None);
+                assert!(target.current_tab);
+                assert_eq!(target.source_pane, None);
             }
             other => panic!("expected show action, got {other:?}"),
         }

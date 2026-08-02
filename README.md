@@ -245,15 +245,16 @@ Replace those with `keybinds { ... }` blocks inside each scratchpad definition i
 Control scratchpads from the command line:
 
 ```sh
-zellij-tools scratchpad toggle              # Toggle the last-focused scratchpad
-zellij-tools scratchpad toggle term         # Toggle a named scratchpad
-zellij-tools scratchpad toggle term --tab-id 7  # Toggle a scratchpad on a specific tab
-zellij-tools scratchpad show term           # Show a scratchpad
-zellij-tools scratchpad hide term           # Hide a scratchpad
-zellij-tools scratchpad close term          # Close a scratchpad (terminates the pane)
+zellij-tools scratchpad toggle       # Toggle the last-focused scratchpad
+zellij-tools scratchpad toggle term  # Toggle a named scratchpad
+zellij-tools scratchpad toggle term --tab 7  # Toggle a scratchpad on a specific tab
+zellij-tools scratchpad toggle term --current-tab  # Toggle a scratchpad on the focused tab
+zellij-tools scratchpad show term    # Show a scratchpad
+zellij-tools scratchpad hide term    # Hide a scratchpad
+zellij-tools scratchpad close term   # Close a scratchpad (terminates the pane)
 ```
 
-If `ZELLIJ_PANE_ID` is set in your environment (automatic inside Zellij) and no `--tab-id` is provided, the CLI infers the target tab from the calling pane. Otherwise, the receiving plugin instance's current tab is used (may be ambiguous in multi-client sessions).
+If `ZELLIJ_PANE_ID` is set in your environment (automatic inside Zellij) and no `--tab` or `--current-tab` is provided, the CLI infers the target tab from the calling pane. Otherwise, the receiving plugin instance's current tab is used (may be ambiguous in multi-client sessions). Use `--current-tab` to explicitly target the focused tab. `--tab-id` is accepted as an alias for `--tab`.
 
 ## Other Actions
 
@@ -295,6 +296,8 @@ Get a session tree snapshot:
 
 ```sh
 zellij-tools tree
+zellij-tools tree --tab 42
+zellij-tools tree --current-tab
 ```
 
 For full event formats and filter options, see `zellij-tools subscribe --help`.

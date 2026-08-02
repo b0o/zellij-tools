@@ -65,9 +65,11 @@ pub struct PaneNode {
 pub fn build_tree(
     tab_infos: &[zellij_tile::prelude::TabInfo],
     pane_manifest: &HashMap<usize, Vec<zellij_tile::prelude::PaneInfo>>,
+    tab_id_filter: Option<usize>,
 ) -> SessionTree {
     let mut tabs: Vec<TabNode> = tab_infos
         .iter()
+        .filter(|tab| tab_id_filter.is_none_or(|tab_id| tab.tab_id == tab_id))
         .map(|tab| {
             let panes = pane_manifest.get(&tab.position);
 
@@ -139,6 +141,30 @@ pub fn build_tree(
 mod tests {
     use super::*;
 
+    fn tab_info(tab_id: usize, position: usize) -> zellij_tile::prelude::TabInfo {
+        zellij_tile::prelude::TabInfo {
+            tab_id,
+            position,
+            name: format!("tab{tab_id}"),
+            active: false,
+            panes_to_hide: 0,
+            is_fullscreen_active: false,
+            is_sync_panes_active: false,
+            are_floating_panes_visible: false,
+            other_focused_clients: vec![],
+            active_swap_layout_name: None,
+            is_swap_layout_dirty: false,
+            viewport_rows: 0,
+            viewport_columns: 0,
+            display_area_rows: 0,
+            display_area_columns: 0,
+            selectable_tiled_panes_count: 0,
+            selectable_floating_panes_count: 0,
+            has_bell_notification: false,
+            is_flashing_bell: false,
+        }
+    }
+
     #[test]
     fn session_tree_serializes_to_json() {
         let tree = SessionTree {
@@ -204,5 +230,14 @@ mod tests {
         let tree = SessionTree { tabs: vec![] };
         let json = serde_json::to_string(&tree).unwrap();
         assert_eq!(json, r#"{"tabs":[]}"#);
+    }
+
+    #[test]
+    fn build_tree_filters_by_tab_id() {
+        let tabs = vec![tab_info(7, 1), tab_info(42, 2), tab_info(9, 3)];
+        let tree = build_tree(&tabs, &HashMap::new(), Some(42));
+
+        assert_eq!(tree.tabs.len(), 1);
+        assert_eq!(tree.tabs[0].tab_id, 42);
     }
 }

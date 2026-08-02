@@ -34,6 +34,13 @@ pub struct Message<'a> {
     pub args: Vec<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeTabFilter {
+    All,
+    TabId(usize),
+    CurrentTab,
+}
+
 /// Parse a pipe message payload into event and args.
 /// Format: "zellij-tools::event::arg1::arg2::..."
 pub fn parse_message(payload: &str) -> Result<Message<'_>, ParseError> {
@@ -54,6 +61,20 @@ pub fn parse_message(payload: &str) -> Result<Message<'_>, ParseError> {
     };
 
     Ok(Message { event, args })
+}
+
+pub fn parse_tree_tab_filter(args: &[&str]) -> Result<TreeTabFilter, ParseError> {
+    match args {
+        [] => Ok(TreeTabFilter::All),
+        ["tab-id", tab_id] => tab_id
+            .parse::<usize>()
+            .map(TreeTabFilter::TabId)
+            .map_err(|_| ParseError::InvalidArgs(format!("invalid tree tab ID: {tab_id}"))),
+        ["current-tab"] => Ok(TreeTabFilter::CurrentTab),
+        _ => Err(ParseError::InvalidArgs(
+            "tree requires no arguments, tab-id::<id>, or current-tab".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -118,5 +139,44 @@ mod tests {
         let msg = parse_message("zellij-tools::tree").unwrap();
         assert_eq!(msg.event, "tree");
         assert!(msg.args.is_empty());
+    }
+
+    #[test]
+    fn parse_tree_with_tab_id() {
+        let msg = parse_message("zellij-tools::tree::tab-id::42").unwrap();
+        assert_eq!(msg.event, "tree");
+        assert_eq!(msg.args, vec!["tab-id", "42"]);
+    }
+
+    #[test]
+    fn parse_tree_with_current_tab() {
+        let msg = parse_message("zellij-tools::tree::current-tab").unwrap();
+        assert_eq!(msg.event, "tree");
+        assert_eq!(msg.args, vec!["current-tab"]);
+    }
+
+    #[test]
+    fn parses_tree_tab_filter() {
+        assert_eq!(parse_tree_tab_filter(&[]).unwrap(), TreeTabFilter::All);
+        assert_eq!(
+            parse_tree_tab_filter(&["tab-id", "42"]).unwrap(),
+            TreeTabFilter::TabId(42)
+        );
+        assert_eq!(
+            parse_tree_tab_filter(&["current-tab"]).unwrap(),
+            TreeTabFilter::CurrentTab
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_tree_tab_filter() {
+        assert!(matches!(
+            parse_tree_tab_filter(&["tab-id", "nope"]),
+            Err(ParseError::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            parse_tree_tab_filter(&["tab", "42"]),
+            Err(ParseError::InvalidArgs(_))
+        ));
     }
 }

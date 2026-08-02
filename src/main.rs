@@ -9,7 +9,7 @@ use zellij_tools::events::{
     TabInfo as EventTabInfo,
 };
 use zellij_tools::focus::{parse_focus_tab_target, FocusTabTarget};
-use zellij_tools::message::{parse_message, ParseError};
+use zellij_tools::message::{parse_message, parse_tree_tab_filter, ParseError, TreeTabFilter};
 use zellij_tools::scratchpad::{
     build_scratchpad_keybind_reconfigure, parse_scratchpad_action, parse_scratchpads_kdl,
     acquire_registry_lock, registry_file_path, registry_lock_path, registry_temp_file_path,
@@ -154,15 +154,18 @@ impl State {
         self.build_scratchpad_context_for_tab_id(None)
     }
 
+    fn current_tab_id(&self) -> Option<usize> {
+        self.position_to_tab_id
+            .get(&self.current_tab_position)
+            .copied()
+            .or_else(|| self.tab_infos.iter().find(|tab| tab.active).map(|tab| tab.tab_id))
+    }
+
     fn build_scratchpad_context_for_tab_id(
         &self,
         target_tab_id: Option<usize>,
     ) -> ScratchpadContext<'_> {
-        let current_tab_id = target_tab_id.or_else(|| {
-            self.position_to_tab_id
-                .get(&self.current_tab_position)
-                .copied()
-        });
+        let current_tab_id = target_tab_id.or_else(|| self.current_tab_id());
         let current_tab_position = current_tab_id
             .and_then(|tab_id| self.tab_id_to_position.get(&tab_id).copied())
             .unwrap_or(self.current_tab_position);
@@ -198,6 +201,7 @@ impl State {
     fn target_tab_id(&self, target: &ScratchpadActionTarget) -> Option<usize> {
         target
             .tab_id
+            .or_else(|| target.current_tab.then(|| self.current_tab_id()).flatten())
             .or_else(|| target.source_pane.and_then(|pane_id| self.tab_id_for_source_pane(pane_id)))
     }
 
@@ -527,16 +531,25 @@ impl State {
                 let rest = &message.args[1..];
                 let mut full = false;
                 let mut tab_id: Option<usize> = None;
+                let mut current_tab = false;
                 let mut names = Vec::new();
 
                 for &arg in rest {
                     if arg == "full" {
                         full = true;
+                    } else if arg == "current-tab" {
+                        current_tab = true;
                     } else if let Some(id_str) = arg.strip_prefix("tab=") {
                         tab_id = id_str.parse().ok();
                     } else {
                         names.push(arg.to_string());
                     }
+                }
+
+                if current_tab {
+                    tab_id = Some(self.current_tab_id().ok_or_else(|| {
+                        ParseError::InvalidArgs("current tab ID is not available".to_string())
+                    })?);
                 }
 
                 let query = ScratchpadListQuery {
@@ -611,7 +624,16 @@ impl State {
                     }
                 };
 
-                let session_tree = tree::build_tree(&self.tab_infos, &self.pane_manifest);
+                let tab_id_filter = match parse_tree_tab_filter(&message.args)? {
+                    TreeTabFilter::All => None,
+                    TreeTabFilter::TabId(tab_id) => Some(tab_id),
+                    TreeTabFilter::CurrentTab => Some(self.current_tab_id().ok_or_else(|| {
+                        ParseError::InvalidArgs("current tab ID is not available".to_string())
+                    })?),
+                };
+
+                let session_tree =
+                    tree::build_tree(&self.tab_infos, &self.pane_manifest, tab_id_filter);
                 let json = serde_json::to_string(&session_tree).unwrap_or_default();
                 self.emit_event(&cli_pipe_id, &json);
                 Ok(())
