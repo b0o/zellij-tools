@@ -32,6 +32,18 @@ nix run github:b0o/zellij-tools#cli -- scratchpad list
 nix develop github:b0o/zellij-tools
 ```
 
+For local development, the flake also exposes Cargo-backed apps that keep using
+the workspace `target/` directory for incremental builds:
+
+```sh
+nix run .#build       # Build the plugin with cargo
+nix run .#build-cli   # Build the CLI with cargo
+nix run .#check       # Run dprint and clippy checks
+nix run .#test        # Run library tests
+nix run .#fmt         # Format sources
+nix run . -- --help   # Run the CLI through cargo
+```
+
 To use the plugin from your Nix-managed Zellij config, add the flake as an input and reference the wasm path:
 
 ```nix

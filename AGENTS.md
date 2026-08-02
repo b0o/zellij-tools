@@ -168,16 +168,20 @@ Plugin subscribes to:
 
 ## Building
 
-- Preferred commands (from `Justfile`):
-  - `just build-release` - Build plugin wasm (`wasm32-wasip1`)
-  - `just build-cli-release` - Build CLI binary
-  - `just build-all-release` - Build plugin + CLI release artifacts
-  - `just test` - Run library tests
-  - `just check` - `dprint check` + clippy (`-D warnings`) for plugin and CLI
-  - `just fmt` - Format with `dprint`
+- Reproducible Nix commands:
+  - `nix build .#default` - Build plugin wasm (`wasm32-wasip1`)
+  - `nix build .#cli` - Build CLI binary
+  - `nix flake check` - Build/check flake outputs
+- Local development apps, backed by Cargo incremental builds:
+  - `nix run .#build` - Build plugin wasm (`wasm32-wasip1`)
+  - `nix run .#build-cli` - Build CLI binary
+  - `nix run .#build-all` - Build plugin and CLI
+  - `nix run .#test` - Run library tests
+  - `nix run .#check` - `dprint check` + clippy (`-D warnings`) for plugin and CLI
+  - `nix run .#fmt` - Format with `dprint` and `rustfmt`
 
 CI/lint conventions:
 
-- Rust toolchain tracks `rust-version = 1.84`
+- Rust toolchain comes from `rust-toolchain.toml`
 - Clippy warnings are treated as errors
 - Workspace contains two crates: plugin root and `cli/`
