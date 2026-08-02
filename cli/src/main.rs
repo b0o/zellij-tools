@@ -98,7 +98,7 @@ enum ScratchpadAction {
         /// Scratchpad name (if omitted, toggles the last-focused scratchpad)
         name: Option<String>,
         /// Target a specific native Zellij tab ID
-        #[arg(long = "tab-id")]
+        #[arg(long = "tab", alias = "tab-id")]
         tab_id: Option<usize>,
     },
     /// Show a scratchpad
@@ -106,7 +106,7 @@ enum ScratchpadAction {
         /// Scratchpad name
         name: String,
         /// Target a specific native Zellij tab ID
-        #[arg(long = "tab-id")]
+        #[arg(long = "tab", alias = "tab-id")]
         tab_id: Option<usize>,
     },
     /// Hide a scratchpad
@@ -114,7 +114,7 @@ enum ScratchpadAction {
         /// Scratchpad name
         name: String,
         /// Target a specific native Zellij tab ID
-        #[arg(long = "tab-id")]
+        #[arg(long = "tab", alias = "tab-id")]
         tab_id: Option<usize>,
     },
     /// Close a scratchpad (terminates the pane)
@@ -122,7 +122,7 @@ enum ScratchpadAction {
         /// Scratchpad name
         name: String,
         /// Target a specific native Zellij tab ID
-        #[arg(long = "tab-id")]
+        #[arg(long = "tab", alias = "tab-id")]
         tab_id: Option<usize>,
     },
     /// List scratchpads as JSON
@@ -130,7 +130,7 @@ enum ScratchpadAction {
         /// Only list specific scratchpads by name
         names: Vec<String>,
         /// Filter to a specific tab by tab ID
-        #[arg(long = "tab")]
+        #[arg(long = "tab", alias = "tab-id")]
         tab_id: Option<usize>,
         /// Include full pane info for each instance
         #[arg(long)]
@@ -264,9 +264,10 @@ fn scratchpad(
         ScratchpadAction::Toggle {
             name: Some(name),
             tab_id,
-        } => {
-            append_scratchpad_target(format!("zellij-tools::scratchpad::toggle::{}", name), tab_id)
-        }
+        } => append_scratchpad_target(
+            format!("zellij-tools::scratchpad::toggle::{}", name),
+            tab_id,
+        ),
         ScratchpadAction::Toggle { name: None, tab_id } => {
             append_scratchpad_target("zellij-tools::scratchpad::toggle".to_string(), tab_id)
         }
@@ -665,6 +666,21 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn parsed_scratchpad_tab_id(args: &[&str]) -> Option<usize> {
+        let cli = Cli::try_parse_from(args.iter().copied()).unwrap();
+
+        match cli.command {
+            Commands::Scratchpad { action } => match action {
+                ScratchpadAction::Toggle { tab_id, .. }
+                | ScratchpadAction::Show { tab_id, .. }
+                | ScratchpadAction::Hide { tab_id, .. }
+                | ScratchpadAction::Close { tab_id, .. }
+                | ScratchpadAction::List { tab_id, .. } => tab_id,
+            },
+            _ => panic!("expected scratchpad command"),
+        }
+    }
+
     #[test]
     fn parses_focus_pane_command() {
         let cli = Cli::try_parse_from(["zellij-tools", "focus", "pane", "2"]).unwrap();
@@ -899,25 +915,36 @@ mod tests {
     }
 
     #[test]
-    fn parses_scratchpad_mutation_tab_id() {
-        let cli = Cli::try_parse_from([
-            "zellij-tools",
-            "scratchpad",
-            "toggle",
-            "term",
-            "--tab-id",
-            "42",
-        ])
-        .unwrap();
+    fn parses_scratchpad_mutation_tab_flag() {
+        for action in ["toggle", "show", "hide", "close"] {
+            assert_eq!(
+                parsed_scratchpad_tab_id(&[
+                    "zellij-tools",
+                    "scratchpad",
+                    action,
+                    "term",
+                    "--tab",
+                    "42",
+                ]),
+                Some(42)
+            );
+        }
+    }
 
-        match cli.command {
-            Commands::Scratchpad {
-                action: ScratchpadAction::Toggle { name, tab_id },
-            } => {
-                assert_eq!(name.as_deref(), Some("term"));
-                assert_eq!(tab_id, Some(42));
-            }
-            _ => panic!("expected scratchpad toggle command"),
+    #[test]
+    fn parses_scratchpad_mutation_tab_id_alias() {
+        for action in ["toggle", "show", "hide", "close"] {
+            assert_eq!(
+                parsed_scratchpad_tab_id(&[
+                    "zellij-tools",
+                    "scratchpad",
+                    action,
+                    "term",
+                    "--tab-id",
+                    "42",
+                ]),
+                Some(42)
+            );
         }
     }
 
@@ -970,6 +997,14 @@ mod tests {
             }
             _ => panic!("expected scratchpad list command"),
         }
+    }
+
+    #[test]
+    fn parses_scratchpad_list_with_tab_id_alias() {
+        assert_eq!(
+            parsed_scratchpad_tab_id(&["zellij-tools", "scratchpad", "list", "--tab-id", "42",]),
+            Some(42)
+        );
     }
 
     #[test]
