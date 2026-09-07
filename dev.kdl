@@ -1,0 +1,176 @@
+default_layout "dev-layout"
+default_mode "locked"
+default_shell "nu"
+layout_dir "."
+mouse_hover_effects false
+pane_frame_style "full"
+pane_frames false
+scroll_buffer_size 20000
+show_startup_tips false
+
+keybinds clear-defaults=true {
+  locked {
+    bind "Ctrl space" { SwitchToMode "normal"; }
+  }
+
+  normal {
+    bind "h" { MoveFocus "left"; }
+    bind "j" { ScrollDown; SwitchToMode "scroll"; }
+    bind "k" { ScrollUp; SwitchToMode "scroll"; }
+    bind "l" { MoveFocus "right"; }
+    bind "p" { SwitchToMode "pane"; }
+    bind "r" { SwitchToMode "resize"; }
+    bind "s" { SwitchToMode "scroll"; }
+    bind "t" { SwitchToMode "tab"; }
+    bind "o" { SwitchToMode "session"; }
+    bind "Shift S" { NewPane "down"; SwitchToMode "locked"; }
+    bind "Shift V" { NewPane "right"; SwitchToMode "locked"; }
+    bind "+" "=" { Resize "Increase"; }
+    bind "-" { Resize "Decrease"; }
+  }
+
+  shared_among "normal" "locked" {
+    bind "Alt Shift A" { FocusLastPane; }
+    bind "Alt Shift H" { MoveFocus "left"; }
+    bind "Alt Shift J" { MoveFocus "down"; }
+    bind "Alt Shift K" { MoveFocus "up"; }
+    bind "Alt Shift L" { MoveFocus "right"; }
+    bind "Ctrl Shift D" {
+      MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::dev"; }
+      SwitchToMode "locked"
+    }
+    bind "Ctrl Alt 1" { GoToTab 1; }
+    bind "Ctrl Alt 2" { GoToTab 2; }
+    bind "Ctrl Alt 3" { GoToTab 3; }
+    bind "Ctrl Alt 4" { GoToTab 4; }
+    bind "Ctrl Alt 5" { GoToTab 5; }
+    bind "Ctrl Alt 6" { GoToTab 6; }
+    bind "Ctrl Alt 7" { GoToTab 7; }
+    bind "Ctrl Alt 8" { GoToTab 8; }
+    bind "Ctrl Alt 9" { GoToTab 9; }
+    bind "Ctrl Alt 0" { GoToTab 10; }
+  }
+
+  pane {
+    bind "h" "left" { MoveFocus "left"; }
+    bind "j" "down" { MoveFocus "down"; }
+    bind "k" "up" { MoveFocus "up"; }
+    bind "l" "right" { MoveFocus "right"; }
+    bind "d" { NewPane "down"; SwitchToMode "locked"; }
+    bind "v" "r" { NewPane "right"; SwitchToMode "locked"; }
+    bind "n" { NewPane; SwitchToMode "locked"; }
+    bind "x" { CloseFocus; SwitchToMode "locked"; }
+    bind "f" { ToggleFocusFullscreen; SwitchToMode "locked"; }
+    bind "e" { TogglePaneEmbedOrFloating; SwitchToMode "locked"; }
+    bind "w" { ToggleFloatingPanes; SwitchToMode "locked"; }
+    bind "z" { TogglePaneFrames; SwitchToMode "locked"; }
+    bind "p" { SwitchToMode "normal"; }
+    bind "tab" { SwitchFocus; }
+  }
+
+  tab {
+    bind "h" "left" "k" "up" { GoToPreviousTab; }
+    bind "j" "down" "l" "right" { GoToNextTab; }
+    bind "n" { NewTab; SwitchToMode "locked"; }
+    bind "x" { CloseTab; SwitchToMode "locked"; }
+    bind "r" { SwitchToMode "renametab"; TabNameInput 0; }
+    bind "s" { ToggleActiveSyncTab; SwitchToMode "locked"; }
+    bind "t" { SwitchToMode "normal"; }
+    bind "1" { GoToTab 1; SwitchToMode "locked"; }
+    bind "2" { GoToTab 2; SwitchToMode "locked"; }
+    bind "3" { GoToTab 3; SwitchToMode "locked"; }
+    bind "4" { GoToTab 4; SwitchToMode "locked"; }
+    bind "5" { GoToTab 5; SwitchToMode "locked"; }
+    bind "6" { GoToTab 6; SwitchToMode "locked"; }
+    bind "7" { GoToTab 7; SwitchToMode "locked"; }
+    bind "8" { GoToTab 8; SwitchToMode "locked"; }
+    bind "9" { GoToTab 9; SwitchToMode "locked"; }
+    bind "0" { GoToTab 10; SwitchToMode "locked"; }
+  }
+
+  resize {
+    bind "h" "left" { Resize "Increase left"; }
+    bind "j" "down" { Resize "Increase down"; }
+    bind "k" "up" { Resize "Increase up"; }
+    bind "l" "right" { Resize "Increase right"; }
+    bind "+" "=" { Resize "Increase"; }
+    bind "-" { Resize "Decrease"; }
+    bind "r" { SwitchToMode "normal"; }
+  }
+
+  shared_among "scroll" "search" {
+    bind "j" "down" { ScrollDown; }
+    bind "k" "up" { ScrollUp; }
+    bind "h" "left" "PageUp" { PageScrollUp; }
+    bind "l" "right" "PageDown" { PageScrollDown; }
+    bind "d" "Shift J" { HalfPageScrollDown; }
+    bind "u" "Shift K" { HalfPageScrollUp; }
+    bind "Ctrl c" { ScrollToBottom; SwitchToMode "locked"; }
+  }
+
+  scroll {
+    bind "/" "f" { SwitchToMode "entersearch"; SearchInput 0; }
+  }
+
+  entersearch {
+    bind "Ctrl c" "esc" { SwitchToMode "scroll"; }
+    bind "enter" { SwitchToMode "search"; }
+  }
+
+  search {
+    bind "n" { Search "down"; }
+    bind "N" { Search "up"; }
+    bind "c" { SearchToggleOption "CaseSensitivity"; }
+    bind "o" { SearchToggleOption "WholeWord"; }
+    bind "w" { SearchToggleOption "Wrap"; }
+  }
+
+  session {
+    bind "d" { Detach; }
+    bind "o" { SwitchToMode "normal"; }
+    bind "p" { LaunchOrFocusPlugin "plugin-manager" { floating true; move_to_focused_tab true; }; SwitchToMode "locked"; }
+    bind "w" { LaunchOrFocusPlugin "session-manager" { floating true; move_to_focused_tab true; }; SwitchToMode "locked"; }
+  }
+
+  renametab {
+    bind "Ctrl c" { SwitchToMode "locked"; }
+    bind "esc" { UndoRenameTab; SwitchToMode "tab"; }
+  }
+
+  shared_except "locked" "entersearch" "renametab" {
+    bind "esc" "Ctrl space" { SwitchToMode "locked"; }
+  }
+}
+
+plugins {
+  plugin-manager location="zellij:plugin-manager"
+  session-manager location="zellij:session-manager"
+  zellij-tools location="file:target/wasm32-wasip1/debug/zellij-tools.wasm" {
+    scratchpads {
+      dev {
+        command "nu"
+        height "70%"
+        origin "center"
+        title "zellij-tools dev"
+        width "80%"
+      }
+    }
+  }
+  zjstatus location="https://github.com/dj95/zjstatus/releases/latest/download/zjstatus.wasm" {
+    datetime "#[fg=#888888,bold] {format} "
+    datetime_format "%H:%M:%S"
+    format_left "{mode} {tabs}"
+    format_right "{datetime}#[bg=#444444,fg=#ffffff,bold] {session} "
+    format_space ""
+    hide_frame_for_single_pane "false"
+    mode_locked "#[bg=#444444,fg=#ffffff,bold] LOCKED "
+    mode_normal "#[bg=#dddddd,fg=#222222,bold] NORMAL "
+    tab_active "#[bg=#555555,fg=#ffffff,bold] {index} {name} "
+    tab_normal "#[fg=#888888,bold] {index} {name} "
+    tab_separator " "
+  }
+}
+
+load_plugins {
+  zellij-tools
+}

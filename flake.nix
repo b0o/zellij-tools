@@ -7,6 +7,10 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    zellij-src = {
+      url = "github:zellij-org/zellij";
+      flake = false;
+    };
   };
 
   outputs = {
@@ -14,13 +18,38 @@
     crane,
     flake-utils,
     rust-overlay,
+    zellij-src,
     ...
   }:
     flake-utils.lib.eachSystem ["x86_64-linux" "aarch64-linux" "aarch64-darwin"] (
       system: let
+        zellijOverlay = final: prev: {
+          zellij = prev.zellij.override {
+            zellij-unwrapped = prev.zellij-unwrapped.overrideAttrs {
+              version = "0-unstable-${zellij-src.shortRev or "dirty"}";
+              src = zellij-src;
+              cargoDeps = final.rustPlatform.importCargoLock {
+                lockFile = "${zellij-src}/Cargo.lock";
+              };
+              # Zellij git removed docs/MANPAGE.md, but nixpkgs may still
+              # unconditionally run mandown against it in postInstall.
+              postInstall =
+                final.lib.optionalString (final.stdenv.buildPlatform.canExecute final.stdenv.hostPlatform)
+                # sh
+                ''
+                  installShellCompletion --cmd zellij \
+                    --bash <($out/bin/zellij setup --generate-completion bash) \
+                    --fish <($out/bin/zellij setup --generate-completion fish) \
+                    --zsh <($out/bin/zellij setup --generate-completion zsh)
+                '';
+              doInstallCheck = false;
+            };
+          };
+        };
+
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [(import rust-overlay)];
+          overlays = [(import rust-overlay) zellijOverlay];
         };
         inherit (pkgs) lib;
 
@@ -128,7 +157,7 @@
           libPath = lib.makeLibraryPath [openssl];
           script = pkgs.writeShellApplication {
             name = scriptName;
-            runtimeInputs = appRuntimeInputs;
+            runtimeInputs = appRuntimeInputs ++ (spec.runtimeInputs or []);
             text = ''
               export ZELLIJ_TOOLS_TARGET="${buildTarget}"
               export ZELLIJ_TOOLS_CLI_PACKAGE="${cliPackage}"
@@ -229,6 +258,16 @@
               # sh
               ''
                 nix flake check
+              '';
+          };
+
+          dev = {
+            description = "Run Zellij with the local dev config";
+            runtimeInputs = [pkgs.zellij];
+            command =
+              # sh
+              ''
+                zellij --config dev.kdl "$@"
               '';
           };
 

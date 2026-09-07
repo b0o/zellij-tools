@@ -1,0 +1,9 @@
+layout {
+    default_tab_template {
+        children
+        pane borderless=true size=1 {
+            plugin location="zjstatus"
+        }
+    }
+    tab name="dev"
+}

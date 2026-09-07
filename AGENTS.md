@@ -171,14 +171,21 @@ Plugin subscribes to:
 - Reproducible Nix commands:
   - `nix build .#default` - Build plugin wasm (`wasm32-wasip1`)
   - `nix build .#cli` - Build CLI binary
-  - `nix flake check` - Build/check flake outputs
+  - `nix flake check` - Build flake checks for plugin, CLI, and clippy outputs
 - Local development apps, backed by Cargo incremental builds:
-  - `nix run .#build` - Build plugin wasm (`wasm32-wasip1`)
+  - `nix run .#build-plugin` - Build plugin wasm (`wasm32-wasip1`)
   - `nix run .#build-cli` - Build CLI binary
-  - `nix run .#build-all` - Build plugin and CLI
+  - `nix run .#build` - Build plugin and CLI
+  - `nix run .#build-plugin-release` - Build plugin wasm in release mode
+  - `nix run .#build-cli-release` - Build CLI binary in release mode
+  - `nix run .#build-release` - Build plugin and CLI in release mode
   - `nix run .#test` - Run library tests
   - `nix run .#check` - `dprint check` + clippy (`-D warnings`) for plugin and CLI
   - `nix run .#fmt` - Format with `dprint` and `rustfmt`
+  - `nix run .#ci` - Run `nix flake check`
+  - `nix run .#dev -- <zellij args>` - Run Zellij from upstream main with `dev.kdl`
+  - `nix run .#run -- <args>` - Run the CLI with Cargo
+  - `nix run .#run-release -- <args>` - Run the CLI in release mode with Cargo
 
 CI/lint conventions:
 

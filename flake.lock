@@ -54,7 +54,8 @@
         "crane": "crane",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
-        "rust-overlay": "rust-overlay"
+        "rust-overlay": "rust-overlay",
+        "zellij-src": "zellij-src"
       }
     },
     "rust-overlay": {
@@ -89,6 +90,22 @@
       "original": {
         "owner": "nix-systems",
         "repo": "default",
+        "type": "github"
+      }
+    },
+    "zellij-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1788202855,
+        "narHash": "sha256-NKPDPUYBwmRzyyCcIldMlom01uAVoTSefNjXsWhYJj0=",
+        "owner": "zellij-org",
+        "repo": "zellij",
+        "rev": "af38660c5884f50bb3726682fb92961326c4268f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "zellij-org",
+        "repo": "zellij",
         "type": "github"
       }
     }
