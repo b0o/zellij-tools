@@ -40,7 +40,7 @@ pub enum ScratchpadCommand {
         tab_id: usize,
         coordinates: Option<ResolvedCoordinates>,
     },
-    /// Hide a pane (suppress)
+    /// Hide a pane without closing it.
     HidePane { pane_id: u32 },
     /// Close a pane
     ClosePane { pane_id: u32 },
@@ -76,6 +76,9 @@ pub struct ScratchpadManager {
     /// Scratchpads that were removed from config but still have active panes
     /// name -> set of tab_ids
     orphaned: HashMap<String, HashSet<usize>>,
+    /// Panes hidden by shrinking them rather than suppressing them in Zellij.
+    /// name -> set of tab_ids
+    hidden: HashMap<String, HashSet<usize>>,
 }
 
 impl ScratchpadManager {
@@ -87,6 +90,7 @@ impl ScratchpadManager {
             focus_times: HashMap::new(),
             just_shown: None,
             orphaned: HashMap::new(),
+            hidden: HashMap::new(),
         }
     }
 
@@ -196,6 +200,7 @@ impl ScratchpadManager {
     /// Returns commands to show orphaned panes (panes whose scratchpad names are not in current config).
     pub fn restore_state(&mut self, state: PersistedState) -> Vec<ScratchpadCommand> {
         self.panes.clear();
+        self.hidden.clear();
         for ((name, tab_id), pane_id) in state.panes {
             self.panes.entry(name).or_default().insert(tab_id, pane_id);
         }
@@ -383,6 +388,12 @@ impl ScratchpadManager {
         }
 
         if let Some(pane_id) = self.get_pane(name, ctx) {
+            if let Some(tab_id) = ctx.current_tab_id {
+                self.hidden
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(tab_id);
+            }
             vec![ScratchpadCommand::HidePane { pane_id }]
         } else {
             Vec::new()
@@ -408,6 +419,12 @@ impl ScratchpadManager {
                 inner.remove(&tab_id);
                 if inner.is_empty() {
                     self.focus_times.remove(name);
+                }
+            }
+            if let Some(inner) = self.hidden.get_mut(name) {
+                inner.remove(&tab_id);
+                if inner.is_empty() {
+                    self.hidden.remove(name);
                 }
             }
             vec![ScratchpadCommand::ClosePane { pane_id }]
@@ -483,6 +500,12 @@ impl ScratchpadManager {
             tab_id,
             coordinates: Some(coordinates),
         });
+        if let Some(hidden_tabs) = self.hidden.get_mut(name) {
+            hidden_tabs.remove(&tab_id);
+            if hidden_tabs.is_empty() {
+                self.hidden.remove(name);
+            }
+        }
         self.just_shown = Some(pane_id);
 
         // Re-hide panes that were hidden before
@@ -534,13 +557,17 @@ impl ScratchpadManager {
         let Some(pane_id) = self.get_pane(name, ctx) else {
             return false;
         };
+        if ctx
+            .current_tab_id
+            .is_some_and(|tab_id| self.is_explicitly_hidden(name, tab_id))
+        {
+            return false;
+        }
 
-        // Decide purely from the pane manifest, which is a single coherent
-        // PaneUpdate snapshot. A scratchpad hidden via `hide_pane_with_id` is
-        // marked `is_suppressed` in that same snapshot, so we don't need the
-        // separately-delivered tab-level `are_floating_panes_visible` flag.
-        // That flag arrives via a different event (TabUpdate) and can be stale
-        // relative to the manifest, which produced wrong toggle decisions.
+        // Decide from the explicit hidden state plus the pane manifest, which
+        // is a single coherent PaneUpdate snapshot. The separately-delivered
+        // tab-level `are_floating_panes_visible` flag can be stale relative to
+        // the manifest, which produced wrong toggle decisions.
         ctx.pane_manifest.values().flatten().any(|p| {
             p.id == pane_id && p.is_floating && !p.is_suppressed && !p.exited && !p.is_held
         })
@@ -550,6 +577,12 @@ impl ScratchpadManager {
         let Some(pane_id) = self.get_pane(name, ctx) else {
             return false;
         };
+        if ctx
+            .current_tab_id
+            .is_some_and(|tab_id| self.is_explicitly_hidden(name, tab_id))
+        {
+            return false;
+        }
 
         if self.just_shown == Some(pane_id) {
             return true;
@@ -579,9 +612,11 @@ impl ScratchpadManager {
 
         self.panes
             .iter()
-            .flat_map(|(name, inner)| inner.values().map(move |&pid| (name, pid)))
-            .find(|(_, pane_id)| *pane_id == focused_pane_id)
-            .map(|(name, _)| name.clone())
+            .flat_map(|(name, inner)| inner.iter().map(move |(&tab_id, &pid)| (name, tab_id, pid)))
+            .find(|(name, tab_id, pane_id)| {
+                *pane_id == focused_pane_id && !self.is_explicitly_hidden(name, *tab_id)
+            })
+            .map(|(name, _, _)| name.clone())
     }
 
     fn get_last_focused_on_current_tab(&self, ctx: &ScratchpadContext) -> Option<String> {
@@ -619,6 +654,9 @@ impl ScratchpadManager {
             .find(|(_, _, pid)| *pid == focused.id);
 
         if let Some((name, tab_id, _)) = found {
+            if self.is_explicitly_hidden(&name, tab_id) {
+                return;
+            }
             self.focus_counter += 1;
             self.focus_times
                 .entry(name)
@@ -678,6 +716,12 @@ impl ScratchpadManager {
                     self.orphaned.remove(&name);
                 }
             }
+            if let Some(inner) = self.hidden.get_mut(&name) {
+                inner.remove(&tab_id);
+                if inner.is_empty() {
+                    self.hidden.remove(&name);
+                }
+            }
         }
 
         commands
@@ -719,8 +763,20 @@ impl ScratchpadManager {
                     self.orphaned.remove(&name);
                 }
             }
+            if let Some(inner) = self.hidden.get_mut(&name) {
+                inner.remove(&tab_id);
+                if inner.is_empty() {
+                    self.hidden.remove(&name);
+                }
+            }
         }
         commands
+    }
+
+    fn is_explicitly_hidden(&self, name: &str, tab_id: usize) -> bool {
+        self.hidden
+            .get(name)
+            .is_some_and(|hidden_tabs| hidden_tabs.contains(&tab_id))
     }
 }
 
@@ -953,6 +1009,44 @@ mod tests {
         assert!(commands
             .iter()
             .any(|c| matches!(c, ScratchpadCommand::HidePane { pane_id: 42 })));
+    }
+
+    #[test]
+    fn toggle_minimized_hidden_scratchpad_shows_it() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+
+        let mut manifest = HashMap::new();
+        // The minimized-hide path leaves Zellij reporting the pane as a focused,
+        // unsuppressed floating pane, so the manager must use its own hidden state.
+        manifest.insert(0, vec![make_floating_pane(42, true)]);
+        let mut positions = HashMap::new();
+        positions.insert(0, 0);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        manager.register_pane("term", 0, 42);
+        manager.clear_just_shown();
+        let hide_commands = manager.handle_action(
+            ScratchpadAction::Hide {
+                name: "term".to_string(),
+                target: Default::default(),
+            },
+            &ctx,
+        );
+        assert!(hide_commands
+            .iter()
+            .any(|c| matches!(c, ScratchpadCommand::HidePane { pane_id: 42 })));
+
+        let show_commands = manager.handle_action(
+            ScratchpadAction::Toggle {
+                name: Some("term".to_string()),
+                target: Default::default(),
+            },
+            &ctx,
+        );
+
+        assert!(show_commands
+            .iter()
+            .any(|c| matches!(c, ScratchpadCommand::ShowPane { pane_id: 42, .. })));
     }
 
     #[test]

@@ -27,6 +27,8 @@ use zellij_tools::zjstatus::{
 
 const REGISTRY_LOCK_STALE_TIMEOUT_MS: u64 = 2_000;
 const REGISTRY_PENDING_TIMEOUT_MS: u64 = 2_000;
+const HIDDEN_FLOATING_PANE_POSITION: &str = "100%";
+const HIDDEN_FLOATING_PANE_SIZE: &str = "1";
 
 #[derive(Default)]
 struct State {
@@ -45,6 +47,7 @@ struct State {
     // Managers
     scratchpad: Option<ScratchpadManager>,
     event_stream: EventStream,
+    scratchpad_hide_strategy: ScratchpadHideStrategy,
 
     // Zellij runtime identity and permissions
     zellij_pid: Option<u32>,
@@ -64,6 +67,7 @@ struct State {
     include_path: Option<PathBuf>,
     // Inline scratchpad config from plugin configuration (for merging)
     inline_scratchpads_kdl: Option<String>,
+    inline_scratchpad_hide_strategy: ScratchpadHideStrategy,
     // Inline zjstatus config from plugin configuration (for merging)
     inline_zjstatus_kdl: Option<String>,
     // Resolved zjstatus output config, if enabled
@@ -85,11 +89,33 @@ struct State {
 struct MergedConfig {
     scratchpads: HashMap<String, ScratchpadConfig>,
     zjstatus: Option<ZjstatusConfig>,
+    scratchpad_hide_strategy: ScratchpadHideStrategy,
 }
 
 struct ExternalConfig {
     scratchpads: HashMap<String, ScratchpadConfig>,
     zjstatus: Option<ZjstatusConfigPatch>,
+    scratchpad_hide_strategy: Option<ScratchpadHideStrategy>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ScratchpadHideStrategy {
+    #[default]
+    Hide,
+    Minimize,
+}
+
+impl ScratchpadHideStrategy {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "hide" => Ok(Self::Hide),
+            "minimize" => Ok(Self::Minimize),
+            _ => Err(format!(
+                "invalid scratchpad_hide_strategy {:?}; expected \"hide\" or \"minimize\"",
+                value
+            )),
+        }
+    }
 }
 
 fn zjstatus_plugin_panes(pane_manifest: &HashMap<usize, Vec<PaneInfo>>) -> HashSet<(usize, u32)> {
@@ -149,6 +175,7 @@ impl State {
     fn load_merged_config(&self) -> MergedConfig {
         let mut scratchpads = HashMap::new();
         let mut zjstatus_layers = ZjstatusConfigLayers::default();
+        let mut scratchpad_hide_strategy = self.inline_scratchpad_hide_strategy;
 
         // First, parse inline config
         if let Some(ref inline_kdl) = self.inline_scratchpads_kdl {
@@ -171,6 +198,9 @@ impl State {
                     if let Some(zjstatus) = external_configs.zjstatus {
                         zjstatus_layers.push(zjstatus);
                     }
+                    if let Some(hide_strategy) = external_configs.scratchpad_hide_strategy {
+                        scratchpad_hide_strategy = hide_strategy;
+                    }
                 }
             }
         }
@@ -186,6 +216,7 @@ impl State {
         MergedConfig {
             scratchpads,
             zjstatus,
+            scratchpad_hide_strategy,
         }
     }
 
@@ -215,11 +246,24 @@ impl State {
             .and_then(|node| node.children())
             .map(parse_zjstatus_config_doc)
             .transpose()?;
+        let scratchpad_hide_strategy = Self::parse_string_child(&doc, "scratchpad_hide_strategy")
+            .map(|value| ScratchpadHideStrategy::parse(&value))
+            .transpose()?;
 
         Ok(ExternalConfig {
             scratchpads,
             zjstatus,
+            scratchpad_hide_strategy,
         })
+    }
+
+    fn parse_string_child(doc: &kdl::KdlDocument, key: &str) -> Option<String> {
+        doc.get(key)?
+            .entries()
+            .first()?
+            .value()
+            .as_string()
+            .map(ToString::to_string)
     }
 
     fn build_scratchpad_context(&self) -> ScratchpadContext<'_> {
@@ -379,6 +423,21 @@ impl State {
         }
     }
 
+    fn shrink_pane_for_hide(pane_id: u32) {
+        let coords = FloatingPaneCoordinates::new(
+            Some(HIDDEN_FLOATING_PANE_POSITION.to_string()),
+            Some(HIDDEN_FLOATING_PANE_POSITION.to_string()),
+            Some(HIDDEN_FLOATING_PANE_SIZE.to_string()),
+            Some(HIDDEN_FLOATING_PANE_SIZE.to_string()),
+            None,
+            Some(true),
+        );
+        if let Some(coords) = coords {
+            change_floating_panes_coordinates(vec![(PaneId::Terminal(pane_id), coords)]);
+            focus_previous_pane();
+        }
+    }
+
     fn register_existing_scratchpad_pane(&mut self, name: &str, tab_id: usize, pane_id: u32) {
         if let Some(ref mut mgr) = self.scratchpad {
             let register_cmds = mgr.register_pane(name, tab_id, pane_id);
@@ -452,6 +511,7 @@ impl State {
     }
 
     fn apply_merged_config(&mut self, config: MergedConfig) {
+        self.scratchpad_hide_strategy = config.scratchpad_hide_strategy;
         self.zjstatus_config = config.zjstatus;
         self.last_zjstatus_output = None;
         self.replace_scratchpad_configs(config.scratchpads);
@@ -574,7 +634,7 @@ impl State {
                             resolved.width,
                             resolved.height,
                             None,
-                            None,
+                            Some(false),
                         );
                         if let Some(coords) = coords {
                             change_floating_panes_coordinates(vec![(
@@ -585,9 +645,14 @@ impl State {
                     }
                     show_pane_with_id(PaneId::Terminal(pane_id), true, true);
                 }
-                ScratchpadCommand::HidePane { pane_id } => {
-                    hide_pane_with_id(PaneId::Terminal(pane_id));
-                }
+                ScratchpadCommand::HidePane { pane_id } => match self.scratchpad_hide_strategy {
+                    ScratchpadHideStrategy::Hide => {
+                        hide_pane_with_id(PaneId::Terminal(pane_id));
+                    }
+                    ScratchpadHideStrategy::Minimize => {
+                        Self::shrink_pane_for_hide(pane_id);
+                    }
+                },
                 ScratchpadCommand::ClosePane { pane_id } => {
                     close_terminal_pane(pane_id);
                 }
@@ -822,6 +887,15 @@ impl ZellijPlugin for State {
         // Store inline scratchpads config for merging
         self.inline_scratchpads_kdl = configuration.get("scratchpads").cloned();
         self.inline_zjstatus_kdl = configuration.get("zjstatus").cloned();
+        self.inline_scratchpad_hide_strategy = configuration
+            .get("scratchpad_hide_strategy")
+            .map(|value| ScratchpadHideStrategy::parse(value))
+            .transpose()
+            .unwrap_or_else(|err| {
+                eprintln!("Failed to parse scratchpad_hide_strategy: {}", err);
+                None
+            })
+            .unwrap_or_default();
 
         // Store raw include path - will resolve after /host is mounted to /
         if let Some(include) = configuration.get("include") {

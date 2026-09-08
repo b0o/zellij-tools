@@ -182,9 +182,10 @@ impl ScratchpadManager {
             .filter(|(&tab_id, _)| tab_filter.is_none() || tab_filter == Some(tab_id))
             .map(|(&tab_id, &pane_id)| {
                 let pane_info = pane_lookup.get(&pane_id);
-                let visible = pane_info
-                    .map(|p| p.is_floating && !p.is_suppressed && !p.exited && !p.is_held)
-                    .unwrap_or(false);
+                let visible = !self.is_explicitly_hidden(name, tab_id)
+                    && pane_info
+                        .map(|p| p.is_floating && !p.is_suppressed && !p.exited && !p.is_held)
+                        .unwrap_or(false);
 
                 ScratchpadInstanceInfo {
                     tab_id,
@@ -319,6 +320,34 @@ mod tests {
 
         let mut manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
         manifest.insert(0, vec![make_pane_info(42, true, true)]); // suppressed
+        let positions = HashMap::from([(1_usize, 0_usize)]);
+
+        let query = ScratchpadListQuery {
+            names: vec![],
+            tab_id: None,
+            full: false,
+        };
+        let entries = manager.list(&query, &manifest, &positions);
+        assert!(!entries[0].instances[0].visible);
+    }
+
+    #[test]
+    fn list_with_explicitly_hidden_instance() {
+        let configs = HashMap::from([("term".to_string(), make_config("nu"))]);
+        let mut manager = ScratchpadManager::new(configs);
+        manager
+            .panes
+            .entry("term".to_string())
+            .or_default()
+            .insert(1, 42);
+        manager
+            .hidden
+            .entry("term".to_string())
+            .or_default()
+            .insert(1);
+
+        let mut manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
+        manifest.insert(0, vec![make_pane_info(42, true, false)]);
         let positions = HashMap::from([(1_usize, 0_usize)]);
 
         let query = ScratchpadListQuery {
