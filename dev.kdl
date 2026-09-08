@@ -263,6 +263,8 @@ plugins {
     }
   }
   zjstatus location="https://github.com/dj95/zjstatus/releases/latest/download/zjstatus.wasm" {
+    pipe_scratchpads_format "{output} "
+    pipe_scratchpads_rendermode "dynamic"
     datetime "#[fg=#888888,bold] {format} "
     datetime_format "%H:%M:%S"
     format_left "{mode} {tabs}"
@@ -277,8 +279,6 @@ plugins {
     mode_search "#[bg=blue,fg=#222222,bold] SEARCH "
     mode_entersearch "#[bg=blue,fg=#222222,bold] ENTERSEARCH "
     mode_renametab "#[bg=red,fg=#222222,bold] RENAMETAB "
-    pipe_scratchpads_format "{output} "
-    pipe_scratchpads_rendermode "dynamic"
     mode_session "#[bg=cyan,fg=#222222,bold] SESSION "
     tab_active "#[bg=#555555,fg=#ffffff,bold] {index} {name} "
     tab_normal "#[fg=#888888,bold] {index} {name} {bell_indicator}"
