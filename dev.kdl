@@ -7,6 +7,8 @@ pane_frame_style "full"
 pane_frames false
 scroll_buffer_size 20000
 show_startup_tips false
+visual_bell true
+host_notification_protocol "off"
 
 keybinds clear-defaults=true {
   locked {
@@ -280,8 +282,12 @@ plugins {
     pipe_scratchpads_rendermode "dynamic"
     mode_session "#[bg=cyan,fg=#222222,bold] SESSION "
     tab_active "#[bg=#555555,fg=#ffffff,bold] {index} {name} "
-    tab_normal "#[fg=#888888,bold] {index} {name} "
+    tab_normal "#[fg=#888888,bold] {index} {name} {bell_indicator}"
     tab_separator " "
+    tab_bell_indicator "!"
+    tab_flashing_bell_indicator "!!"
+    tab_normal_bell "#[fg=#f38ba8,bg=$bg,bold] {index} {name} {bell_indicator} "
+    tab_normal_flashing_bell "#[fg=$bg,bg=#f38ba8,bold] {index} {name} {bell_indicator} "
   }
 }
 
