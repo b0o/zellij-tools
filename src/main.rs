@@ -443,7 +443,16 @@ impl State {
         panes
             .iter()
             .find(|pane| {
-                pane.id != pane_id && !pane.is_floating && !pane.exited && !pane.is_held
+                pane.id != pane_id
+                    && pane.is_floating
+                    && !pane.is_suppressed
+                    && !pane.exited
+                    && !pane.is_held
+            })
+            .or_else(|| {
+                panes.iter().find(|pane| {
+                    pane.id != pane_id && !pane.is_floating && !pane.exited && !pane.is_held
+                })
             })
             .map(|pane| {
                 if pane.is_plugin {
@@ -929,6 +938,27 @@ mod tests {
         assert_eq!(
             state.focus_target_for_minimized_hide(42),
             Some(PaneId::Terminal(7))
+        );
+    }
+
+    #[test]
+    fn minimized_hide_focus_target_prefers_visible_floating_pane() {
+        let mut state = State {
+            current_tab_position: 1,
+            ..Default::default()
+        };
+        state.pane_manifest.insert(
+            1,
+            vec![
+                pane(42, true, true, false),
+                pane(43, true, false, false),
+                pane(7, false, false, false),
+            ],
+        );
+
+        assert_eq!(
+            state.focus_target_for_minimized_hide(42),
+            Some(PaneId::Terminal(43))
         );
     }
 
