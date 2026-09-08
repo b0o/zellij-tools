@@ -192,3 +192,10 @@ CI/lint conventions:
 - Rust toolchain comes from `rust-toolchain.toml`
 - Clippy warnings are treated as errors
 - Workspace contains two crates: plugin root and `cli/`
+
+Release conventions:
+
+- Do not create GitHub releases manually. Push the release tag only; the GitHub release workflow creates the release.
+- Do not build or upload release assets manually. The GitHub release workflow builds and attaches platform assets.
+- For a patch release, make the code/version commits, push them, then create and push the `vX.Y.Z` tag.
+- Do not replace workflow-generated assets with locally-built artifacts.
