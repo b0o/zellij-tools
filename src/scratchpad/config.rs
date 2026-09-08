@@ -273,9 +273,10 @@ pub fn parse_scratchpad_action(args: &[&str]) -> Result<ScratchpadAction, ParseE
                 let id = args.get(index + 1).ok_or_else(|| {
                     ParseError::InvalidArgs("tab-id requires a value".to_string())
                 })?;
-                target.tab_id = Some(id.parse().map_err(|_| {
-                    ParseError::InvalidArgs(format!("Invalid tab ID: {}", id))
-                })?);
+                target.tab_id = Some(
+                    id.parse()
+                        .map_err(|_| ParseError::InvalidArgs(format!("Invalid tab ID: {}", id)))?,
+                );
                 index += 2;
             }
             "source-pane" => {
@@ -434,8 +435,7 @@ fn parse_origin(children: Option<&kdl::KdlDocument>) -> Result<Origin, Option<St
 }
 
 fn canonical_input_mode_name(mode: &str) -> Result<String, String> {
-    InputMode::from_str(mode)
-        .map_err(|_| format!("Invalid keybind mode: '{}'", mode))?;
+    InputMode::from_str(mode).map_err(|_| format!("Invalid keybind mode: '{}'", mode))?;
     let mode = mode.to_ascii_lowercase();
     if ALL_KEYBIND_MODES.contains(&mode.as_str()) {
         Ok(mode)
@@ -471,7 +471,10 @@ fn node_string_args(node: &kdl::KdlNode) -> Vec<String> {
 fn expanded_keybind_modes(block: &kdl::KdlNode) -> Result<Vec<String>, String> {
     let block_name = block.name().value();
     match block_name {
-        "shared" => Ok(ALL_KEYBIND_MODES.iter().map(|mode| (*mode).to_string()).collect()),
+        "shared" => Ok(ALL_KEYBIND_MODES
+            .iter()
+            .map(|mode| (*mode).to_string())
+            .collect()),
         "shared_except" => {
             let excluded = node_string_args(block)
                 .iter()
@@ -493,9 +496,7 @@ fn expanded_keybind_modes(block: &kdl::KdlNode) -> Result<Vec<String>, String> {
             }
             Ok(modes)
         }
-        mode => {
-            Ok(vec![canonical_input_mode_name(mode)?])
-        }
+        mode => Ok(vec![canonical_input_mode_name(mode)?]),
     }
 }
 
@@ -518,7 +519,10 @@ fn parse_keybind_action(node: &kdl::KdlNode) -> Result<ScratchpadKeybindAction, 
                 canonical_input_mode_name(mode)?,
             ))
         }
-        _ => Err(format!("Unsupported scratchpad keybind action: '{}'", action)),
+        _ => Err(format!(
+            "Unsupported scratchpad keybind action: '{}'",
+            action
+        )),
     }
 }
 
@@ -550,9 +554,12 @@ fn parse_scratchpad_keybinds(
     let mut keybinds = Vec::new();
     for mode_block in keybinds_doc.nodes() {
         let modes = expanded_keybind_modes(mode_block)?;
-        let mode_doc = mode_block
-            .children()
-            .ok_or_else(|| format!("keybind mode '{}' requires a block", mode_block.name().value()))?;
+        let mode_doc = mode_block.children().ok_or_else(|| {
+            format!(
+                "keybind mode '{}' requires a block",
+                mode_block.name().value()
+            )
+        })?;
 
         for bind_node in mode_doc.nodes() {
             if bind_node.name().value() != "bind" {
@@ -585,7 +592,11 @@ fn scratchpad_action_payload(name: &str, action: &str) -> String {
     format!("zellij-tools::scratchpad::{}::{}", action, name)
 }
 
-fn scratchpad_keybind_pipe_action(scratchpad_name: &str, action: &str, own_plugin_id: u32) -> Action {
+fn scratchpad_keybind_pipe_action(
+    scratchpad_name: &str,
+    action: &str,
+    own_plugin_id: u32,
+) -> Action {
     Action::KeybindPipe {
         name: Some("zellij-tools".to_string()),
         payload: Some(scratchpad_action_payload(scratchpad_name, action)),
@@ -663,7 +674,14 @@ pub fn build_scratchpad_keybind_reconfigure(
     configs: &HashMap<String, ScratchpadConfig>,
     own_plugin_id: u32,
     installed: &[ScratchpadKeybindUnbind],
-) -> Result<(Vec<ScratchpadKeybindUnbind>, Vec<ScratchpadKeybindUnbind>, String), String> {
+) -> Result<
+    (
+        Vec<ScratchpadKeybindUnbind>,
+        Vec<ScratchpadKeybindUnbind>,
+        String,
+    ),
+    String,
+> {
     let mut mode_binds: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut new_installed = Vec::new();
     let mut configs: Vec<(&String, &ScratchpadConfig)> = configs.iter().collect();
@@ -858,7 +876,10 @@ mod tests {
     #[test]
     fn parse_toggle_no_name() {
         let action = parse_scratchpad_action(&args(&["toggle"])).unwrap();
-        assert!(matches!(action, ScratchpadAction::Toggle { name: None, .. }));
+        assert!(matches!(
+            action,
+            ScratchpadAction::Toggle { name: None, .. }
+        ));
     }
 
     #[test]
@@ -919,13 +940,9 @@ mod tests {
 
     #[test]
     fn parse_action_with_source_pane_target() {
-        let action = parse_scratchpad_action(&args(&[
-            "show",
-            "term",
-            "source-pane",
-            "terminal_12",
-        ]))
-        .unwrap();
+        let action =
+            parse_scratchpad_action(&args(&["show", "term", "source-pane", "terminal_12"]))
+                .unwrap();
         match action {
             ScratchpadAction::Show { target, .. } => {
                 assert_eq!(target.tab_id, None);
@@ -1391,7 +1408,10 @@ mod tests {
 
         match &rebinds[0].2[0] {
             Action::KeybindPipe { payload, .. } => {
-                assert_eq!(payload.as_deref(), Some("zellij-tools::scratchpad::hide::term"));
+                assert_eq!(
+                    payload.as_deref(),
+                    Some("zellij-tools::scratchpad::hide::term")
+                );
             }
             action => panic!("expected KeybindPipe, got {action:?}"),
         }
@@ -1420,11 +1440,15 @@ mod tests {
                 InputMode::Locked,
                 KeyWithModifier::from_str("Ctrl d").unwrap(),
             ),
-            (InputMode::Normal, KeyWithModifier::from_str("Alt t").unwrap()),
+            (
+                InputMode::Normal,
+                KeyWithModifier::from_str("Alt t").unwrap(),
+            ),
         ];
 
         let keybinds = keybind_with_actions(vec![ScratchpadKeybindAction::Toggle]);
-        let (unbinds, _) = build_scratchpad_keybind_update("term", &keybinds, 42, &installed).unwrap();
+        let (unbinds, _) =
+            build_scratchpad_keybind_update("term", &keybinds, 42, &installed).unwrap();
 
         assert_eq!(unbinds, installed);
     }

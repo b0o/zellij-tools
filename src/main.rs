@@ -11,13 +11,19 @@ use zellij_tools::events::{
 use zellij_tools::focus::{parse_focus_tab_target, FocusTabTarget};
 use zellij_tools::message::{parse_message, parse_tree_tab_filter, ParseError, TreeTabFilter};
 use zellij_tools::scratchpad::{
-    build_scratchpad_keybind_reconfigure, parse_scratchpad_action, parse_scratchpads_kdl,
-    acquire_registry_lock, registry_file_path, registry_lock_path, registry_temp_file_path,
-    OpenDecision, RegistryLockMetadata, RegistryRecordState, ScratchpadCommand, ScratchpadConfig,
-    ScratchpadContext, ScratchpadKeybindUnbind, ScratchpadListQuery, ScratchpadManager,
-    ScratchpadRegistry, ScratchpadAction, ScratchpadActionTarget,
+    acquire_registry_lock, build_scratchpad_keybind_reconfigure, parse_scratchpad_action,
+    parse_scratchpads_kdl, registry_file_path, registry_lock_path, registry_temp_file_path,
+    OpenDecision, RegistryLockMetadata, RegistryRecordState, ScratchpadAction,
+    ScratchpadActionTarget, ScratchpadCommand, ScratchpadConfig, ScratchpadContext,
+    ScratchpadKeybindUnbind, ScratchpadListQuery, ScratchpadManager, ScratchpadRegistry,
+    ScratchpadStatusSnapshot,
 };
 use zellij_tools::tree;
+use zellij_tools::zjstatus::{
+    parse_zjstatus_config_doc, parse_zjstatus_config_kdl, render as render_zjstatus,
+    should_publish_empty as should_publish_empty_zjstatus, zjstatus_payload, ZjstatusConfig,
+    ZjstatusConfigLayers, ZjstatusConfigPatch,
+};
 
 const REGISTRY_LOCK_STALE_TIMEOUT_MS: u64 = 2_000;
 const REGISTRY_PENDING_TIMEOUT_MS: u64 = 2_000;
@@ -58,12 +64,51 @@ struct State {
     include_path: Option<PathBuf>,
     // Inline scratchpad config from plugin configuration (for merging)
     inline_scratchpads_kdl: Option<String>,
+    // Inline zjstatus config from plugin configuration (for merging)
+    inline_zjstatus_kdl: Option<String>,
+    // Resolved zjstatus output config, if enabled
+    zjstatus_config: Option<ZjstatusConfig>,
+    // Last published zjstatus output, used to avoid duplicate event spam
+    last_zjstatus_output: Option<String>,
+    // Known zjstatus plugin panes, used to detect newly-created status bars.
+    zjstatus_plugin_panes: HashSet<(usize, u32)>,
+    // Republish after pane/tab churn settles so newly-created status bars receive state.
+    pending_zjstatus_publish: bool,
     // Whether we need to mount / after permissions are granted
     needs_host_mount: bool,
     // Last modified time of external config (for polling)
     config_last_modified: Option<std::time::SystemTime>,
     // Watch interval in milliseconds (None = disabled, Some(ms) = poll interval)
     watch_interval_ms: Option<u64>,
+}
+
+struct MergedConfig {
+    scratchpads: HashMap<String, ScratchpadConfig>,
+    zjstatus: Option<ZjstatusConfig>,
+}
+
+struct ExternalConfig {
+    scratchpads: HashMap<String, ScratchpadConfig>,
+    zjstatus: Option<ZjstatusConfigPatch>,
+}
+
+fn zjstatus_plugin_panes(pane_manifest: &HashMap<usize, Vec<PaneInfo>>) -> HashSet<(usize, u32)> {
+    pane_manifest
+        .iter()
+        .flat_map(|(&tab_position, panes)| {
+            panes.iter().filter_map(move |pane| {
+                let is_zjstatus = pane
+                    .plugin_url
+                    .as_deref()
+                    .is_some_and(is_zjstatus_plugin_url);
+                (pane.is_plugin && is_zjstatus).then_some((tab_position, pane.id))
+            })
+        })
+        .collect()
+}
+
+fn is_zjstatus_plugin_url(url: &str) -> bool {
+    url == "zjstatus" || url.contains("zjstatus")
 }
 
 register_plugin!(State);
@@ -101,15 +146,20 @@ impl State {
     }
 
     /// Load and merge inline + external configs
-    fn load_merged_configs(
-        &self,
-    ) -> std::collections::HashMap<String, zellij_tools::scratchpad::ScratchpadConfig> {
-        let mut configs = std::collections::HashMap::new();
+    fn load_merged_config(&self) -> MergedConfig {
+        let mut scratchpads = HashMap::new();
+        let mut zjstatus_layers = ZjstatusConfigLayers::default();
 
         // First, parse inline config
         if let Some(ref inline_kdl) = self.inline_scratchpads_kdl {
             if let Ok(inline_configs) = parse_scratchpads_kdl(inline_kdl) {
-                configs.extend(inline_configs);
+                scratchpads.extend(inline_configs);
+            }
+        }
+        if let Some(ref inline_kdl) = self.inline_zjstatus_kdl {
+            match parse_zjstatus_config_kdl(inline_kdl) {
+                Ok(inline_config) => zjstatus_layers.push(inline_config),
+                Err(err) => eprintln!("Failed to parse inline zjstatus config: {}", err),
             }
         }
 
@@ -117,19 +167,30 @@ impl State {
         if let Some(ref include_path) = self.include_path {
             if let Ok(contents) = std::fs::read_to_string(include_path) {
                 if let Ok(external_configs) = Self::parse_external_config(&contents) {
-                    configs.extend(external_configs);
+                    scratchpads.extend(external_configs.scratchpads);
+                    if let Some(zjstatus) = external_configs.zjstatus {
+                        zjstatus_layers.push(zjstatus);
+                    }
                 }
             }
         }
 
-        configs
+        let zjstatus = match zjstatus_layers.into_config() {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("Failed to finalize zjstatus config: {}", err);
+                None
+            }
+        };
+
+        MergedConfig {
+            scratchpads,
+            zjstatus,
+        }
     }
 
     /// Parse external config file (expects `scratchpads { ... }` at top level)
-    fn parse_external_config(
-        contents: &str,
-    ) -> Result<std::collections::HashMap<String, zellij_tools::scratchpad::ScratchpadConfig>, String>
-    {
+    fn parse_external_config(contents: &str) -> Result<ExternalConfig, String> {
         use kdl::KdlDocument;
 
         let doc: KdlDocument = contents
@@ -137,17 +198,28 @@ impl State {
             .map_err(|e| format!("KDL parse error: {}", e))?;
 
         // Find scratchpads node
-        if let Some(scratchpads_node) = doc.get("scratchpads") {
+        let scratchpads = if let Some(scratchpads_node) = doc.get("scratchpads") {
             if let Some(children) = scratchpads_node.children() {
                 // Convert children back to string and parse
                 let scratchpads_kdl = children.to_string();
                 parse_scratchpads_kdl(&scratchpads_kdl)
             } else {
-                Ok(std::collections::HashMap::new())
+                Ok(HashMap::new())
             }
         } else {
-            Ok(std::collections::HashMap::new())
-        }
+            Ok(HashMap::new())
+        }?;
+
+        let zjstatus = doc
+            .get("zjstatus")
+            .and_then(|node| node.children())
+            .map(parse_zjstatus_config_doc)
+            .transpose()?;
+
+        Ok(ExternalConfig {
+            scratchpads,
+            zjstatus,
+        })
     }
 
     fn build_scratchpad_context(&self) -> ScratchpadContext<'_> {
@@ -158,7 +230,12 @@ impl State {
         self.position_to_tab_id
             .get(&self.current_tab_position)
             .copied()
-            .or_else(|| self.tab_infos.iter().find(|tab| tab.active).map(|tab| tab.tab_id))
+            .or_else(|| {
+                self.tab_infos
+                    .iter()
+                    .find(|tab| tab.active)
+                    .map(|tab| tab.tab_id)
+            })
     }
 
     fn build_scratchpad_context_for_tab_id(
@@ -202,7 +279,11 @@ impl State {
         target
             .tab_id
             .or_else(|| target.current_tab.then(|| self.current_tab_id()).flatten())
-            .or_else(|| target.source_pane.and_then(|pane_id| self.tab_id_for_source_pane(pane_id)))
+            .or_else(|| {
+                target
+                    .source_pane
+                    .and_then(|pane_id| self.tab_id_for_source_pane(pane_id))
+            })
     }
 
     fn scratchpad_action_target_tab_id(&self, action: &ScratchpadAction) -> Option<usize> {
@@ -251,22 +332,22 @@ impl State {
         let now_ms = Self::current_time_ms();
         let metadata = RegistryLockMetadata {
             plugin_id: own_plugin_id,
-            client_id: self.own_client_id.map(|client_id| client_id as u32).unwrap_or_default(),
+            client_id: self
+                .own_client_id
+                .map(|client_id| client_id as u32)
+                .unwrap_or_default(),
             created_ms: now_ms,
         };
         let lock_path = registry_lock_path(zellij_pid);
-        let _lock = match acquire_registry_lock(
-            &lock_path,
-            &metadata,
-            REGISTRY_LOCK_STALE_TIMEOUT_MS,
-        ) {
-            Ok(Some(lock)) => lock,
-            Ok(None) => return None,
-            Err(err) => {
-                eprintln!("Failed to acquire scratchpad registry lock: {}", err);
-                return None;
-            }
-        };
+        let _lock =
+            match acquire_registry_lock(&lock_path, &metadata, REGISTRY_LOCK_STALE_TIMEOUT_MS) {
+                Ok(Some(lock)) => lock,
+                Ok(None) => return None,
+                Err(err) => {
+                    eprintln!("Failed to acquire scratchpad registry lock: {}", err);
+                    return None;
+                }
+            };
 
         let path = registry_file_path(zellij_pid);
         let temp_path = registry_temp_file_path(zellij_pid, own_plugin_id);
@@ -279,12 +360,7 @@ impl State {
         };
 
         let (live_tabs, live_panes) = self.live_registry_state();
-        registry.reconcile(
-            &live_tabs,
-            &live_panes,
-            now_ms,
-            REGISTRY_PENDING_TIMEOUT_MS,
-        );
+        registry.reconcile(&live_tabs, &live_panes, now_ms, REGISTRY_PENDING_TIMEOUT_MS);
         let result = f(&mut registry, own_plugin_id, now_ms);
 
         if let Err(err) = registry.write_atomic_to_path(&path, &temp_path) {
@@ -373,6 +449,57 @@ impl State {
         } else if !configs.is_empty() {
             self.scratchpad = Some(ScratchpadManager::new(configs));
         }
+    }
+
+    fn apply_merged_config(&mut self, config: MergedConfig) {
+        self.zjstatus_config = config.zjstatus;
+        self.last_zjstatus_output = None;
+        self.replace_scratchpad_configs(config.scratchpads);
+        self.publish_zjstatus(true);
+    }
+
+    fn zjstatus_snapshot(&self) -> ScratchpadStatusSnapshot {
+        if let Some(ref scratchpad) = self.scratchpad {
+            let ctx = self.build_scratchpad_context();
+            scratchpad.status_snapshot(&ctx)
+        } else {
+            ScratchpadStatusSnapshot::default()
+        }
+    }
+
+    fn publish_zjstatus(&mut self, force: bool) {
+        let Some(config) = self.zjstatus_config.clone() else {
+            return;
+        };
+        let output = render_zjstatus(&config, &self.zjstatus_snapshot());
+        if output.is_empty() && !should_publish_empty_zjstatus(&config) {
+            return;
+        }
+        if !force && self.last_zjstatus_output.as_deref() == Some(output.as_str()) {
+            return;
+        }
+
+        let payload = zjstatus_payload(&config.pipe, &output);
+        pipe_message_to_plugin(MessageToPlugin::new("zjstatus").with_payload(payload));
+        self.last_zjstatus_output = Some(output);
+    }
+
+    fn schedule_zjstatus_publish(&mut self) {
+        if self.zjstatus_config.is_none() || self.pending_zjstatus_publish {
+            return;
+        }
+        self.pending_zjstatus_publish = true;
+        set_timeout(0.25);
+    }
+
+    fn update_zjstatus_plugin_panes(&mut self) -> bool {
+        let panes = zjstatus_plugin_panes(&self.pane_manifest);
+        if panes == self.zjstatus_plugin_panes {
+            return false;
+        }
+
+        self.zjstatus_plugin_panes = panes;
+        true
     }
 
     fn execute_scratchpad_commands(&mut self, commands: Vec<ScratchpadCommand>) {
@@ -484,6 +611,7 @@ impl State {
                         self.scratchpad = Some(scratchpad);
                         if let Some(commands) = result {
                             self.execute_scratchpad_commands(commands);
+                            self.publish_zjstatus(false);
                             return Ok(());
                         }
                     }
@@ -579,7 +707,12 @@ impl State {
                     let commands = scratchpad.handle_action(action, &ctx);
                     self.scratchpad = Some(scratchpad);
                     self.execute_scratchpad_commands(commands);
+                    self.publish_zjstatus(false);
                 }
+                Ok(())
+            }
+            "zjstatus" if message.args.first().copied() == Some("refresh") => {
+                self.publish_zjstatus(true);
                 Ok(())
             }
             "subscribe" => {
@@ -662,6 +795,7 @@ impl ZellijPlugin for State {
             PermissionType::ReadCliPipes,
             PermissionType::FullHdAccess,
             PermissionType::Reconfigure,
+            PermissionType::MessageAndLaunchOtherPlugins,
         ]);
 
         subscribe(&[
@@ -675,6 +809,7 @@ impl ZellijPlugin for State {
 
         // Store inline scratchpads config for merging
         self.inline_scratchpads_kdl = configuration.get("scratchpads").cloned();
+        self.inline_zjstatus_kdl = configuration.get("zjstatus").cloned();
 
         // Store raw include path - will resolve after /host is mounted to /
         if let Some(include) = configuration.get("include") {
@@ -691,11 +826,8 @@ impl ZellijPlugin for State {
         }
 
         // Load inline configs immediately (external will load when HostFolderChanged arrives)
-        if let Some(ref inline_kdl) = self.inline_scratchpads_kdl {
-            if let Ok(configs) = parse_scratchpads_kdl(inline_kdl) {
-                self.replace_scratchpad_configs(configs);
-            }
-        }
+        let config = self.load_merged_config();
+        self.apply_merged_config(config);
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -773,6 +905,11 @@ impl ZellijPlugin for State {
                     self.scratchpad = Some(scratchpad);
                     self.execute_scratchpad_commands(commands);
                 }
+                let zjstatus_panes_changed = self.update_zjstatus_plugin_panes();
+                self.publish_zjstatus(false);
+                if zjstatus_panes_changed {
+                    self.schedule_zjstatus_publish();
+                }
             }
             Event::TabUpdate(tab_infos) => {
                 if let Some(active_tab) = tab_infos.iter().find(|t| t.active) {
@@ -819,6 +956,7 @@ impl ZellijPlugin for State {
                 }
 
                 self.tab_infos = tab_infos;
+                self.publish_zjstatus(false);
             }
             Event::HostFolderChanged(_new_path) => {
                 // Resolve include path now that /host is mounted to /
@@ -839,8 +977,8 @@ impl ZellijPlugin for State {
                     }
 
                     // Load the config
-                    let configs = self.load_merged_configs();
-                    self.replace_scratchpad_configs(configs);
+                    let config = self.load_merged_config();
+                    self.apply_merged_config(config);
 
                     // Start polling timer if watching is enabled
                     if let Some(interval_ms) = self.watch_interval_ms {
@@ -855,6 +993,7 @@ impl ZellijPlugin for State {
                 if result == PermissionStatus::Granted {
                     self.reconfigure_allowed = true;
                     self.register_configured_scratchpad_keybinds();
+                    self.publish_zjstatus(true);
                 }
 
                 // Mount root filesystem so we can access /proc/self/environ for config resolution
@@ -864,6 +1003,11 @@ impl ZellijPlugin for State {
                 }
             }
             Event::Timer(_elapsed) => {
+                if self.pending_zjstatus_publish {
+                    self.pending_zjstatus_publish = false;
+                    self.publish_zjstatus(true);
+                }
+
                 // Check if config file has changed (only if watching is enabled)
                 if let (Some(ref include_path), Some(interval_ms)) =
                     (&self.include_path, self.watch_interval_ms)
@@ -874,8 +1018,8 @@ impl ZellijPlugin for State {
                             self.config_last_modified = current_mtime;
 
                             // Reload config
-                            let new_configs = self.load_merged_configs();
-                            self.replace_scratchpad_configs(new_configs);
+                            let config = self.load_merged_config();
+                            self.apply_merged_config(config);
                         }
                     }
 

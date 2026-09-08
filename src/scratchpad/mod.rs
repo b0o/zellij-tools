@@ -2,6 +2,7 @@ mod config;
 mod list;
 mod persistence;
 mod registry;
+mod status;
 
 pub use config::{
     build_scratchpad_keybind_reconfigure, build_scratchpad_keybind_update,
@@ -16,6 +17,7 @@ pub use registry::{
     OpenDecision, RegistryFileLock, RegistryLockMetadata, RegistryRecord, RegistryRecordState,
     ScratchpadRegistry,
 };
+pub use status::{ScratchpadDisplayState, ScratchpadStatusItem, ScratchpadStatusSnapshot};
 
 use std::collections::{HashMap, HashSet};
 use zellij_tile::prelude::{CommandToRun, PaneInfo};
@@ -535,12 +537,9 @@ impl ScratchpadManager {
         // separately-delivered tab-level `are_floating_panes_visible` flag.
         // That flag arrives via a different event (TabUpdate) and can be stale
         // relative to the manifest, which produced wrong toggle decisions.
-        ctx.pane_manifest
-            .values()
-            .flatten()
-            .any(|p| {
-                p.id == pane_id && p.is_floating && !p.is_suppressed && !p.exited && !p.is_held
-            })
+        ctx.pane_manifest.values().flatten().any(|p| {
+            p.id == pane_id && p.is_floating && !p.is_suppressed && !p.exited && !p.is_held
+        })
     }
 
     fn is_focused(&self, name: &str, ctx: &ScratchpadContext) -> bool {

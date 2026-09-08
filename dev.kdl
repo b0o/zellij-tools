@@ -27,6 +27,19 @@ keybinds clear-defaults=true {
     bind "Shift V" { NewPane "right"; SwitchToMode "locked"; }
     bind "+" "=" { Resize "Increase"; }
     bind "-" { Resize "Decrease"; }
+    bind "1" { GoToTab 1; }
+    bind "2" { GoToTab 2; }
+    bind "3" { GoToTab 3; }
+    bind "4" { GoToTab 4; }
+    bind "5" { GoToTab 5; }
+    bind "6" { GoToTab 6; }
+    bind "7" { GoToTab 7; }
+    bind "8" { GoToTab 8; }
+    bind "9" { GoToTab 9; }
+    bind "0" { GoToTab 10; }
+    bind ";" { GoToPreviousTab; }
+    bind "'" { GoToNextTab; }
+    bind "Enter" { NewTab; }
   }
 
   shared_among "normal" "locked" {
@@ -39,16 +52,22 @@ keybinds clear-defaults=true {
       MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::dev"; }
       SwitchToMode "locked"
     }
-    bind "Ctrl Alt 1" { GoToTab 1; }
-    bind "Ctrl Alt 2" { GoToTab 2; }
-    bind "Ctrl Alt 3" { GoToTab 3; }
-    bind "Ctrl Alt 4" { GoToTab 4; }
-    bind "Ctrl Alt 5" { GoToTab 5; }
-    bind "Ctrl Alt 6" { GoToTab 6; }
-    bind "Ctrl Alt 7" { GoToTab 7; }
-    bind "Ctrl Alt 8" { GoToTab 8; }
-    bind "Ctrl Alt 9" { GoToTab 9; }
-    bind "Ctrl Alt 0" { GoToTab 10; }
+    bind "Ctrl Shift B" {
+      MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::monitor"; }
+      SwitchToMode "locked"
+    }
+    bind "Ctrl Shift G" {
+      MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::git"; }
+      SwitchToMode "locked"
+    }
+    bind "Ctrl Shift N" {
+      MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::notes"; }
+      SwitchToMode "locked"
+    }
+    bind "Ctrl Shift R" {
+      MessagePlugin "zellij-tools" { payload "zellij-tools::zjstatus::refresh"; }
+      SwitchToMode "locked"
+    }
   }
 
   pane {
@@ -151,20 +170,115 @@ plugins {
         command "nu"
         height "70%"
         origin "center"
-        title "zellij-tools dev"
+        title "sh"
         width "80%"
       }
+      git {
+        command "bash" "-lc" "git status --short --branch; exec bash"
+        height "35%"
+        origin "bottom" "left"
+        title "git"
+        width "45%"
+      }
+      monitor {
+        command "top"
+        height "60%"
+        origin "top" "right"
+        title "mon"
+        width "45%"
+      }
+      notes {
+        command "nu"
+        height "45%"
+        origin "bottom" "right"
+        title "note"
+        width "50%"
+      }
+    }
+
+    zjstatus {
+      // Logical zjstatus pipe name. This publishes to the zjstatus widget named
+      // pipe_scratchpads, which is rendered below with {pipe_scratchpads}.
+      pipe "scratchpads"
+
+      // Top-level format placeholders:
+      // - {current_items}: rendered items for the active tab
+      // - {global_items}: rendered aggregate items across the session
+      // - Global live/visible/hidden/rendered counts count pane instances, not
+      //   aggregate item names. If the same scratchpad is open on two tabs, it
+      //   contributes 2 to those counts while rendering once in {global_items}.
+      // - {current_configured_count}, {global_configured_count}: configured
+      //   scratchpads after include/exclude filters, before item rendering
+      // - {current_rendered_count}, {global_rendered_count}: items rendered
+      //   after empty item formats are filtered out
+      // - {current_live_count}, {global_live_count}: scratchpads with a live pane
+      // - {current_visible_count}, {global_visible_count}: visible items
+      // - {current_hidden_count}, {global_hidden_count}: hidden/suppressed items
+      // - {current_closed_count}, {global_closed_count}: configured but closed
+      // - {other_configured_count}, {other_rendered_count}, {other_live_count},
+      //   {other_visible_count}, {other_hidden_count}, {other_closed_count}:
+      //   global count minus current count
+      // - {current_focused_name}, {global_focused_name}: focused scratchpad name
+      // - {current_focused_title}, {global_focused_title}: focused title
+      format "#[fg=#808080]  {current_items}#[fg=#666666]+{other_live_count}"
+
+      // Used when the rendered output is empty. Leave empty to avoid clearing a
+      // previously populated zjstatus pipe during transient tab/pane updates.
+      empty_format ""
+
+      // Item format placeholders:
+      // - {name}: scratchpad config name
+      // - {title}: configured title, falling back to name
+      // - {state}: visible, hidden, or closed
+      // - {icon}: fixed state icon (visible ●, hidden ○, closed ×)
+      // - {pane_id}, {tab_id}, {tab_position}: live pane/tab identifiers
+      // - {is_focused}: true or false
+      //
+      // current_item_focused_format is an active-tab-only override for focused
+      // scratchpads. If it is unset, normal state fallback is used.
+      //
+      // Format fallback order for non-focused items is:
+      // - <scope>_item_<state>_format
+      // - item_<state>_format
+      // - <scope>_item_format
+      // - item_format
+      //
+      // Set a state-specific format to "" to filter those items out. For
+      // example, current_item_closed_format "" hides closed current-tab items.
+      current_item_focused_format "#[fg=#7583FF,bold]{title} "
+      current_item_visible_format "#[fg=#585d8d,bold]{title} "
+      current_item_hidden_format "#[fg=#666666]{title} "
+      current_item_closed_format ""
+
+      // Optional separator overrides:
+      // - item_separator applies to both scopes
+      // - current_item_separator overrides current items only
+      // - global_item_separator overrides global items only
+      item_separator ""
+
+      // Optional name filters, not used in this dev config:
+      // include "dev" "monitor"
+      // exclude "notes"
     }
   }
   zjstatus location="https://github.com/dj95/zjstatus/releases/latest/download/zjstatus.wasm" {
     datetime "#[fg=#888888,bold] {format} "
     datetime_format "%H:%M:%S"
     format_left "{mode} {tabs}"
-    format_right "{datetime}#[bg=#444444,fg=#ffffff,bold] {session} "
+    format_right "{pipe_scratchpads} {datetime}#[bg=#444444,fg=#ffffff,bold] {session} "
     format_space ""
     hide_frame_for_single_pane "false"
     mode_locked "#[bg=#444444,fg=#ffffff,bold] LOCKED "
-    mode_normal "#[bg=#dddddd,fg=#222222,bold] NORMAL "
+    mode_normal "#[bg=green,fg=#222222,bold] NORMAL "
+    mode_tab "#[bg=yellow,fg=#222222,bold] TAB "
+    mode_pane "#[bg=magenta,fg=#222222,bold] PANE "
+    mode_resize "#[bg=orange,fg=#222222,bold] RESIZE "
+    mode_search "#[bg=blue,fg=#222222,bold] SEARCH "
+    mode_entersearch "#[bg=blue,fg=#222222,bold] ENTERSEARCH "
+    mode_renametab "#[bg=red,fg=#222222,bold] RENAMETAB "
+    pipe_scratchpads_format "{output} "
+    pipe_scratchpads_rendermode "dynamic"
+    mode_session "#[bg=cyan,fg=#222222,bold] SESSION "
     tab_active "#[bg=#555555,fg=#ffffff,bold] {index} {name} "
     tab_normal "#[fg=#888888,bold] {index} {name} "
     tab_separator " "
@@ -174,3 +288,5 @@ plugins {
 load_plugins {
   zellij-tools
 }
+
+// vim: set ts=2 sw=2 tw=0 et :

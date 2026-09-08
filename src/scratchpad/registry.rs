@@ -174,9 +174,9 @@ impl ScratchpadRegistry {
             }
 
             match record.state {
-                RegistryRecordState::Present { pane_id } => {
-                    live_panes.get(&pane_id).is_some_and(|tab_id| *tab_id == record.tab_id)
-                }
+                RegistryRecordState::Present { pane_id } => live_panes
+                    .get(&pane_id)
+                    .is_some_and(|tab_id| *tab_id == record.tab_id),
                 RegistryRecordState::Pending { .. } => {
                     !is_stale(record.updated_at_ms, now_ms, pending_timeout_ms)
                 }
@@ -220,9 +220,8 @@ pub fn acquire_registry_lock(
             if lock_is_stale(path, metadata.created_ms, stale_timeout_ms)? {
                 fs::remove_file(path)
                     .map_err(|err| format!("Failed to remove stale lock {:?}: {}", path, err))?;
-                create_lock_file(path, metadata).map_err(|err| {
-                    format!("Failed to create registry lock {:?}: {}", path, err)
-                })?;
+                create_lock_file(path, metadata)
+                    .map_err(|err| format!("Failed to create registry lock {:?}: {}", path, err))?;
                 Ok(Some(RegistryFileLock {
                     path: path.to_path_buf(),
                 }))
@@ -230,7 +229,10 @@ pub fn acquire_registry_lock(
                 Ok(None)
             }
         }
-        Err(err) => Err(format!("Failed to create registry lock {:?}: {}", path, err)),
+        Err(err) => Err(format!(
+            "Failed to create registry lock {:?}: {}",
+            path, err
+        )),
     }
 }
 
@@ -423,7 +425,11 @@ mod tests {
             client_id: 1,
             created_ms: 100,
         };
-        drop(acquire_registry_lock(&path, &old_metadata, TIMEOUT_MS).unwrap().unwrap());
+        drop(
+            acquire_registry_lock(&path, &old_metadata, TIMEOUT_MS)
+                .unwrap()
+                .unwrap(),
+        );
         fs::write(&path, serde_json::to_vec(&old_metadata).unwrap()).unwrap();
 
         let new_metadata = RegistryLockMetadata {
@@ -434,7 +440,8 @@ mod tests {
         let lock = acquire_registry_lock(&path, &new_metadata, TIMEOUT_MS).unwrap();
 
         assert!(lock.is_some());
-        let restored: RegistryLockMetadata = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let restored: RegistryLockMetadata =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(restored, new_metadata);
     }
 
@@ -465,6 +472,9 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         let restored: ScratchpadRegistry = serde_json::from_str(&contents).unwrap();
 
-        assert_eq!(restored.record("term", 7).map(|record| &record.state), Some(&RegistryRecordState::Present { pane_id: 42 }));
+        assert_eq!(
+            restored.record("term", 7).map(|record| &record.state),
+            Some(&RegistryRecordState::Present { pane_id: 42 })
+        );
     }
 }
