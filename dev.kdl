@@ -197,8 +197,6 @@ plugins {
       }
     }
 
-    scratchpad_hide_strategy "minimize"
-
     zjstatus {
       // Logical zjstatus pipe name. This publishes to the zjstatus widget named
       // pipe_scratchpads, which is rendered below with {pipe_scratchpads}.

@@ -95,7 +95,7 @@ impl ScratchpadManager {
             .panes
             .get(name)
             .and_then(|panes| panes.get(&tab_id).copied())
-            .and_then(|pane_id| self.live_instance(name, pane_id, tab_id, ctx, pane_lookup));
+            .and_then(|pane_id| self.live_instance(pane_id, tab_id, ctx, pane_lookup));
 
         match instance {
             Some(instance) => ScratchpadStatusItem::from_instance(name, title, instance),
@@ -115,9 +115,7 @@ impl ScratchpadManager {
             .get(name)
             .into_iter()
             .flat_map(|panes| panes.iter())
-            .filter_map(|(&tab_id, &pane_id)| {
-                self.live_instance(name, pane_id, tab_id, ctx, pane_lookup)
-            })
+            .filter_map(|(&tab_id, &pane_id)| self.live_instance(pane_id, tab_id, ctx, pane_lookup))
             .collect::<Vec<_>>();
 
         if instances.is_empty() {
@@ -159,9 +157,7 @@ impl ScratchpadManager {
             .get(name)
             .into_iter()
             .flat_map(|panes| panes.iter())
-            .filter_map(|(&tab_id, &pane_id)| {
-                self.live_instance(name, pane_id, tab_id, ctx, pane_lookup)
-            })
+            .filter_map(|(&tab_id, &pane_id)| self.live_instance(pane_id, tab_id, ctx, pane_lookup))
             .map(|instance| ScratchpadStatusItem::from_instance(name, title.clone(), instance))
             .collect::<Vec<_>>();
 
@@ -174,7 +170,6 @@ impl ScratchpadManager {
 
     fn live_instance(
         &self,
-        name: &str,
         pane_id: u32,
         tab_id: usize,
         ctx: &ScratchpadContext<'_>,
@@ -188,9 +183,8 @@ impl ScratchpadManager {
             return None;
         }
 
-        let is_hidden = self.is_explicitly_hidden(name, tab_id);
-        let is_focused = !is_hidden && (self.just_shown == Some(pane_id) || pane.is_focused);
-        let state = if pane.is_floating && !pane.is_suppressed && !is_hidden {
+        let is_focused = self.just_shown == Some(pane_id) || pane.is_focused;
+        let state = if pane.is_floating && !pane.is_suppressed {
             ScratchpadDisplayState::Visible
         } else {
             ScratchpadDisplayState::Hidden
@@ -358,32 +352,6 @@ mod tests {
         assert!(snapshot.current_items[0].is_focused);
         assert_eq!(snapshot.current_items[0].pane_id, Some(42));
         assert_eq!(snapshot.current_items[0].title, "Terminal");
-    }
-
-    #[test]
-    fn snapshot_reports_explicitly_hidden_pane_as_hidden_and_unfocused() {
-        let mut manager =
-            ScratchpadManager::new(HashMap::from([("term".to_string(), make_config(None))]));
-        manager
-            .panes
-            .entry("term".to_string())
-            .or_default()
-            .insert(10, 42);
-        manager
-            .hidden
-            .entry("term".to_string())
-            .or_default()
-            .insert(10);
-        let manifest = HashMap::from([(0, vec![make_pane(42, false, true)])]);
-        let positions = HashMap::from([(10, 0)]);
-
-        let snapshot = manager.status_snapshot(&make_context(&manifest, &positions));
-
-        assert_eq!(
-            snapshot.current_items[0].state,
-            ScratchpadDisplayState::Hidden
-        );
-        assert!(!snapshot.current_items[0].is_focused);
     }
 
     #[test]

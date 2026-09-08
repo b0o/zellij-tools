@@ -74,7 +74,6 @@ Scratchpads can be configured inline or in an external file.
 ```kdl
 plugins {
     zellij-tools location="..." {
-        // scratchpad_hide_strategy "minimize"  // Default: "hide"
         scratchpads {
             term { command "zsh"; }
             btop { command "btop"; }
@@ -126,10 +125,6 @@ scratchpads {
     }
 }
 
-// Optional: keep scratchpads unsuppressed while hidden so bell/urgent state can still update.
-// Default is "hide", which uses Zellij's normal pane hiding behavior.
-scratchpad_hide_strategy "minimize"
-
 // Optional: publish scratchpad status to the zjstatus plugin.
 zjstatus {
     pipe "scratchpads"
@@ -158,14 +153,13 @@ The config directory is determined by (in order):
 
 ### Configuration Options
 
-| Option                     | Description                                                                                                   | Default       | Inline Config | External Config File |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------- | :-----------: | :------------------: |
-| `include`                  | Path to external config file                                                                                  | -             |      Yes      |          No          |
-| `config_dir`               | Override base directory for relative includes                                                                 | Auto-detected |      Yes      |          No          |
-| `watch_ms`                 | Polling interval in ms. `"false"` or `"0"` to disable.                                                        | `2000`        |      Yes      |          No          |
-| `scratchpad_hide_strategy` | `"hide"` uses Zellij's hidden-pane state. `"minimize"` shrinks panes instead to preserve bell/urgent updates. | `"hide"`      |      Yes      |         Yes          |
-| `scratchpads`              | Scratchpad definitions                                                                                        | -             |      Yes      |         Yes          |
-| `zjstatus`                 | Optional scratchpad status output for the zjstatus plugin                                                     | -             |      Yes      |         Yes          |
+| Option        | Description                                                | Default       | Inline Config | External Config File |
+| ------------- | ---------------------------------------------------------- | ------------- | :-----------: | :------------------: |
+| `include`     | Path to external config file                               | -             |      Yes      |          No          |
+| `config_dir`  | Override base directory for relative includes              | Auto-detected |      Yes      |          No          |
+| `watch_ms`    | Polling interval in ms. `"false"` or `"0"` to disable.     | `2000`        |      Yes      |          No          |
+| `scratchpads` | Scratchpad definitions                                     | -             |      Yes      |         Yes          |
+| `zjstatus`    | Optional scratchpad status output for the zjstatus plugin  | -             |      Yes      |         Yes          |
 
 ### Scratchpad Options
 
