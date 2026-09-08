@@ -502,6 +502,14 @@ impl State {
         true
     }
 
+    fn go_to_tab_id(&self, tab_id: usize) {
+        if let Some(position) = self.tab_id_to_position.get(&tab_id).copied() {
+            if let Ok(tab_index) = u32::try_from(position) {
+                go_to_tab(tab_index);
+            }
+        }
+    }
+
     fn execute_scratchpad_commands(&mut self, commands: Vec<ScratchpadCommand>) {
         for cmd in commands {
             match cmd {
@@ -531,6 +539,8 @@ impl State {
                         Some(OpenDecision::Open) | None => (),
                     }
 
+                    self.go_to_tab_id(tab_id);
+
                     let coords = FloatingPaneCoordinates::new(
                         coordinates.x,
                         coordinates.y,
@@ -553,8 +563,10 @@ impl State {
                 }
                 ScratchpadCommand::ShowPane {
                     pane_id,
+                    tab_id,
                     coordinates,
                 } => {
+                    self.go_to_tab_id(tab_id);
                     if let Some(resolved) = coordinates {
                         let coords = FloatingPaneCoordinates::new(
                             resolved.x,

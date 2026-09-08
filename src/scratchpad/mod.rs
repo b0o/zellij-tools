@@ -37,6 +37,7 @@ pub enum ScratchpadCommand {
     /// Show a pane (make visible and focus), optionally re-applying coordinates
     ShowPane {
         pane_id: u32,
+        tab_id: usize,
         coordinates: Option<ResolvedCoordinates>,
     },
     /// Hide a pane (suppress)
@@ -116,6 +117,7 @@ impl ScratchpadManager {
                     if !orphaned_set.is_some_and(|s| s.contains(&tab_id)) {
                         commands.push(ScratchpadCommand::ShowPane {
                             pane_id,
+                            tab_id,
                             coordinates: None,
                         });
                         // Defer insertion to avoid borrow conflict
@@ -216,6 +218,7 @@ impl ScratchpadManager {
                     if !is_already_orphaned {
                         commands.push(ScratchpadCommand::ShowPane {
                             pane_id,
+                            tab_id,
                             coordinates: None,
                         });
                         self.orphaned
@@ -477,6 +480,7 @@ impl ScratchpadManager {
 
         commands.push(ScratchpadCommand::ShowPane {
             pane_id,
+            tab_id,
             coordinates: Some(coordinates),
         });
         self.just_shown = Some(pane_id);
