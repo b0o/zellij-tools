@@ -423,7 +423,51 @@ impl State {
         }
     }
 
-    fn shrink_pane_for_hide(pane_id: u32) {
+    fn focused_minimized_hide_pane(&self, pane_id: u32) -> bool {
+        self.pane_manifest
+            .get(&self.current_tab_position)
+            .is_some_and(|panes| {
+                panes
+                    .iter()
+                    .any(|pane| pane.id == pane_id && pane.is_floating && pane.is_focused)
+            })
+    }
+
+    fn focus_target_for_minimized_hide(&self, pane_id: u32) -> Option<PaneId> {
+        let panes = self.pane_manifest.get(&self.current_tab_position)?;
+
+        if !self.focused_minimized_hide_pane(pane_id) {
+            return None;
+        }
+
+        panes
+            .iter()
+            .find(|pane| {
+                pane.id != pane_id && !pane.is_floating && !pane.exited && !pane.is_held
+            })
+            .map(|pane| {
+                if pane.is_plugin {
+                    PaneId::Plugin(pane.id)
+                } else {
+                    PaneId::Terminal(pane.id)
+                }
+            })
+    }
+
+    fn focus_pane_for_minimized_hide(&self, pane_id: u32) {
+        if !self.focused_minimized_hide_pane(pane_id) {
+            return;
+        }
+
+        match self.focus_target_for_minimized_hide(pane_id) {
+            Some(PaneId::Terminal(target_id)) => focus_terminal_pane(target_id, true, true),
+            Some(PaneId::Plugin(target_id)) => focus_plugin_pane(target_id, true, true),
+            None => focus_previous_pane(),
+        }
+    }
+
+    fn shrink_pane_for_hide(&self, pane_id: u32) {
+        self.focus_pane_for_minimized_hide(pane_id);
         let coords = FloatingPaneCoordinates::new(
             Some(HIDDEN_FLOATING_PANE_POSITION.to_string()),
             Some(HIDDEN_FLOATING_PANE_POSITION.to_string()),
@@ -434,7 +478,6 @@ impl State {
         );
         if let Some(coords) = coords {
             change_floating_panes_coordinates(vec![(PaneId::Terminal(pane_id), coords)]);
-            focus_previous_pane();
         }
     }
 
@@ -650,7 +693,7 @@ impl State {
                         hide_pane_with_id(PaneId::Terminal(pane_id));
                     }
                     ScratchpadHideStrategy::Minimize => {
-                        Self::shrink_pane_for_hide(pane_id);
+                        self.shrink_pane_for_hide(pane_id);
                     }
                 },
                 ScratchpadCommand::ClosePane { pane_id } => {
@@ -855,6 +898,49 @@ impl State {
     fn emit_event(&self, pipe_id: &str, json: &str) {
         // Append newline so CLI can read line-by-line with BufReader::lines()
         cli_pipe_output(pipe_id, &format!("{}\n", json));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(id: u32, is_floating: bool, is_focused: bool, is_plugin: bool) -> PaneInfo {
+        PaneInfo {
+            id,
+            is_floating,
+            is_focused,
+            is_plugin,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn minimized_hide_focus_target_prefers_tiled_pane_when_hidden_pane_is_focused() {
+        let mut state = State {
+            current_tab_position: 1,
+            ..Default::default()
+        };
+        state.pane_manifest.insert(
+            1,
+            vec![pane(42, true, true, false), pane(7, false, false, false)],
+        );
+
+        assert_eq!(
+            state.focus_target_for_minimized_hide(42),
+            Some(PaneId::Terminal(7))
+        );
+    }
+
+    #[test]
+    fn minimized_hide_focus_target_ignores_background_hidden_pane() {
+        let mut state = State::default();
+        state.pane_manifest.insert(
+            0,
+            vec![pane(42, true, false, false), pane(7, false, true, false)],
+        );
+
+        assert_eq!(state.focus_target_for_minimized_hide(42), None);
     }
 }
 
