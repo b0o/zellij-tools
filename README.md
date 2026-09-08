@@ -129,6 +129,15 @@ scratchpads {
 // Optional: keep scratchpads unsuppressed while hidden so bell/urgent state can still update.
 // Default is "hide", which uses Zellij's normal pane hiding behavior.
 scratchpad_hide_strategy "minimize"
+
+// Optional: publish scratchpad status to the zjstatus plugin.
+zjstatus {
+    pipe "scratchpads"
+    format "{current_items}"
+    current_item_visible_format "#[fg=green]{title}"
+    current_item_hidden_format "#[fg=gray]{title}"
+    current_item_closed_format ""
+}
 ```
 
 The plugin polls the external file for changes and automatically reloads scratchpad definitions.
@@ -156,6 +165,7 @@ The config directory is determined by (in order):
 | `watch_ms`                 | Polling interval in ms. `"false"` or `"0"` to disable.                                                        | `2000`        |      Yes      |          No          |
 | `scratchpad_hide_strategy` | `"hide"` uses Zellij's hidden-pane state. `"minimize"` shrinks panes instead to preserve bell/urgent updates. | `"hide"`      |      Yes      |         Yes          |
 | `scratchpads`              | Scratchpad definitions                                                                                        | -             |      Yes      |         Yes          |
+| `zjstatus`                 | Optional scratchpad status output for the zjstatus plugin                                                     | -             |      Yes      |         Yes          |
 
 ### Scratchpad Options
 
@@ -246,6 +256,77 @@ keybinds {
 
 Replace those with `keybinds { ... }` blocks inside each scratchpad definition in your `zellij-tools.kdl` file, as shown above. Then remove the old `MessagePlugin` bindings from `config.kdl`.
 
+### zjstatus Integration
+
+The plugin can publish scratchpad status to [zjstatus](https://github.com/dj95/zjstatus) using zjstatus' pipe protocol. Add a `zjstatus` block to the inline plugin config or to the external file loaded by `include`:
+
+```kdl
+// inside of the zellij-tools config:
+zjstatus {
+    // Publishes to zjstatus' pipe_scratchpads widget.
+    pipe "scratchpads"
+
+    // Top-level output shown by zjstatus.
+    format "{current_items} #[fg=#666666]+{other_live_count}"
+
+    // Optional fallback published when the rendered output is empty.
+    // Leave empty to avoid clearing the previous zjstatus output during transient updates.
+    empty_format ""
+
+    current_item_focused_format "#[fg=#7583FF,bold]{title}"
+    current_item_visible_format "#[fg=#585d8d,bold]{title}"
+    current_item_hidden_format "#[fg=#666666]{title}"
+    current_item_closed_format ""
+    item_separator " "
+}
+```
+
+Then configure zjstatus to render the matching pipe widget:
+
+```kdl
+zjstatus location="https://github.com/dj95/zjstatus/releases/latest/download/zjstatus.wasm" {
+    pipe_scratchpads_format "{output} "
+    pipe_scratchpads_rendermode "dynamic"
+    format_right "{pipe_scratchpads} {datetime} {session}"
+}
+```
+
+The plugin publishes updates when scratchpads change, when panes/tabs change, when a zjstatus plugin pane appears, and when it receives `zellij-tools::zjstatus::refresh`.
+
+#### zjstatus Placeholders
+
+Top-level `format` supports these placeholders:
+
+| Placeholder                                                                           | Description                                                   |
+| ------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `{current_items}`, `{global_items}`                                                   | Rendered scratchpad items for the active tab or whole session |
+| `{current_configured_count}`, `{global_configured_count}`, `{other_configured_count}` | Configured scratchpad counts after include/exclude filters    |
+| `{current_rendered_count}`, `{global_rendered_count}`, `{other_rendered_count}`       | Items that render after empty item formats are filtered out   |
+| `{current_live_count}`, `{global_live_count}`, `{other_live_count}`                   | Scratchpads with live panes                                   |
+| `{current_visible_count}`, `{global_visible_count}`, `{other_visible_count}`          | Visible scratchpad counts                                     |
+| `{current_hidden_count}`, `{global_hidden_count}`, `{other_hidden_count}`             | Hidden/suppressed scratchpad counts                           |
+| `{current_closed_count}`, `{global_closed_count}`, `{other_closed_count}`             | Configured scratchpads without a live pane                    |
+| `{current_focused_name}`, `{global_focused_name}`                                     | Focused scratchpad name                                       |
+| `{current_focused_title}`, `{global_focused_title}`                                   | Focused scratchpad title                                      |
+
+`current_*` values describe the active tab. `global_*` values describe the whole session. `other_*` values are `global` minus `current`.
+
+Item formats support these placeholders:
+
+| Placeholder             | Description                                |
+| ----------------------- | ------------------------------------------ |
+| `{name}`                | Scratchpad config name                     |
+| `{title}`               | Configured title, falling back to the name |
+| `{state}`               | `visible`, `hidden`, or `closed`           |
+| `{icon}`                | Fixed state icon: `●`, `○`, or `×`         |
+| `{pane_id}`, `{tab_id}` | Live pane and native Zellij tab IDs        |
+| `{tab_position}`        | 1-based tab position when available        |
+| `{is_focused}`          | `true` or `false`                          |
+
+Item format fallback order is: `<scope>_item_<state>_format`, `item_<state>_format`, `<scope>_item_format`, then `item_format`. The `current_item_focused_format` override wins for focused scratchpads on the active tab. Set a state-specific item format to an empty string to omit those items.
+
+Supported zjstatus config keys are: `pipe`, `format`, `empty_format`, `item_format`, `item_visible_format`, `item_hidden_format`, `item_closed_format`, `current_item_format`, `current_item_focused_format`, `current_item_visible_format`, `current_item_hidden_format`, `current_item_closed_format`, `global_item_format`, `global_item_visible_format`, `global_item_hidden_format`, `global_item_closed_format`, `item_separator`, `current_item_separator`, `global_item_separator`, `include`, and `exclude`.
+
 ### Scratchpad CLI
 
 Control scratchpads from the command line:
@@ -258,9 +339,13 @@ zellij-tools scratchpad toggle term --current-tab  # Toggle a scratchpad on the 
 zellij-tools scratchpad show term    # Show a scratchpad
 zellij-tools scratchpad hide term    # Hide a scratchpad
 zellij-tools scratchpad close term   # Close a scratchpad (terminates the pane)
+zellij-tools scratchpad list         # List configured scratchpads as JSON
+zellij-tools scratchpad list --full  # Include full pane info for live instances
 ```
 
 If `ZELLIJ_PANE_ID` is set in your environment (automatic inside Zellij) and no `--tab` or `--current-tab` is provided, the CLI infers the target tab from the calling pane. Otherwise, the receiving plugin instance's current tab is used (may be ambiguous in multi-client sessions). Use `--current-tab` to explicitly target the focused tab. `--tab-id` is accepted as an alias for `--tab`.
+
+`scratchpad list` accepts optional scratchpad names and the same `--tab`, `--tab-id`, and `--current-tab` filters as the control commands. It returns JSON sorted by scratchpad name and includes orphaned scratchpads that still have panes after being removed from config.
 
 ## Other Actions
 
@@ -318,6 +403,7 @@ The plugin requires the following permissions:
 - `ReadCliPipes` - Stream events and tree data to CLI pipes
 - `FullHdAccess` - Read external config files
 - `Reconfigure` - Install scratchpad keybinds at runtime
+- `MessageAndLaunchOtherPlugins` - Publish scratchpad status to zjstatus
 
 ## License
 
