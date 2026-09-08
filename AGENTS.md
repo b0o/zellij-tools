@@ -197,5 +197,6 @@ Release conventions:
 
 - Do not create GitHub releases manually. Push the release tag only; the GitHub release workflow creates the release.
 - Do not build or upload release assets manually. The GitHub release workflow builds and attaches platform assets.
-- For a patch release, make the code/version commits, push them, then create and push the `vX.Y.Z` tag.
+- For a patch release, commit code fixes first, then make a separate version commit that bumps both crate manifests (`Cargo.toml`, `cli/Cargo.toml`) and the corresponding local package entries in `Cargo.lock`.
+- Tag the version commit as `vX.Y.Z`, push `main`, push the tag, and verify the tag-triggered `Release` GitHub Actions workflow succeeds.
 - Do not replace workflow-generated assets with locally-built artifacts.
