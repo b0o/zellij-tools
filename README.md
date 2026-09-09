@@ -153,13 +153,13 @@ The config directory is determined by (in order):
 
 ### Configuration Options
 
-| Option        | Description                                                | Default       | Inline Config | External Config File |
-| ------------- | ---------------------------------------------------------- | ------------- | :-----------: | :------------------: |
-| `include`     | Path to external config file                               | -             |      Yes      |          No          |
-| `config_dir`  | Override base directory for relative includes              | Auto-detected |      Yes      |          No          |
-| `watch_ms`    | Polling interval in ms. `"false"` or `"0"` to disable.     | `2000`        |      Yes      |          No          |
-| `scratchpads` | Scratchpad definitions                                     | -             |      Yes      |         Yes          |
-| `zjstatus`    | Optional scratchpad status output for the zjstatus plugin  | -             |      Yes      |         Yes          |
+| Option        | Description                                               | Default       | Inline Config | External Config File |
+| ------------- | --------------------------------------------------------- | ------------- | :-----------: | :------------------: |
+| `include`     | Path to external config file                              | -             |      Yes      |          No          |
+| `config_dir`  | Override base directory for relative includes             | Auto-detected |      Yes      |          No          |
+| `watch_ms`    | Polling interval in ms. `"false"` or `"0"` to disable.    | `2000`        |      Yes      |          No          |
+| `scratchpads` | Scratchpad definitions                                    | -             |      Yes      |         Yes          |
+| `zjstatus`    | Optional scratchpad status output for the zjstatus plugin | -             |      Yes      |         Yes          |
 
 ### Scratchpad Options
 
@@ -317,9 +317,9 @@ Item formats support these placeholders:
 | `{tab_position}`        | 1-based tab position when available        |
 | `{is_focused}`          | `true` or `false`                          |
 
-Item format fallback order is: `<scope>_item_<state>_format`, `item_<state>_format`, `<scope>_item_format`, then `item_format`. The `current_item_focused_format` override wins for focused scratchpads on the active tab. Set a state-specific item format to an empty string to omit those items.
+Item format fallback order is: `<scope>_item_<state>_format`, `item_<state>_format`, `<scope>_item_format`, then `item_format`. On the active tab, `current_item_focused_format` takes priority, followed by `current_item_mru_format`, then the state-based fallbacks. The MRU is the focused scratchpad, or, when none is focused, the scratchpad that `zellij-tools::scratchpad::toggle` would show using the active tab's focus history. No MRU is selected without a focused scratchpad or focus history. These overrides do not affect global items. Set an item format to an empty string to omit matching items.
 
-Supported zjstatus config keys are: `pipe`, `format`, `empty_format`, `item_format`, `item_visible_format`, `item_hidden_format`, `item_closed_format`, `current_item_format`, `current_item_focused_format`, `current_item_visible_format`, `current_item_hidden_format`, `current_item_closed_format`, `global_item_format`, `global_item_visible_format`, `global_item_hidden_format`, `global_item_closed_format`, `item_separator`, `current_item_separator`, `global_item_separator`, `include`, and `exclude`.
+Supported zjstatus config keys are: `pipe`, `format`, `empty_format`, `item_format`, `item_visible_format`, `item_hidden_format`, `item_closed_format`, `current_item_format`, `current_item_focused_format`, `current_item_mru_format`, `current_item_visible_format`, `current_item_hidden_format`, `current_item_closed_format`, `global_item_format`, `global_item_visible_format`, `global_item_hidden_format`, `global_item_closed_format`, `item_separator`, `current_item_separator`, `global_item_separator`, `include`, and `exclude`.
 
 ### Scratchpad CLI
 

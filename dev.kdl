@@ -49,26 +49,26 @@ keybinds clear-defaults=true {
     bind "Alt Shift J" { MoveFocus "down"; }
     bind "Alt Shift K" { MoveFocus "up"; }
     bind "Alt Shift L" { MoveFocus "right"; }
-    bind "Ctrl Shift D" {
-      MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::dev"; }
-      SwitchToMode "locked"
-    }
-    bind "Ctrl Shift B" {
-      MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::monitor"; }
-      SwitchToMode "locked"
-    }
-    bind "Ctrl Shift G" {
-      MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::git"; }
-      SwitchToMode "locked"
-    }
-    bind "Ctrl Shift N" {
-      MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::notes"; }
-      SwitchToMode "locked"
-    }
-    bind "Ctrl Shift R" {
-      MessagePlugin "zellij-tools" { payload "zellij-tools::zjstatus::refresh"; }
-      SwitchToMode "locked"
-    }
+    // bind "Ctrl Shift D" {
+    //   MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::dev"; }
+    //   SwitchToMode "locked"
+    // }
+    // bind "Ctrl Shift B" {
+    //   MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::monitor"; }
+    //   SwitchToMode "locked"
+    // }
+    // bind "Ctrl Shift G" {
+    //   MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::git"; }
+    //   SwitchToMode "locked"
+    // }
+    // bind "Ctrl Shift N" {
+    //   MessagePlugin "zellij-tools" { payload "zellij-tools::scratchpad::toggle::notes"; }
+    //   SwitchToMode "locked"
+    // }
+    // bind "Ctrl Shift R" {
+    //   MessagePlugin "zellij-tools" { payload "zellij-tools::zjstatus::refresh"; }
+    //   SwitchToMode "locked"
+    // }
   }
 
   pane {
@@ -173,6 +173,11 @@ plugins {
         origin "center"
         title "sh"
         width "80%"
+        keybinds {
+          shared_among "normal" "locked" {
+            bind "Ctrl t" { Toggle; SwitchToMode "locked"; }
+          }
+        }
       }
       git {
         command "bash" "-lc" "git status --short --branch; exec bash"
@@ -180,6 +185,11 @@ plugins {
         origin "bottom" "left"
         title "git"
         width "45%"
+        keybinds {
+          shared_among "normal" "locked" {
+            bind "Ctrl g" { Toggle; SwitchToMode "locked"; }
+          }
+        }
       }
       monitor {
         command "top"
@@ -187,13 +197,11 @@ plugins {
         origin "top" "right"
         title "mon"
         width "45%"
-      }
-      notes {
-        command "nu"
-        height "45%"
-        origin "bottom" "right"
-        title "note"
-        width "50%"
+        keybinds {
+          shared_among "normal" "locked" {
+            bind "Ctrl b" { Toggle; SwitchToMode "locked"; }
+          }
+        }
       }
     }
 
@@ -248,6 +256,7 @@ plugins {
       // example, current_item_closed_format "" hides closed current-tab items.
       current_item_focused_format "#[fg=#7583FF,bold]{title} "
       current_item_visible_format "#[fg=#585d8d,bold]{title} "
+      current_item_mru_format "#[fg=#878ec9]{title} "
       current_item_hidden_format "#[fg=#666666]{title} "
       current_item_closed_format ""
 

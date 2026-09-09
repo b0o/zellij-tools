@@ -20,6 +20,7 @@ pub struct ZjstatusConfigPatch {
     item_closed_format: Option<String>,
     current_item_format: Option<String>,
     current_item_focused_format: Option<String>,
+    current_item_mru_format: Option<String>,
     current_item_visible_format: Option<String>,
     current_item_hidden_format: Option<String>,
     current_item_closed_format: Option<String>,
@@ -45,6 +46,7 @@ pub struct ZjstatusConfig {
     item_closed_format: Option<String>,
     current_item_format: Option<String>,
     current_item_focused_format: Option<String>,
+    current_item_mru_format: Option<String>,
     current_item_visible_format: Option<String>,
     current_item_hidden_format: Option<String>,
     current_item_closed_format: Option<String>,
@@ -87,6 +89,10 @@ impl ZjstatusConfigPatch {
         overlay_option(
             &mut self.current_item_focused_format,
             other.current_item_focused_format,
+        );
+        overlay_option(
+            &mut self.current_item_mru_format,
+            other.current_item_mru_format,
         );
         overlay_option(
             &mut self.current_item_visible_format,
@@ -145,6 +151,7 @@ impl ZjstatusConfig {
             item_closed_format: patch.item_closed_format,
             current_item_format: patch.current_item_format,
             current_item_focused_format: patch.current_item_focused_format,
+            current_item_mru_format: patch.current_item_mru_format,
             current_item_visible_format: patch.current_item_visible_format,
             current_item_hidden_format: patch.current_item_hidden_format,
             current_item_closed_format: patch.current_item_closed_format,
@@ -165,6 +172,12 @@ impl ZjstatusConfig {
     fn item_format(&self, scope: Scope, item: &ScratchpadStatusItem) -> &str {
         if scope == Scope::Current && item.is_focused {
             if let Some(format) = self.current_item_focused_format.as_deref() {
+                return format;
+            }
+        }
+
+        if scope == Scope::Current && item.is_mru {
+            if let Some(format) = self.current_item_mru_format.as_deref() {
                 return format;
             }
         }
@@ -264,6 +277,7 @@ pub fn parse_zjstatus_config_doc(doc: &kdl::KdlDocument) -> Result<ZjstatusConfi
         current_item_separator: parse_string_child(doc, "current_item_separator"),
         global_item_separator: parse_string_child(doc, "global_item_separator"),
         current_item_focused_format: parse_string_child(doc, "current_item_focused_format"),
+        current_item_mru_format: parse_string_child(doc, "current_item_mru_format"),
         include: parse_string_args_child(doc, "include"),
         exclude: parse_string_args_child(doc, "exclude"),
     };
@@ -612,6 +626,7 @@ mod tests {
             tab_id: Some(11),
             tab_position: Some(2),
             is_focused: false,
+            is_mru: false,
         }
     }
 
@@ -714,11 +729,13 @@ mod tests {
             pipe "scratchpads"
             format "{current_items}"
             current_item_focused_format "[{title}]"
+            current_item_mru_format "MRU:{title}"
             current_item_visible_format "{title}"
             "#,
         );
         let mut focused = item("term", ScratchpadDisplayState::Visible);
         focused.is_focused = true;
+        focused.is_mru = true;
         let snapshot = ScratchpadStatusSnapshot {
             current_items: vec![focused, item("notes", ScratchpadDisplayState::Visible)],
             global_count_items: Vec::new(),
@@ -726,6 +743,67 @@ mod tests {
         };
 
         assert_eq!(render(&config, &snapshot), "[term] notes");
+    }
+
+    #[test]
+    fn current_mru_format_overrides_states_but_not_global_items() {
+        let mut config = config(
+            r#"
+            pipe "scratchpads"
+            format "{current_rendered_count}:{current_items}|{global_items}"
+            item_format "{name}"
+            current_item_mru_format "MRU:{name}"
+            current_item_visible_format "visible"
+            current_item_hidden_format "hidden"
+            current_item_closed_format ""
+            "#,
+        );
+
+        for state in [
+            ScratchpadDisplayState::Visible,
+            ScratchpadDisplayState::Hidden,
+            ScratchpadDisplayState::Closed,
+        ] {
+            let mut mru = item("term", state);
+            mru.is_mru = true;
+            let mut snapshot = ScratchpadStatusSnapshot {
+                current_items: vec![mru.clone()],
+                global_items: vec![mru.clone()],
+                global_count_items: vec![mru],
+            };
+            assert_eq!(render(&config, &snapshot), "1:MRU:term|term");
+            snapshot.current_items[0].is_focused = true;
+            assert_eq!(render(&config, &snapshot), "1:MRU:term|term");
+        }
+
+        let mut mru = item("term", ScratchpadDisplayState::Hidden);
+        mru.is_mru = true;
+        let snapshot = ScratchpadStatusSnapshot {
+            current_items: vec![mru],
+            ..Default::default()
+        };
+        config.current_item_mru_format = Some(String::new());
+        assert_eq!(render(&config, &snapshot), "0:|");
+        config.current_item_mru_format = None;
+        assert_eq!(render(&config, &snapshot), "1:hidden|");
+    }
+
+    #[test]
+    fn overlays_mru_format_without_resetting_other_options() {
+        let mut layers = ZjstatusConfigLayers::default();
+        layers.push(
+            parse_zjstatus_config_kdl("pipe \"scratchpads\"\ncurrent_item_mru_format \"inline\"")
+                .unwrap(),
+        );
+        layers.push(parse_zjstatus_config_kdl("format \"{current_items}\"").unwrap());
+        assert_eq!(
+            layers.patch.current_item_mru_format.as_deref(),
+            Some("inline")
+        );
+        layers.push(parse_zjstatus_config_kdl("current_item_mru_format \"external\"").unwrap());
+        let config = layers.into_config().unwrap().unwrap();
+        assert_eq!(config.current_item_mru_format.as_deref(), Some("external"));
+        assert_eq!(config.pipe, "scratchpads");
     }
 
     #[test]
@@ -828,6 +906,7 @@ mod tests {
                 tab_id: None,
                 tab_position: None,
                 is_focused: false,
+                is_mru: false,
             }],
             global_count_items: Vec::new(),
             global_items: Vec::new(),

@@ -28,6 +28,7 @@ pub struct ScratchpadStatusItem {
     pub tab_id: Option<usize>,
     pub tab_position: Option<usize>,
     pub is_focused: bool,
+    pub is_mru: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -60,9 +61,16 @@ impl ScratchpadManager {
         let mut names: Vec<&String> = self.configs.keys().collect();
         names.sort();
 
+        let mru = self
+            .get_focused_scratchpad(ctx)
+            .or_else(|| self.get_last_focused_on_current_tab(ctx));
         let current_items = names
             .iter()
-            .map(|name| self.current_status_item(name, ctx, &pane_lookup))
+            .map(|name| {
+                let mut item = self.current_status_item(name, ctx, &pane_lookup);
+                item.is_mru = mru.as_deref() == Some(name.as_str());
+                item
+            })
             .collect();
         let global_count_items = names
             .iter()
@@ -142,6 +150,7 @@ impl ScratchpadManager {
             tab_id: Some(chosen.tab_id),
             tab_position: chosen.tab_position,
             is_focused: chosen.is_focused,
+            is_mru: false,
         }
     }
 
@@ -217,6 +226,7 @@ impl ScratchpadStatusItem {
             tab_id: None,
             tab_position: None,
             is_focused: false,
+            is_mru: false,
         }
     }
 
@@ -229,6 +239,7 @@ impl ScratchpadStatusItem {
             tab_id: Some(instance.tab_id),
             tab_position: instance.tab_position,
             is_focused: instance.is_focused,
+            is_mru: false,
         }
     }
 }
@@ -327,6 +338,7 @@ mod tests {
             ScratchpadDisplayState::Closed
         );
         assert_eq!(snapshot.current_items[0].title, "term");
+        assert!(!snapshot.current_items[0].is_mru);
     }
 
     #[test]
@@ -350,6 +362,7 @@ mod tests {
             ScratchpadDisplayState::Visible
         );
         assert!(snapshot.current_items[0].is_focused);
+        assert!(snapshot.current_items[0].is_mru);
         assert_eq!(snapshot.current_items[0].pane_id, Some(42));
         assert_eq!(snapshot.current_items[0].title, "Terminal");
     }
@@ -391,6 +404,56 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn current_mru_matches_toggle_target_and_tracks_focus_changes() {
+        let mut manager = ScratchpadManager::new(HashMap::from([
+            ("term".to_string(), make_config(None)),
+            ("notes".to_string(), make_config(None)),
+        ]));
+        manager.panes = HashMap::from([
+            ("term".to_string(), HashMap::from([(10, 42)])),
+            ("notes".to_string(), HashMap::from([(10, 43), (11, 44)])),
+        ]);
+        manager.focus_times = HashMap::from([
+            ("term".to_string(), HashMap::from([(10, 2)])),
+            ("notes".to_string(), HashMap::from([(10, 1), (11, 3)])),
+        ]);
+        manager.focus_counter = 3;
+        let mut manifest = HashMap::from([(
+            0,
+            vec![make_pane(42, true, false), make_pane(43, true, false)],
+        )]);
+        let positions = HashMap::from([(10, 0), (11, 1)]);
+        let ctx = make_context(&manifest, &positions);
+        let snapshot = manager.status_snapshot(&ctx);
+        let mru = snapshot
+            .current_items
+            .iter()
+            .find(|item| item.is_mru)
+            .unwrap();
+        assert_eq!(mru.name, "term");
+        assert_eq!(mru.state, ScratchpadDisplayState::Hidden);
+        assert_eq!(
+            Some(mru.name.clone()),
+            manager.get_last_focused_on_current_tab(&ctx)
+        );
+        assert!(snapshot.global_items.iter().all(|item| !item.is_mru));
+
+        manifest.get_mut(&0).unwrap()[1] = make_pane(43, false, true);
+        let ctx = make_context(&manifest, &positions);
+        let snapshot = manager.status_snapshot(&ctx);
+        assert!(snapshot.current_items[0].is_focused);
+        assert!(snapshot.current_items[0].is_mru);
+        assert!(!snapshot.current_items[1].is_mru);
+        manager.update_focus_tracking(&ctx);
+
+        manifest.get_mut(&0).unwrap()[1] = make_pane(43, true, false);
+        let snapshot = manager.status_snapshot(&make_context(&manifest, &positions));
+        assert!(!snapshot.current_items[0].is_focused);
+        assert!(snapshot.current_items[0].is_mru);
+        assert!(!snapshot.current_items[1].is_mru);
     }
 
     #[test]
