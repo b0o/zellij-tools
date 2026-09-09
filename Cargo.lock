@@ -2580,7 +2580,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-tools"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "kdl",
  "serde",
@@ -2591,7 +2591,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-tools-cli"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "clap",
  "ctrlc",
