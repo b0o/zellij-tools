@@ -299,16 +299,13 @@ impl ScratchpadManager {
         let target_name = match name {
             Some(n) => n,
             None => {
-                // Check if a scratchpad is focused
                 if let Some(focused) = self.get_focused_scratchpad(ctx) {
-                    focused
-                } else {
-                    // Use last from current tab's focus history
-                    match self.get_last_focused_on_current_tab(ctx) {
-                        Some(last) => last,
-                        None => return Vec::new(),
-                    }
+                    return self.handle_hide(&focused, ctx);
                 }
+                return match self.get_last_focused_on_current_tab(ctx) {
+                    Some(last) => self.handle_show(&last, ctx),
+                    None => Vec::new(),
+                };
             }
         };
 
@@ -568,19 +565,36 @@ impl ScratchpadManager {
     }
 
     fn get_focused_scratchpad(&self, ctx: &ScratchpadContext) -> Option<String> {
+        let tab_id = ctx.current_tab_id?;
+        if let Some(pane_id) = self.just_shown {
+            if let Some((name, _)) = self
+                .panes
+                .iter()
+                .find(|(_, panes)| panes.get(&tab_id) == Some(&pane_id))
+            {
+                return Some(name.clone());
+            }
+        }
+
         // A focused floating pane in the manifest already implies the floating
-        // layer is visible, so the manifest is sufficient on its own.
+        // layer is visible. Other tabs can retain focused panes in the manifest.
         let focused_pane_id = ctx
             .pane_manifest
-            .values()
-            .flatten()
-            .find(|p| p.is_floating && p.is_focused)?
+            .get(&ctx.current_tab_position)?
+            .iter()
+            .find(|p| {
+                !p.is_plugin
+                    && p.is_floating
+                    && p.is_focused
+                    && !p.is_suppressed
+                    && !p.exited
+                    && !p.is_held
+            })?
             .id;
 
         self.panes
             .iter()
-            .flat_map(|(name, inner)| inner.values().map(move |&pid| (name, pid)))
-            .find(|(_, pane_id)| *pane_id == focused_pane_id)
+            .find(|(_, panes)| panes.get(&tab_id) == Some(&focused_pane_id))
             .map(|(name, _)| name.clone())
     }
 
@@ -595,30 +609,10 @@ impl ScratchpadManager {
     }
 
     fn update_focus_tracking(&mut self, ctx: &ScratchpadContext) {
-        // A focused floating pane in the manifest already implies the floating
-        // layer is visible, so the manifest is sufficient on its own.
-        let focused_pane = ctx
-            .pane_manifest
-            .values()
-            .flatten()
-            .find(|p| p.is_floating && p.is_focused);
-
-        let Some(focused) = focused_pane else {
+        let Some(tab_id) = ctx.current_tab_id else {
             return;
         };
-
-        // Find the (name, tab_id) for the focused pane
-        let found = self
-            .panes
-            .iter()
-            .flat_map(|(name, inner)| {
-                inner
-                    .iter()
-                    .map(move |(&tab_id, &pid)| (name.clone(), tab_id, pid))
-            })
-            .find(|(_, _, pid)| *pid == focused.id);
-
-        if let Some((name, tab_id, _)) = found {
+        if let Some(name) = self.get_focused_scratchpad(ctx) {
             self.focus_counter += 1;
             self.focus_times
                 .entry(name)
@@ -1009,6 +1003,107 @@ mod tests {
         assert!(commands
             .iter()
             .any(|c| matches!(c, ScratchpadCommand::HidePane { pane_id: 42 })));
+    }
+
+    #[test]
+    fn unnamed_toggle_and_status_use_each_tabs_mru_not_other_tabs_focus() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term", "notes"]));
+        manager.register_pane("term", 10, 42);
+        manager.register_pane("notes", 11, 43);
+        manager.clear_just_shown();
+        let positions = HashMap::from([(10, 0), (11, 1)]);
+
+        for (tab_id, position, name, pane_id, other_pane_id) in
+            [(10, 0, "term", 42, 43), (11, 1, "notes", 43, 42)]
+        {
+            for floating in [false, true] {
+                let mut hidden = make_floating_pane(pane_id, false);
+                hidden.is_suppressed = true;
+                let manifest = HashMap::from([
+                    (position, vec![hidden, make_pane(99, floating, true)]),
+                    (1 - position, vec![make_floating_pane(other_pane_id, true)]),
+                ]);
+                let ctx = make_context(&manifest, position, Some(tab_id), false, &positions);
+                let history = manager.focus_times.clone();
+                manager.update_focus_tracking(&ctx);
+                assert_eq!(manager.focus_times, history);
+
+                let snapshot = manager.status_snapshot(&ctx);
+                let mru: Vec<_> = snapshot
+                    .current_items
+                    .iter()
+                    .filter(|item| item.is_mru)
+                    .collect();
+                assert_eq!(mru.len(), 1);
+                assert_eq!(mru[0].name, name);
+                let commands = manager.handle_toggle(None, &ctx);
+                assert!(matches!(
+                    commands.as_slice(),
+                    [ScratchpadCommand::ShowPane { pane_id: id, tab_id: tab, .. }]
+                        if *id == pane_id && *tab == tab_id
+                ));
+                manager.clear_just_shown();
+            }
+        }
+
+        let manifest = HashMap::from([(1, vec![make_floating_pane(43, true)])]);
+        let ctx = make_context(&manifest, 2, Some(12), true, &positions);
+        assert!(manager.handle_toggle(None, &ctx).is_empty());
+        assert!(manager
+            .status_snapshot(&ctx)
+            .current_items
+            .iter()
+            .all(|item| !item.is_mru));
+    }
+
+    #[test]
+    fn unnamed_toggle_hides_current_focus_and_remembers_it_after_hiding() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term", "notes"]));
+        manager.register_pane("term", 10, 42);
+        manager.register_pane("notes", 10, 43);
+        manager.register_pane("notes", 11, 44);
+        manager.clear_just_shown();
+        let positions = HashMap::from([(10, 0), (11, 1)]);
+        let mut manifest = HashMap::from([
+            (
+                0,
+                vec![make_floating_pane(42, true), make_floating_pane(43, false)],
+            ),
+            (1, vec![make_floating_pane(44, true)]),
+        ]);
+        let ctx = make_context(&manifest, 0, Some(10), false, &positions);
+        assert_eq!(
+            manager.get_focused_scratchpad(&ctx).as_deref(),
+            Some("term")
+        );
+        assert!(matches!(
+            manager.handle_toggle(None, &ctx).as_slice(),
+            [ScratchpadCommand::HidePane { pane_id: 42 }]
+        ));
+        manager.update_focus_tracking(&ctx);
+        assert_eq!(manager.focus_times["notes"][&11], 3);
+        assert_eq!(
+            manager.get_last_focused_on_current_tab(&ctx).as_deref(),
+            Some("term")
+        );
+
+        let pane = &mut manifest.get_mut(&0).unwrap()[0];
+        pane.is_focused = false;
+        pane.is_suppressed = true;
+        let ctx = make_context(&manifest, 0, Some(10), true, &positions);
+        assert!(matches!(
+            manager.handle_toggle(None, &ctx).as_slice(),
+            [ScratchpadCommand::ShowPane {
+                pane_id: 42,
+                tab_id: 10,
+                ..
+            }]
+        ));
+        // A second toggle before PaneUpdate must hide the pane just shown.
+        assert!(matches!(
+            manager.handle_toggle(None, &ctx).as_slice(),
+            [ScratchpadCommand::HidePane { pane_id: 42 }]
+        ));
     }
 
     #[test]
