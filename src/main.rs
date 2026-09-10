@@ -24,7 +24,7 @@ use zellij_tools::zjstatus::{
     parse_zjstatus_config_doc, parse_zjstatus_config_kdl, ZjstatusConfig, ZjstatusConfigLayers,
     ZjstatusConfigPatch,
 };
-use zellij_tools::zjstatus_runtime::{Publisher, Scheduler};
+use zellij_tools::zjstatus_runtime::{update_zjstatus_plugin_panes, Publisher, Scheduler};
 
 const REGISTRY_LOCK_STALE_TIMEOUT_MS: u64 = 2_000;
 const REGISTRY_PENDING_TIMEOUT_MS: u64 = 2_000;
@@ -93,25 +93,6 @@ struct MergedConfig {
 struct ExternalConfig {
     scratchpads: HashMap<String, ScratchpadConfig>,
     zjstatus: Option<ZjstatusConfigPatch>,
-}
-
-fn zjstatus_plugin_panes(pane_manifest: &HashMap<usize, Vec<PaneInfo>>) -> HashSet<(usize, u32)> {
-    pane_manifest
-        .iter()
-        .flat_map(|(&tab_position, panes)| {
-            panes.iter().filter_map(move |pane| {
-                let is_zjstatus = pane
-                    .plugin_url
-                    .as_deref()
-                    .is_some_and(is_zjstatus_plugin_url);
-                (pane.is_plugin && is_zjstatus).then_some((tab_position, pane.id))
-            })
-        })
-        .collect()
-}
-
-fn is_zjstatus_plugin_url(url: &str) -> bool {
-    url == "zjstatus" || url.contains("zjstatus")
 }
 
 register_plugin!(State);
@@ -537,16 +518,6 @@ impl State {
         }
     }
 
-    fn update_zjstatus_plugin_panes(&mut self) -> bool {
-        let panes = zjstatus_plugin_panes(&self.pane_manifest);
-        if panes == self.zjstatus_plugin_panes {
-            return false;
-        }
-
-        self.zjstatus_plugin_panes = panes;
-        true
-    }
-
     fn go_to_tab_id(&self, tab_id: usize) {
         if let Some(position) = self.tab_id_to_position.get(&tab_id).copied() {
             if let Ok(tab_index) = u32::try_from(position) {
@@ -963,8 +934,12 @@ impl ZellijPlugin for State {
                     self.scratchpad = Some(scratchpad);
                     self.execute_scratchpad_commands(commands);
                 }
-                let zjstatus_panes_changed = self.update_zjstatus_plugin_panes();
-                self.publish_zjstatus(false);
+                let zjstatus_panes_changed = update_zjstatus_plugin_panes(
+                    &mut self.zjstatus_plugin_panes,
+                    &self.pane_manifest,
+                );
+                // New receivers have not seen unchanged values submitted to older ones.
+                self.publish_zjstatus(zjstatus_panes_changed);
                 if zjstatus_panes_changed {
                     self.schedule_zjstatus_publish();
                 }

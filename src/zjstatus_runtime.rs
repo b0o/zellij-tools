@@ -7,13 +7,40 @@
 //! Scheduler times are elapsed durations from one main-owned `Instant` origin, not
 //! the elapsed value carried by Zellij timer events. No host calls occur here.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
+
+use zellij_tile::prelude::PaneInfo;
 
 use crate::scratchpad::{ScratchpadStatusItem, ScratchpadStatusSnapshot};
 use crate::zjstatus::{
     render, should_publish_empty, zjstatus_payload, zjstatus_tab_payload, OutputKey, ZjstatusConfig,
 };
+
+/// Update receiver discovery state. A changed set needs an immediate full
+/// publication plus a delayed replay for receivers that are still initializing.
+pub fn update_zjstatus_plugin_panes(
+    previous: &mut HashSet<(usize, u32)>,
+    pane_manifest: &HashMap<usize, Vec<PaneInfo>>,
+) -> bool {
+    let panes = pane_manifest
+        .iter()
+        .flat_map(|(&tab_position, panes)| {
+            panes.iter().filter_map(move |pane| {
+                let is_zjstatus = pane
+                    .plugin_url
+                    .as_deref()
+                    .is_some_and(|url| url == "zjstatus" || url.contains("zjstatus"));
+                (pane.is_plugin && is_zjstatus).then_some((tab_position, pane.id))
+            })
+        })
+        .collect();
+    if panes == *previous {
+        return false;
+    }
+    *previous = panes;
+    true
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum PublishedKey {
@@ -278,6 +305,126 @@ mod tests {
 
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
+    }
+
+    fn receiver(id: u32) -> PaneInfo {
+        PaneInfo {
+            id,
+            is_plugin: true,
+            plugin_url: Some("file:/plugins/zjstatus.wasm".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn receiver_discovery_replays_unchanged_values_and_keeps_delayed_fallback() {
+        let config = config(
+            "pipe \"badge\" { format \"global\"; }\n\
+             tab_pipe \"badge\" { item_format \"{state}\"; }",
+        );
+        let snapshot = ScratchpadStatusSnapshot::default();
+        let tabs = BTreeMap::from([
+            (42, vec![item(42, ScratchpadDisplayState::Visible)]),
+            (57, vec![item(57, ScratchpadDisplayState::Hidden)]),
+        ]);
+        let expected = [
+            "zjstatus::pipe::pipe_badge::global",
+            "zjstatus::tab_pipe::42::badge::visible",
+            "zjstatus::tab_pipe::57::badge::hidden",
+        ];
+        let mut publisher = Publisher::default();
+        let mut scheduler = Scheduler::default();
+        scheduler.configure(ms(0), None, Some(2000));
+        let mut receivers = HashSet::new();
+        let mut manifest = HashMap::new();
+
+        for (now, position, id) in [(0, 0, 7), (300, 1, 8)] {
+            manifest.insert(position, vec![receiver(id)]);
+            let changed = update_zjstatus_plugin_panes(&mut receivers, &manifest);
+            assert!(changed);
+            assert_eq!(
+                publisher.commands(Some(&config), &snapshot, &tabs, changed),
+                expected
+            );
+            if changed {
+                scheduler.delay_replay(ms(now), ms(250));
+            }
+            assert_eq!(scheduler.arm(ms(now)), Some(ms(250)));
+
+            // Ordinary pane changes do not rediscover the existing receivers.
+            manifest.get_mut(&position).unwrap().push(PaneInfo {
+                id: 99,
+                ..Default::default()
+            });
+            let changed = update_zjstatus_plugin_panes(&mut receivers, &manifest);
+            assert!(!changed);
+            assert!(publisher
+                .commands(Some(&config), &snapshot, &tabs, changed)
+                .is_empty());
+            assert_eq!(scheduler.take_due(ms(now + 249)), DueTasks::default());
+            assert_eq!(
+                scheduler.take_due(ms(now + 250)),
+                DueTasks {
+                    delayed_replay: true,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(scheduler.take_due(ms(now + 250)), DueTasks::default());
+        }
+        assert!(scheduler.take_due(ms(2000)).full_replay);
+    }
+
+    #[test]
+    fn receiver_discovery_preserves_empty_retired_and_closed_tab_semantics() {
+        let original = config(
+            "pipe \"badge\" { item_format \"{name}\"; }\n\
+             tab_pipe \"badge\" { item_format \"{state}\"; }\n\
+             tab_pipe \"old\" { format \"old\"; }",
+        );
+        let replacement = config(
+            "pipe \"badge\" { item_format \"{name}\"; }\n\
+             tab_pipe \"badge\" { item_format \"{state}\"; }",
+        );
+        let mut snapshot = ScratchpadStatusSnapshot {
+            current_items: vec![item(42, ScratchpadDisplayState::Visible)],
+            ..Default::default()
+        };
+        let mut tabs = BTreeMap::from([(42, snapshot.current_items.clone()), (57, vec![])]);
+        let mut publisher = Publisher::default();
+        let mut receivers = HashSet::new();
+        let mut manifest = HashMap::from([(0, vec![receiver(7)])]);
+        let changed = update_zjstatus_plugin_panes(&mut receivers, &manifest);
+        publisher.commands(Some(&original), &snapshot, &tabs, changed);
+        publisher.commands(Some(&replacement), &snapshot, &tabs, false);
+        assert!(publisher.has_retired());
+
+        snapshot.current_items.clear();
+        tabs.insert(42, vec![]);
+        tabs.remove(&57);
+        manifest.insert(1, vec![receiver(8)]);
+        let changed = update_zjstatus_plugin_panes(&mut receivers, &manifest);
+        assert!(changed);
+        assert_eq!(
+            publisher.commands(Some(&replacement), &snapshot, &tabs, changed),
+            [
+                "zjstatus::tab_pipe::42::old::",
+                "zjstatus::tab_pipe::42::badge::"
+            ]
+        );
+        // Skipping empty global output retains its last submission for diffing.
+        snapshot
+            .current_items
+            .push(item(42, ScratchpadDisplayState::Visible));
+        let changed = update_zjstatus_plugin_panes(&mut receivers, &manifest);
+        assert!(!changed);
+        assert!(publisher
+            .commands(Some(&replacement), &snapshot, &tabs, changed)
+            .is_empty());
+        assert!(!publisher
+            .published
+            .keys()
+            .chain(&publisher.retired)
+            .any(|key| matches!(key, PublishedKey::Tab(57, _))));
     }
 
     #[test]
