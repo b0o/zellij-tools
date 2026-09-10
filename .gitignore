@@ -21,6 +21,7 @@
 # will have compiled files and executables
 debug/
 target/
+/.cache/
 
 # Cargo.lock is tracked because we build executables (plugin + CLI)
 # More information here https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html

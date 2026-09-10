@@ -206,74 +206,49 @@ plugins {
     }
 
     zjstatus {
-      // Logical zjstatus pipe name. This publishes to the zjstatus widget named
-      // pipe_scratchpads, which is rendered below with {pipe_scratchpads}.
-      pipe "scratchpads"
+      // Positive u32 milliseconds; independent of external config watch_ms.
+      refresh_ms 2000
 
-      // Top-level format placeholders:
-      // - {current_items}: rendered items for the active tab
-      // - {global_items}: rendered aggregate items across the session
-      // - Global live/visible/hidden/rendered counts count pane instances, not
-      //   aggregate item names. If the same scratchpad is open on two tabs, it
-      //   contributes 2 to those counts while rendering once in {global_items}.
-      // - {current_configured_count}, {global_configured_count}: configured
-      //   scratchpads after include/exclude filters, before item rendering
-      // - {current_rendered_count}, {global_rendered_count}: items rendered
-      //   after empty item formats are filtered out
-      // - {current_live_count}, {global_live_count}: scratchpads with a live pane
-      // - {current_visible_count}, {global_visible_count}: visible items
-      // - {current_hidden_count}, {global_hidden_count}: hidden/suppressed items
-      // - {current_closed_count}, {global_closed_count}: configured but closed
-      // - {other_configured_count}, {other_rendered_count}, {other_live_count},
-      //   {other_visible_count}, {other_hidden_count}, {other_closed_count}:
-      //   global count minus current count
-      // - {current_focused_name}, {global_focused_name}: focused scratchpad name
-      // - {current_focused_title}, {global_focused_title}: focused title
-      format "#[fg=#808080]  {current_items}#[fg=#666666]+{other_live_count}"
+      // One producer per output name/field. Focus/MRU use this client's view.
+      pipe "scratchpads" {
+        format "#[fg=#808080]  {current_items}#[fg=#666666]+{other_live_count}"
+        current_item_focused_format "#[fg=#7583FF,bold]{title} "
+        current_item_visible_format "#[fg=#585d8d,bold]{title} "
+        current_item_mru_format "#[fg=#878ec9]{title} "
+        current_item_hidden_format "#[fg=#666666]{title} "
+        current_item_closed_format ""
+        item_separator ""
+      }
 
-      // Used when the rendered output is empty. Leave empty to avoid clearing a
-      // previously populated zjstatus pipe during transient tab/pane updates.
-      empty_format ""
+      // Plain tab-local text for the receiver's static wrapper.
+      // In dev: hide dev on tab 1, leave git visible on tab 2 (README).
+      tab_pipe "scratchpads" {
+        include "dev" "git"
+        format "{tab_items}"
+        item_visible_format "{name}+"
+        item_hidden_format "{name}-"
+        item_closed_format ""
+      }
 
-      // Item format placeholders:
-      // - {name}: scratchpad config name
-      // - {title}: configured title, falling back to name
-      // - {state}: visible, hidden, or closed
-      // - {icon}: fixed state icon (visible ●, hidden ○, closed ×)
-      // - {pane_id}, {tab_id}, {tab_position}: live pane/tab identifiers
-      // - {is_focused}: true or false
-      //
-      // current_item_focused_format is an active-tab-only override for focused
-      // scratchpads. If it is unset, normal state fallback is used.
-      //
-      // Format fallback order for non-focused items is:
-      // - <scope>_item_<state>_format
-      // - item_<state>_format
-      // - <scope>_item_format
-      // - item_format
-      //
-      // Set a state-specific format to "" to filter those items out. For
-      // example, current_item_closed_format "" hides closed current-tab items.
-      current_item_focused_format "#[fg=#7583FF,bold]{title} "
-      current_item_visible_format "#[fg=#585d8d,bold]{title} "
-      current_item_mru_format "#[fg=#878ec9]{title} "
-      current_item_hidden_format "#[fg=#666666]{title} "
-      current_item_closed_format ""
-
-      // Optional separator overrides:
-      // - item_separator applies to both scopes
-      // - current_item_separator overrides current items only
-      // - global_item_separator overrides global items only
-      item_separator ""
-
-      // Optional name filters, not used in this dev config:
-      // include "dev" "monitor"
-      // exclude "notes"
+      // Independent filter and producer-authored styles for dynamic mode.
+      tab_pipe "monitor" {
+        include "monitor"
+        item_visible_format "#[fg=green,bold]{title}+"
+        item_hidden_format "#[fg=gray]{title}-"
+        item_closed_format ""
+      }
+      // Empty tab output clears its field, unlike empty global output (skip).
+      // Retired tab keys replay clears even if all outputs are disabled.
     }
   }
-  zjstatus location="https://github.com/dj95/zjstatus/releases/latest/download/zjstatus.wasm" {
+  // nix run .#dev copies the source-built fork artifact here from the Nix store.
+  zjstatus location="file:.cache/zjstatus.wasm" {
     pipe_scratchpads_format "{output} "
     pipe_scratchpads_rendermode "dynamic"
+    tab_pipe_scratchpads_format "#[fg=#a6adc8] [{output}]"
+    tab_pipe_scratchpads_rendermode "static"
+    tab_pipe_monitor_format " {output}"
+    tab_pipe_monitor_rendermode "dynamic"
     datetime "#[fg=#888888,bold] {format} "
     datetime_format "%H:%M:%S"
     format_left "{mode} {tabs}"
@@ -289,13 +264,13 @@ plugins {
     mode_entersearch "#[bg=blue,fg=#222222,bold] ENTERSEARCH "
     mode_renametab "#[bg=red,fg=#222222,bold] RENAMETAB "
     mode_session "#[bg=cyan,fg=#222222,bold] SESSION "
-    tab_active "#[bg=#555555,fg=#ffffff,bold] {index} {name} "
-    tab_normal "#[fg=#888888,bold] {index} {name} {bell_indicator}"
+    tab_active "#[bg=#555555,fg=#ffffff,bold] {index} {name}{tab_pipe_scratchpads}{tab_pipe_monitor} "
+    tab_normal "#[fg=#888888,bold] {index} {name}{tab_pipe_scratchpads}{tab_pipe_monitor} {bell_indicator}"
     tab_separator " "
     tab_bell_indicator "!"
     tab_flashing_bell_indicator "!!"
-    tab_normal_bell "#[fg=#f38ba8,bg=$bg,bold] {index} {name} {bell_indicator} "
-    tab_normal_flashing_bell "#[fg=$bg,bg=#f38ba8,bold] {index} {name} {bell_indicator} "
+    tab_normal_bell "#[fg=#f38ba8,bg=$bg,bold] {index} {name}{tab_pipe_scratchpads}{tab_pipe_monitor} {bell_indicator} "
+    tab_normal_flashing_bell "#[fg=$bg,bg=#f38ba8,bold] {index} {name}{tab_pipe_scratchpads}{tab_pipe_monitor} {bell_indicator} "
   }
 }
 

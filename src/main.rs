@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use zellij_tile::prelude::*;
 
@@ -20,10 +21,10 @@ use zellij_tools::scratchpad::{
 };
 use zellij_tools::tree;
 use zellij_tools::zjstatus::{
-    parse_zjstatus_config_doc, parse_zjstatus_config_kdl, render as render_zjstatus,
-    should_publish_empty as should_publish_empty_zjstatus, zjstatus_payload, ZjstatusConfig,
-    ZjstatusConfigLayers, ZjstatusConfigPatch,
+    parse_zjstatus_config_doc, parse_zjstatus_config_kdl, ZjstatusConfig, ZjstatusConfigLayers,
+    ZjstatusConfigPatch,
 };
+use zellij_tools::zjstatus_runtime::{Publisher, Scheduler};
 
 const REGISTRY_LOCK_STALE_TIMEOUT_MS: u64 = 2_000;
 const REGISTRY_PENDING_TIMEOUT_MS: u64 = 2_000;
@@ -32,9 +33,11 @@ const REGISTRY_PENDING_TIMEOUT_MS: u64 = 2_000;
 struct State {
     // Pane tracking (from PaneUpdate events)
     pane_manifest: HashMap<usize, Vec<PaneInfo>>,
+    has_pane_snapshot: bool,
 
     // Tab tracking (from TabUpdate events)
     tab_infos: Vec<TabInfo>,
+    has_tab_snapshot: bool,
     current_tab_position: usize,
     are_floating_panes_visible: bool,
 
@@ -68,12 +71,12 @@ struct State {
     inline_zjstatus_kdl: Option<String>,
     // Resolved zjstatus output config, if enabled
     zjstatus_config: Option<ZjstatusConfig>,
-    // Last published zjstatus output, used to avoid duplicate event spam
-    last_zjstatus_output: Option<String>,
+    zjstatus_publisher: Publisher,
+    scheduler: Scheduler,
+    clock_origin: Option<Instant>,
+    zjstatus_refresh_ms: u32,
     // Known zjstatus plugin panes, used to detect newly-created status bars.
     zjstatus_plugin_panes: HashSet<(usize, u32)>,
-    // Republish after pane/tab churn settles so newly-created status bars receive state.
-    pending_zjstatus_publish: bool,
     // Whether we need to mount / after permissions are granted
     needs_host_mount: bool,
     // Last modified time of external config (for polling)
@@ -452,44 +455,86 @@ impl State {
     }
 
     fn apply_merged_config(&mut self, config: MergedConfig) {
+        if let Some(ref zjstatus) = config.zjstatus {
+            self.zjstatus_refresh_ms = zjstatus.refresh_ms;
+        }
         self.zjstatus_config = config.zjstatus;
-        self.last_zjstatus_output = None;
         self.replace_scratchpad_configs(config.scratchpads);
         self.publish_zjstatus(true);
-    }
-
-    fn zjstatus_snapshot(&self) -> ScratchpadStatusSnapshot {
-        if let Some(ref scratchpad) = self.scratchpad {
-            let ctx = self.build_scratchpad_context();
-            scratchpad.status_snapshot(&ctx)
-        } else {
-            ScratchpadStatusSnapshot::default()
-        }
+        self.configure_scheduler();
     }
 
     fn publish_zjstatus(&mut self, force: bool) {
-        let Some(config) = self.zjstatus_config.clone() else {
+        if !self.has_tab_snapshot {
             return;
+        }
+        // Publication observes the atomic registry without locking, pruning or writing it.
+        if let Some(pid) = self.zellij_pid {
+            if let Some(mut scratchpad) = self.scratchpad.take() {
+                if self.has_pane_snapshot {
+                    scratchpad.prune_passive_observations(&self.build_scratchpad_context());
+                }
+                match ScratchpadRegistry::read_from_path(&registry_file_path(pid)) {
+                    Ok(registry) => scratchpad
+                        .discover_panes_from_registry(&registry, &self.build_scratchpad_context()),
+                    Err(err) => eprintln!("Failed to discover scratchpad panes: {err}"),
+                }
+                self.scratchpad = Some(scratchpad);
+            }
+        }
+        let (snapshot, tabs) = if let Some(ref scratchpad) = self.scratchpad {
+            scratchpad.publication_snapshot(&self.build_scratchpad_context())
+        } else {
+            (
+                ScratchpadStatusSnapshot::default(),
+                self.tab_infos
+                    .iter()
+                    .map(|tab| (tab.tab_id, Vec::new()))
+                    .collect(),
+            )
         };
-        let output = render_zjstatus(&config, &self.zjstatus_snapshot());
-        if output.is_empty() && !should_publish_empty_zjstatus(&config) {
-            return;
+        for payload in
+            self.zjstatus_publisher
+                .commands(self.zjstatus_config.as_ref(), &snapshot, &tabs, force)
+        {
+            pipe_message_to_plugin(MessageToPlugin::new("zjstatus").with_payload(payload));
         }
-        if !force && self.last_zjstatus_output.as_deref() == Some(output.as_str()) {
-            return;
-        }
-
-        let payload = zjstatus_payload(&config.pipe, &output);
-        pipe_message_to_plugin(MessageToPlugin::new("zjstatus").with_payload(payload));
-        self.last_zjstatus_output = Some(output);
+        self.configure_scheduler();
     }
 
     fn schedule_zjstatus_publish(&mut self) {
-        if self.zjstatus_config.is_none() || self.pending_zjstatus_publish {
-            return;
+        let now = self.scheduler_now();
+        self.scheduler.delay_replay(now, Duration::from_millis(250));
+        self.arm_scheduler();
+    }
+
+    fn scheduler_now(&mut self) -> Duration {
+        self.clock_origin.get_or_insert_with(Instant::now).elapsed()
+    }
+
+    fn configure_scheduler(&mut self) {
+        let now = self.scheduler_now();
+        let poll = self.include_path.as_ref().and(self.watch_interval_ms);
+        let replay = self
+            .zjstatus_config
+            .as_ref()
+            .is_some_and(|config| config.outputs.values().any(|output| output.enabled))
+            || self.zjstatus_publisher.has_retired();
+        let refresh = if self.zjstatus_refresh_ms == 0 {
+            2000
+        } else {
+            self.zjstatus_refresh_ms
+        };
+        self.scheduler
+            .configure(now, poll, replay.then_some(u64::from(refresh)));
+        self.arm_scheduler();
+    }
+
+    fn arm_scheduler(&mut self) {
+        let now = self.scheduler_now();
+        if let Some(delay) = self.scheduler.arm(now) {
+            set_timeout(delay.as_secs_f64());
         }
-        self.pending_zjstatus_publish = true;
-        set_timeout(0.25);
     }
 
     fn update_zjstatus_plugin_panes(&mut self) -> bool {
@@ -845,6 +890,7 @@ impl ZellijPlugin for State {
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::PaneUpdate(pane_manifest) => {
+                self.has_pane_snapshot = true;
                 self.pane_manifest = pane_manifest.panes;
 
                 if self.event_stream.has_subscribers() {
@@ -924,6 +970,7 @@ impl ZellijPlugin for State {
                 }
             }
             Event::TabUpdate(tab_infos) => {
+                self.has_tab_snapshot = true;
                 if let Some(active_tab) = tab_infos.iter().find(|t| t.active) {
                     self.current_tab_position = active_tab.position;
                     self.are_floating_panes_visible = active_tab.are_floating_panes_visible;
@@ -991,11 +1038,6 @@ impl ZellijPlugin for State {
                     // Load the config
                     let config = self.load_merged_config();
                     self.apply_merged_config(config);
-
-                    // Start polling timer if watching is enabled
-                    if let Some(interval_ms) = self.watch_interval_ms {
-                        set_timeout(interval_ms as f64 / 1000.0);
-                    }
                 }
             }
             Event::FailedToChangeHostFolder(_err) => {
@@ -1015,14 +1057,10 @@ impl ZellijPlugin for State {
                 }
             }
             Event::Timer(_elapsed) => {
-                if self.pending_zjstatus_publish {
-                    self.pending_zjstatus_publish = false;
-                    self.publish_zjstatus(true);
-                }
-
-                // Check if config file has changed (only if watching is enabled)
-                if let (Some(ref include_path), Some(interval_ms)) =
-                    (&self.include_path, self.watch_interval_ms)
+                let now = self.scheduler_now();
+                let due = self.scheduler.take_due(now);
+                if let Some(ref include_path) =
+                    self.include_path.as_ref().filter(|_| due.config_poll)
                 {
                     if let Ok(metadata) = std::fs::metadata(include_path) {
                         let current_mtime = metadata.modified().ok();
@@ -1034,10 +1072,11 @@ impl ZellijPlugin for State {
                             self.apply_merged_config(config);
                         }
                     }
-
-                    // Schedule next poll
-                    set_timeout(interval_ms as f64 / 1000.0);
                 }
+                if due.full_replay || due.delayed_replay {
+                    self.publish_zjstatus(true);
+                }
+                self.arm_scheduler();
             }
             _ => (),
         };

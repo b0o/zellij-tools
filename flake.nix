@@ -11,6 +11,15 @@
       url = "github:zellij-org/zellij";
       flake = false;
     };
+    zjstatus = {
+      url = "github:b0o/zjstatus/feat-tab-pipe";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        crane.follows = "crane";
+        flake-utils.follows = "flake-utils";
+        rust-overlay.follows = "rust-overlay";
+      };
+    };
   };
 
   outputs = {
@@ -19,6 +28,7 @@
     flake-utils,
     rust-overlay,
     zellij-src,
+    zjstatus,
     ...
   }:
     flake-utils.lib.eachSystem ["x86_64-linux" "aarch64-linux" "aarch64-darwin"] (
@@ -136,6 +146,7 @@
         packages = {
           default = plugin;
           inherit cli;
+          zjstatus = zjstatus.packages.${system}.default;
         };
 
         checks = {
@@ -263,10 +274,11 @@
 
           dev = {
             description = "Run Zellij with the local dev config";
-            runtimeInputs = [pkgs.zellij];
+            runtimeInputs = [pkgs.zellij pkgs.coreutils];
             command =
               # sh
               ''
+                install -Dm644 ${packages.zjstatus}/bin/zjstatus.wasm .cache/zjstatus.wasm
                 zellij --config dev.kdl "$@"
               '';
           };

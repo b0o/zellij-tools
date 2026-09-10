@@ -67,6 +67,10 @@ pub struct ScratchpadManager {
     configs: HashMap<String, ScratchpadConfig>,
     /// name -> (tab_id -> pane_id)
     panes: HashMap<String, HashMap<usize, u32>>,
+    /// Display-only observations, never consumed by actions or reconciliation.
+    passive_panes: HashMap<String, HashMap<usize, u32>>,
+    /// tab_id -> (last focused passive name, pane_id, local focus counter at observation).
+    passive_mru: HashMap<usize, (String, u32, u64)>,
     /// Monotonic counter for focus tracking
     focus_counter: u64,
     /// name -> (tab_id -> last focus timestamp)
@@ -83,6 +87,8 @@ impl ScratchpadManager {
         Self {
             configs,
             panes: HashMap::new(),
+            passive_panes: HashMap::new(),
+            passive_mru: HashMap::new(),
             focus_counter: 0,
             focus_times: HashMap::new(),
             just_shown: None,
@@ -430,6 +436,120 @@ impl ScratchpadManager {
         }
     }
 
+    /// Prune display-only observations using complete pane and authoritative tab snapshots.
+    /// Call before attempting registry I/O, even when that read fails. Wait until both
+    /// snapshots are available. Pane liveness ignores positions to tolerate reorder lag.
+    /// Local action ownership and focus history are never changed.
+    pub fn prune_passive_observations(&mut self, ctx: &ScratchpadContext<'_>) {
+        let live_panes: HashSet<u32> = ctx
+            .pane_manifest
+            .values()
+            .flatten()
+            .filter(|pane| !pane.is_plugin && !pane.exited && !pane.is_held)
+            .map(|pane| pane.id)
+            .collect();
+        self.passive_panes.retain(|name, panes| {
+            if !self.configs.contains_key(name) {
+                return false;
+            }
+            panes.retain(|tab_id, pane_id| {
+                ctx.tab_id_to_position.contains_key(tab_id) && live_panes.contains(pane_id)
+            });
+            !panes.is_empty()
+        });
+        self.passive_mru.retain(|tab_id, (name, pane_id, _)| {
+            self.passive_panes
+                .get(name)
+                .and_then(|panes| panes.get(tab_id))
+                == Some(pane_id)
+        });
+    }
+
+    /// Discover configured, observed Present records without reconciling or writing
+    /// the shared registry. Only display-only observations and MRU are updated;
+    /// action ownership, focus history, and orphan tracking are untouched. Empty
+    /// registry reads retain observations. Panes never transfer between name/tab keys.
+    pub fn discover_panes_from_registry(
+        &mut self,
+        registry: &ScratchpadRegistry,
+        ctx: &ScratchpadContext<'_>,
+    ) {
+        let observed: HashSet<(usize, u32)> = ctx
+            .pane_manifest
+            .iter()
+            .flat_map(|(&position, panes)| {
+                panes
+                    .iter()
+                    .filter(|pane| !pane.is_plugin && !pane.exited && !pane.is_held)
+                    .map(move |pane| (position, pane.id))
+            })
+            .collect();
+        let mut known_panes: HashSet<u32> = self
+            .panes
+            .values()
+            .chain(self.passive_panes.values())
+            .flat_map(|panes| panes.values().copied())
+            .collect();
+
+        for record in &registry.entries {
+            let RegistryRecordState::Present { pane_id } = record.state else {
+                continue;
+            };
+            if !self.configs.contains_key(&record.name)
+                || self
+                    .panes
+                    .get(&record.name)
+                    .is_some_and(|panes| panes.contains_key(&record.tab_id))
+                || !ctx
+                    .tab_id_to_position
+                    .get(&record.tab_id)
+                    .is_some_and(|&position| observed.contains(&(position, pane_id)))
+                || !known_panes.insert(pane_id)
+            {
+                continue;
+            }
+            self.passive_panes
+                .entry(record.name.clone())
+                .or_default()
+                .insert(record.tab_id, pane_id);
+        }
+
+        let view = self.publication_view();
+        for (&tab_id, &position) in ctx.tab_id_to_position {
+            let tab_ctx = ScratchpadContext {
+                current_tab_id: Some(tab_id),
+                current_tab_position: position,
+                ..*ctx
+            };
+            let Some(name) = view.get_focused_scratchpad(&tab_ctx) else {
+                continue;
+            };
+            if self
+                .panes
+                .get(&name)
+                .is_some_and(|panes| panes.contains_key(&tab_id))
+            {
+                if self
+                    .passive_mru
+                    .get(&tab_id)
+                    .is_some_and(|(mru_name, pane_id, counter)| {
+                        *mru_name != name
+                            || view.get_pane(&name, &tab_ctx) != Some(*pane_id)
+                            || self
+                                .focus_times
+                                .values()
+                                .any(|times| times.get(&tab_id).is_some_and(|time| time > counter))
+                    })
+                {
+                    self.passive_mru.remove(&tab_id);
+                }
+            } else if let Some(pane_id) = view.get_pane(&name, &tab_ctx) {
+                self.passive_mru
+                    .insert(tab_id, (name, pane_id, self.focus_counter));
+            }
+        }
+    }
+
     /// Register a pane that was just opened for a scratchpad.
     /// Called by the plugin after `open_command_pane_floating` returns the `PaneId`.
     pub fn register_pane(
@@ -772,6 +892,371 @@ mod tests {
             viewport_cols: 200,
             viewport_rows: 50,
         }
+    }
+
+    #[test]
+    fn passive_pruning_without_registry_discards_closed_panes_and_history() {
+        for state in ["absent", "exited", "held", "plugin"] {
+            let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+            manager
+                .passive_panes
+                .insert("term".to_string(), HashMap::from([(10, 42)]));
+            manager.passive_mru.insert(10, ("term".to_string(), 42, 0));
+            manager.register_pane("term", 11, 99);
+            let local_panes = manager.panes.clone();
+            let local_history = manager.focus_times.clone();
+            let positions = HashMap::from([(10, 0), (11, 1)]);
+            let panes = if state == "absent" {
+                Vec::new()
+            } else {
+                vec![PaneInfo {
+                    id: 42,
+                    exited: state == "exited",
+                    is_held: state == "held",
+                    is_plugin: state == "plugin",
+                    ..Default::default()
+                }]
+            };
+            let manifest = HashMap::from([(0, panes)]);
+            let ctx = make_context(&manifest, 0, Some(10), true, &positions);
+            // Registry unavailable: pruning and publication still run, discovery does not.
+            manager.prune_passive_observations(&ctx);
+            assert!(manager.passive_panes.is_empty(), "{state}");
+            assert!(manager.passive_mru.is_empty(), "{state}");
+            let (snapshot, tabs) = manager.publication_snapshot(&ctx);
+            assert!(!snapshot.current_items[0].is_mru);
+            assert!(!tabs[&10][0].is_mru);
+            assert_eq!(tabs[&10][0].state, ScratchpadDisplayState::Closed);
+            assert_eq!(manager.panes, local_panes);
+            assert_eq!(manager.focus_times, local_history);
+            assert_eq!(manager.just_shown, Some(99));
+        }
+    }
+
+    #[test]
+    fn passive_pruning_preserves_reorders_but_removes_closed_tabs_and_configs() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term", "notes"]));
+        manager.passive_panes = HashMap::from([
+            ("term".to_string(), HashMap::from([(10, 42), (11, 43)])),
+            ("notes".to_string(), HashMap::from([(12, 44)])),
+        ]);
+        manager.passive_mru = HashMap::from([
+            (10, ("term".to_string(), 42, 0)),
+            (11, ("term".to_string(), 43, 0)),
+            (12, ("notes".to_string(), 44, 0)),
+        ]);
+        let manifest = HashMap::from([(
+            0,
+            vec![
+                make_floating_pane(42, false),
+                make_floating_pane(43, false),
+                make_floating_pane(44, false),
+            ],
+        )]);
+        let positions = HashMap::from([(10, 7), (12, 2)]);
+        manager.reconcile_config(make_configs(&["term"]));
+        let ctx = make_context(&manifest, 7, Some(10), true, &positions);
+        manager.prune_passive_observations(&ctx);
+        assert_eq!(
+            manager.passive_panes,
+            HashMap::from([("term".to_string(), HashMap::from([(10, 42)]))])
+        );
+        assert_eq!(
+            manager.passive_mru,
+            HashMap::from([(10, ("term".to_string(), 42, 0))])
+        );
+        // Another unavailable read must not erase surviving observations/history.
+        manager.prune_passive_observations(&ctx);
+        assert_eq!(manager.passive_panes["term"][&10], 42);
+        let positions = HashMap::new();
+        manager.prune_passive_observations(&make_context(&manifest, 0, None, true, &positions));
+        assert!(manager.passive_panes.is_empty());
+        assert!(manager.passive_mru.is_empty());
+    }
+
+    #[test]
+    fn passive_mru_survives_same_pane_sync_until_new_local_focus() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term", "notes"]));
+        manager.register_pane("notes", 10, 43);
+        manager.clear_just_shown();
+        let mut registry = ScratchpadRegistry::default();
+        registry.begin_open("term", 10, 1, 0, 2_000);
+        registry.finish_open("term", 10, 1, 42, 1);
+        let positions = HashMap::from([(10, 0)]);
+        let mut manifest = HashMap::from([(
+            0,
+            vec![make_floating_pane(42, true), make_floating_pane(43, false)],
+        )]);
+        let ctx = make_context(&manifest, 0, Some(10), true, &positions);
+        manager.discover_panes_from_registry(&registry, &ctx);
+        manager.sync_known_panes(&[("term".to_string(), 10, 42)]);
+        manager.discover_panes_from_registry(&registry, &ctx);
+        assert_eq!(manager.passive_mru[&10].0, "term");
+        let pane = &mut manifest.get_mut(&0).unwrap()[0];
+        pane.is_focused = false;
+        pane.is_suppressed = true;
+        let ctx = make_context(&manifest, 0, Some(10), true, &positions);
+        manager.prune_passive_observations(&ctx);
+        let (snapshot, tabs) = manager.publication_snapshot(&ctx);
+        assert!(snapshot.current_items[1].is_mru);
+        assert!(tabs[&10][1].is_mru);
+        assert_eq!(
+            manager.get_last_focused_on_current_tab(&ctx).as_deref(),
+            Some("notes")
+        );
+        manager.register_pane("notes", 10, 43);
+        manager.clear_just_shown();
+        let (_, tabs) = manager.publication_snapshot(&ctx);
+        assert!(tabs[&10][0].is_mru);
+        assert!(!tabs[&10][1].is_mru);
+    }
+
+    #[test]
+    fn passive_discovery_validates_observations_without_mutating_registry() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+        let mut registry = ScratchpadRegistry::default();
+        for tab_id in 10..18 {
+            registry.begin_open("term", tab_id, 1, 0, 2_000);
+            registry.finish_open("term", tab_id, 1, tab_id as u32, 1);
+        }
+        registry.entries[6].state = RegistryRecordState::Pending { owner_plugin_id: 1 };
+        registry.entries[7].state = RegistryRecordState::Tombstone;
+        registry.begin_open("unknown", 10, 1, 0, 2_000);
+        registry.finish_open("unknown", 10, 1, 99, 1);
+        let original = registry.clone();
+        let positions = (10..17).map(|id| (id, id - 10)).collect();
+        let mut manifest = HashMap::from([
+            (
+                0,
+                vec![make_floating_pane(10, true), make_floating_pane(99, false)],
+            ),
+            (
+                2,
+                vec![PaneInfo {
+                    id: 12,
+                    exited: true,
+                    ..Default::default()
+                }],
+            ),
+            (
+                3,
+                vec![PaneInfo {
+                    id: 13,
+                    is_held: true,
+                    ..Default::default()
+                }],
+            ),
+            (
+                4,
+                vec![PaneInfo {
+                    id: 14,
+                    is_plugin: true,
+                    ..Default::default()
+                }],
+            ),
+            (5, vec![make_floating_pane(16, false)]),
+            (6, vec![make_floating_pane(15, false)]),
+            (7, vec![make_floating_pane(17, false)]),
+        ]);
+        manager.discover_panes_from_registry(
+            &registry,
+            &make_context(&manifest, 0, Some(10), true, &positions),
+        );
+        assert_eq!(
+            manager.passive_panes,
+            HashMap::from([("term".to_string(), HashMap::from([(10, 10)]))])
+        );
+        assert_eq!(registry, original);
+
+        // A later snapshot can discover a pane without any registry reconciliation.
+        manifest.insert(1, vec![make_floating_pane(11, false)]);
+        manager.discover_panes_from_registry(
+            &registry,
+            &make_context(&manifest, 0, Some(10), true, &positions),
+        );
+        assert_eq!(
+            manager.passive_panes["term"],
+            HashMap::from([(10, 10), (11, 11)])
+        );
+        assert_eq!(registry, original);
+        assert!(manager.panes.is_empty());
+        assert!(manager.focus_times.is_empty());
+        assert_eq!(manager.just_shown, None);
+
+        // A confirmed replacement on the same key must not stay closed forever.
+        registry.entries[1].state = RegistryRecordState::Present { pane_id: 111 };
+        manifest.insert(1, vec![make_floating_pane(111, false)]);
+        let ctx = make_context(&manifest, 0, Some(10), true, &positions);
+        manager.discover_panes_from_registry(&registry, &ctx);
+        assert_eq!(
+            manager.publication_snapshot(&ctx).1[&11][0].pane_id,
+            Some(111)
+        );
+        assert!(manager.panes.is_empty());
+    }
+
+    #[test]
+    fn passive_discovery_preserves_local_state_and_never_transfers_panes() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term", "notes"]));
+        manager.register_pane("term", 10, 42);
+        manager.register_pane("notes", 12, 99);
+        manager
+            .orphaned
+            .insert("old".to_string(), HashSet::from([13]));
+        let panes = manager.panes.clone();
+        let focus_times = manager.focus_times.clone();
+        let orphaned = manager.orphaned.clone();
+        let focus_counter = manager.focus_counter;
+        let just_shown = manager.just_shown;
+        let mut registry = ScratchpadRegistry::default();
+        for (name, tab_id, pane_id) in [("term", 11, 42), ("notes", 11, 42), ("notes", 12, 100)] {
+            registry.begin_open(name, tab_id, 1, 0, 2_000);
+            registry.finish_open(name, tab_id, 1, pane_id, 1);
+        }
+        let manifest = HashMap::from([
+            (1, vec![make_floating_pane(42, true)]),
+            (2, vec![make_floating_pane(100, false)]),
+        ]);
+        let positions = HashMap::from([(10, 0), (11, 1), (12, 2)]);
+        let ctx = make_context(&manifest, 0, Some(10), true, &positions);
+        manager.discover_panes_from_registry(&registry, &ctx);
+        manager.discover_panes_from_registry(&ScratchpadRegistry::default(), &ctx);
+        assert_eq!(manager.panes, panes);
+        assert_eq!(manager.focus_times, focus_times);
+        assert_eq!(manager.orphaned, orphaned);
+        assert_eq!(manager.focus_counter, focus_counter);
+        assert_eq!(manager.just_shown, just_shown);
+        let (_, tabs) = manager.publication_snapshot(&ctx);
+        assert!(tabs[&11]
+            .iter()
+            .all(|item| item.state == ScratchpadDisplayState::Closed));
+    }
+
+    #[test]
+    fn passive_panes_are_never_action_owned_or_cleaned_up_as_orphans() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+        let mut registry = ScratchpadRegistry::default();
+        registry.begin_open("term", 10, 1, 0, 2_000);
+        registry.finish_open("term", 10, 1, 42, 1);
+        let manifest = HashMap::from([(0, vec![make_floating_pane(42, true)])]);
+        let positions = HashMap::from([(10, 0)]);
+        let ctx = make_context(&manifest, 0, Some(10), true, &positions);
+        manager.discover_panes_from_registry(&registry, &ctx);
+        let (snapshot, tabs) = manager.publication_snapshot(&ctx);
+        assert_eq!(snapshot.current_items[0].pane_id, Some(42));
+        assert_eq!(snapshot.global_items[0].pane_id, Some(42));
+        assert_eq!(snapshot.global_count_items[0].pane_id, Some(42));
+        assert_eq!(tabs[&10][0].pane_id, Some(42));
+        assert!(manager.persisted_state().panes.is_empty());
+        assert_eq!(
+            manager.status_snapshot(&ctx).current_items[0].state,
+            ScratchpadDisplayState::Closed
+        );
+        assert!(manager.handle_focus_pane(42, &ctx).is_none());
+        assert!(manager.handle_toggle(None, &ctx).is_empty());
+        assert!(manager.handle_hide("term", &ctx).is_empty());
+        assert!(manager.handle_close("term", &ctx).is_empty());
+        assert!(matches!(
+            manager.handle_show("term", &ctx).as_slice(),
+            [ScratchpadCommand::OpenFloating { .. }]
+        ));
+
+        // A stale position-derived orphan set must never close another client's pane.
+        assert!(manager
+            .on_pane_update(&ctx, &HashSet::from([10]))
+            .is_empty());
+        assert!(manager.focus_times.is_empty());
+        assert_eq!(manager.focus_counter, 0);
+        assert!(manager.reconcile_config(HashMap::new()).is_empty());
+        assert!(manager.orphaned.is_empty());
+        manager.reconcile_config(make_configs(&["term"]));
+        assert_eq!(
+            manager.publication_snapshot(&ctx).1[&10][0].pane_id,
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn passive_first_focus_survives_hide_without_affecting_action_mru() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term", "notes"]));
+        manager.register_pane("notes", 10, 43);
+        manager.clear_just_shown();
+        let mut registry = ScratchpadRegistry::default();
+        registry.begin_open("term", 10, 1, 0, 2_000);
+        registry.finish_open("term", 10, 1, 42, 1);
+        let positions = HashMap::from([(10, 0)]);
+        let mut manifest = HashMap::from([(
+            0,
+            vec![make_floating_pane(42, true), make_floating_pane(43, false)],
+        )]);
+        manager.discover_panes_from_registry(
+            &registry,
+            &make_context(&manifest, 0, Some(10), true, &positions),
+        );
+        assert_eq!(manager.passive_mru[&10].0, "term");
+        let pane = &mut manifest.get_mut(&0).unwrap()[0];
+        pane.is_focused = false;
+        pane.is_suppressed = true;
+        let ctx = make_context(&manifest, 0, Some(10), true, &positions);
+        // Empty reads preserve both observations and passive focus history.
+        manager.discover_panes_from_registry(&ScratchpadRegistry::default(), &ctx);
+        let (snapshot, tabs) = manager.publication_snapshot(&ctx);
+        assert!(tabs[&10][1].is_mru);
+        assert_eq!(tabs[&10][1].state, ScratchpadDisplayState::Hidden);
+        assert!(snapshot.current_items[1].is_mru);
+        assert_eq!(
+            manager.get_last_focused_on_current_tab(&ctx).as_deref(),
+            Some("notes")
+        );
+        assert!(manager.status_snapshot(&ctx).current_items[0].is_mru);
+        assert_eq!(manager.focus_times.len(), 1);
+        assert_eq!(manager.focus_counter, 1);
+
+        // A later local focus wins without using the passive counter for actions.
+        manager.handle_show("notes", &ctx);
+        manager.clear_just_shown();
+        let (_, tabs) = manager.publication_snapshot(&ctx);
+        assert!(tabs[&10][0].is_mru);
+        assert!(!tabs[&10][1].is_mru);
+    }
+
+    #[test]
+    fn passive_identity_cannot_transfer_and_later_local_ownership_wins() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term", "notes"]));
+        let mut registry = ScratchpadRegistry::default();
+        registry.begin_open("term", 10, 1, 0, 2_000);
+        registry.finish_open("term", 10, 1, 42, 1);
+        let positions = HashMap::from([(10, 0), (11, 1)]);
+        let manifest = HashMap::from([(0, vec![make_floating_pane(42, true)])]);
+        manager.discover_panes_from_registry(
+            &registry,
+            &make_context(&manifest, 0, Some(10), true, &positions),
+        );
+        let passive = manager.passive_panes.clone();
+        registry.entries[0].name = "notes".to_string();
+        registry.entries[0].tab_id = 11;
+        let manifest = HashMap::from([(1, vec![make_floating_pane(42, true)])]);
+        let ctx = make_context(&manifest, 1, Some(11), true, &positions);
+        manager.discover_panes_from_registry(&registry, &ctx);
+        assert_eq!(manager.passive_panes, passive);
+        assert!(manager
+            .publication_snapshot(&ctx)
+            .1
+            .values()
+            .flatten()
+            .all(|item| item.pane_id.is_none()));
+
+        // Explicit action ownership, not discovery, can claim the pane elsewhere.
+        manager.register_pane("notes", 11, 42);
+        let (_, tabs) = manager.publication_snapshot(&ctx);
+        assert_eq!(tabs[&11][0].pane_id, Some(42));
+        assert_eq!(tabs[&10][1].pane_id, None);
+
+        // An in-flight local pane also masks the same passive name/tab key.
+        manager.register_pane("term", 10, 99);
+        let manifest = HashMap::from([(0, vec![make_floating_pane(42, true)])]);
+        let ctx = make_context(&manifest, 0, Some(10), true, &positions);
+        assert_eq!(manager.publication_snapshot(&ctx).1[&10][1].pane_id, None);
     }
 
     #[test]

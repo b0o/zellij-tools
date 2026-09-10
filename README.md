@@ -61,7 +61,7 @@ To use the plugin from your Nix-managed Zellij config, add the flake as an input
 
 ## Scratchpads
 
-Scratchpads are floating terminal panes that can be quickly toggled on and off. They follow you across tabs and persist their state.
+Scratchpads are floating terminal panes that can be quickly toggled on and off. Instances are keyed by scratchpad name and native tab ID, so the same name can have independent panes on different tabs. Hiding preserves the pane; closing terminates it.
 
 ### Configuration
 
@@ -127,11 +127,12 @@ scratchpads {
 
 // Optional: publish scratchpad status to the zjstatus plugin.
 zjstatus {
-    pipe "scratchpads"
-    format "{current_items}"
-    current_item_visible_format "#[fg=green]{title}"
-    current_item_hidden_format "#[fg=gray]{title}"
-    current_item_closed_format ""
+    pipe "scratchpads" {
+        format "{current_items}"
+        current_item_visible_format "#[fg=green]{title}"
+        current_item_hidden_format "#[fg=gray]{title}"
+        current_item_closed_format ""
+    }
 }
 ```
 
@@ -252,50 +253,119 @@ Replace those with `keybinds { ... }` blocks inside each scratchpad definition i
 
 ### zjstatus Integration
 
-The plugin can publish scratchpad status to [zjstatus](https://github.com/dj95/zjstatus) using zjstatus' pipe protocol. Add a `zjstatus` block to the inline plugin config or to the external file loaded by `include`:
+The plugin publishes global widgets and independent per-tab fields using the zjstatus pipe protocol. Global widgets work with [upstream zjstatus](https://github.com/dj95/zjstatus); tab fields require a build with the tab-pipe extension, such as the local fork used in `dev.kdl`. Add a `zjstatus` block inline or in the external file loaded by `include`.
+
+#### Breaking Migration
+
+Only nested `pipe "name" { ... }` and `tab_pipe "field" { ... }` outputs are supported. The old flat `pipe "scratchpads"` followed by sibling formatting options is rejected, including when mixed with new syntax. Move those options inside the pipe block; the receiver's global widget name stays unchanged. Minimal replacement:
 
 ```kdl
-// inside of the zellij-tools config:
 zjstatus {
-    // Publishes to zjstatus' pipe_scratchpads widget.
-    pipe "scratchpads"
-
-    // Top-level output shown by zjstatus.
-    format "{current_items} #[fg=#666666]+{other_live_count}"
-
-    // Optional fallback published when the rendered output is empty.
-    // Leave empty to avoid clearing the previous zjstatus output during transient updates.
-    empty_format ""
-
-    current_item_focused_format "#[fg=#7583FF,bold]{title}"
-    current_item_visible_format "#[fg=#585d8d,bold]{title}"
-    current_item_hidden_format "#[fg=#666666]{title}"
-    current_item_closed_format ""
-    item_separator " "
+    pipe "scratchpads" {
+        format "{current_items}"
+        current_item_closed_format ""
+    }
 }
 ```
 
-Then configure zjstatus to render the matching pipe widget:
+#### Multiple Outputs
 
 ```kdl
-zjstatus location="https://github.com/dj95/zjstatus/releases/latest/download/zjstatus.wasm" {
+zjstatus {
+    refresh_ms 2000
+
+    pipe "scratchpads" {
+        format "{current_items} #[fg=#666666]+{other_live_count}"
+        current_item_focused_format "#[fg=#7583FF,bold]{title}"
+        current_item_visible_format "#[fg=#585d8d,bold]{title}"
+        current_item_hidden_format "#[fg=#666666]{title}"
+        current_item_closed_format ""
+    }
+
+    tab_pipe "scratchpads" {
+        format "{tab_items}"
+        include "term" "git"
+        item_visible_format "{name}+"
+        item_hidden_format "{name}-"
+        item_closed_format ""
+    }
+
+    tab_pipe "notes" {
+        include "notes"
+        item_visible_format "#[fg=green,bg=black,bold]{title}"
+        item_hidden_format "#[fg=gray,bg=black]{title}"
+        item_closed_format ""
+    }
+}
+```
+
+Configure the tab-pipe-capable receiver with matching names. Static mode styles a wrapper around plain producer text; dynamic mode interprets producer-authored zjstatus styles:
+
+```kdl
+zjstatus location="file:/absolute/path/to/tab-pipe-capable/zjstatus.wasm" {
     pipe_scratchpads_format "{output} "
     pipe_scratchpads_rendermode "dynamic"
     format_right "{pipe_scratchpads} {datetime} {session}"
+    format_left "{tabs}"
+    tab_normal "{index} {name}{tab_pipe_scratchpads}{tab_pipe_notes}"
+    tab_active "#[bold]{index} {name}{tab_pipe_scratchpads}{tab_pipe_notes}"
+    tab_pipe_scratchpads_format "#[fg=blue,bg=black] [{output}]"
+    tab_pipe_scratchpads_rendermode "static"
+    tab_pipe_notes_format " ({output})"
+    tab_pipe_notes_rendermode "dynamic"
 }
 ```
 
-The plugin publishes updates when scratchpads change, when panes/tabs change, when a zjstatus plugin pane appears, and when it receives `zellij-tools::zjstatus::refresh`.
+Tab placeholders belong in tab label formats, including any explicit bell/fullscreen/sync/rename variants, not outer bar formats. Tab pipe styles do not inherit the surrounding tab style. Missing or cleared tab values hide their wrappers.
+
+#### Schema and Layering
+
+- Repeat either output kind as needed. Identity is `(kind, name)`, so global `scratchpads` and tab `scratchpads` coexist; duplicate identities within one layer are errors.
+- Global names match `[A-Za-z0-9_-]+`; tab field names match `[a-z0-9_]+`. Use the bare name, without `pipe_` or `tab_pipe_`.
+- `enabled true` is the default. `enabled false` disables an output; it is a KDL boolean, not a string.
+- Each output has independent defaults: `format "{current_items}"` for global pipes, `format "{tab_items}"` for tab pipes, `item_format "{icon} {name}"`, `item_separator " "`, and `empty_format ""`. There is no cross-output inheritance.
+- Inline and external definitions merge by identity. Explicit external fields win; omitted fields retain inline values. Defaults apply after merging. Omitting an external output does not delete its inline definition; use `enabled false` to disable it.
+- `include` and `exclude` are exact scratchpad-name lists applied before counts. Exclude wins. Lists replace rather than append; `include;` resets to all names and `exclude;` resets to no exclusions. Items are alphabetical, not ordered by the include list.
+- Explicit empty strings override inherited formats. Empty item formats omit those items without extra separators and affect `rendered_count`, not `live_count`.
+
+For example, an external override can disable an inline field and reset another field's filter without replacing its other settings:
+
+```kdl
+zjstatus {
+    tab_pipe "notes" { enabled false; }
+    tab_pipe "scratchpads" { include; item_hidden_format ""; }
+}
+```
+
+#### Delivery and Limits
+
+Use **one authoritative producer per global name or tab field**. Delivery is session-wide and last-writer-wins, not client-private. The producer passively discovers configured scratchpad instances opened by other clients from the shared registry, validated against observed panes, without reconciling or writing registry records during publication. Focus and MRU reflect that producer's client view and history, not a merged multi-client view. Automatic adoption of manually moved cross-tab scratchpads is out of scope; moving a pane does not transfer its scratchpad identity or badge.
+
+Updates follow scratchpad actions, pane/tab changes and configuration changes. New receivers also trigger delayed replay. `zellij-tools::zjstatus::refresh` forces replay; periodic full replay recovers new/restarted receivers and startup races even without state changes. `refresh_ms` is an unquoted positive KDL integer in `1..=4294967295` (`u32`), default `2000` milliseconds. Zero, negatives, overflow, strings and booleans are rejected. Replay is independent of `watch_ms` and requires no external include file.
+
+An empty rendered result uses the literal `empty_format` fallback after sanitization. If the result is still empty, a **tab output sends a clear**, including on its first publication; a **global output skips the write**, retaining the receiver's previous value. Whitespace is nonempty. A count-only format such as `"{tab_live_count}"` renders `0`, not an empty value, so its wrapper remains visible. Disabling/removing global outputs does not guarantee clearing their old receiver values.
+
+Disabling, removing or renaming a tab output clears its previously owned fields on live tabs. Retired tab keys keep replaying clears during the producer's lifetime, **even with all outputs disabled**. Replay stops when there are neither enabled outputs nor retired keys needing clears. Retired keys are dropped when their tab closes or the key is reactivated. Receiver state and producer retirement history are transient: there is no acknowledgement, TTL, persistent ownership history or automatic cleanup after a producer crash/restart.
+
+Tab delivery uses native stable IDs, not positions or pane IDs, and broadcasts every tab's values to all receivers, including bars in inactive tabs:
+
+```text
+zjstatus::tab_pipe::42::scratchpads::term+ git-
+zjstatus::tab_pipe::42::scratchpads::
+zjstatus::pipe::pipe_scratchpads::term
+```
+
+The second command clears tab ID `42`'s field; its trailing `::` is required. IDs here are illustrative; obtain actual IDs from `zellij-tools tree`. Tab values preserve embedded `::`; global values replace it with `: :`. Both replace CR/LF with spaces. Data-derived names/titles are escaped rather than interpreted as style markup or recursively expanded placeholders.
 
 #### zjstatus Placeholders
 
-Top-level `format` supports these placeholders:
+Global pipe `format` supports these placeholders:
 
 | Placeholder                                                                           | Description                                                   |
 | ------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
 | `{current_items}`, `{global_items}`                                                   | Rendered scratchpad items for the active tab or whole session |
-| `{current_configured_count}`, `{global_configured_count}`, `{other_configured_count}` | Configured scratchpad counts after include/exclude filters    |
-| `{current_rendered_count}`, `{global_rendered_count}`, `{other_rendered_count}`       | Items that render after empty item formats are filtered out   |
+| `{current_configured_count}`, `{global_configured_count}`, `{other_configured_count}` | Status entries after include/exclude filters                  |
+| `{current_rendered_count}`, `{global_rendered_count}`, `{other_rendered_count}`       | Count entries whose item format renders nonempty              |
 | `{current_live_count}`, `{global_live_count}`, `{other_live_count}`                   | Scratchpads with live panes                                   |
 | `{current_visible_count}`, `{global_visible_count}`, `{other_visible_count}`          | Visible scratchpad counts                                     |
 | `{current_hidden_count}`, `{global_hidden_count}`, `{other_hidden_count}`             | Hidden/suppressed scratchpad counts                           |
@@ -303,23 +373,53 @@ Top-level `format` supports these placeholders:
 | `{current_focused_name}`, `{global_focused_name}`                                     | Focused scratchpad name                                       |
 | `{current_focused_title}`, `{global_focused_title}`                                   | Focused scratchpad title                                      |
 
-`current_*` values describe the active tab. `global_*` values describe the whole session. `other_*` values are `global` minus `current`.
+`current_*` values describe the producer's active tab. `global_*` values describe the whole session. `other_*` counts are `global` minus `current`, floored at zero. Global items render one representative per configured name, but global counts use each live instance, or one closed entry when a name has no live instances. Thus a name live on two tabs contributes two to global configured/live counts while rendering once in `{global_items}`; global rendered counts also evaluate the per-instance entries.
+
+Tab outputs support `{tab_items}`, `{tab_configured_count}`, `{tab_rendered_count}`, `{tab_live_count}`, `{tab_visible_count}`, `{tab_hidden_count}`, `{tab_closed_count}`, `{tab_focused_name}`, and `{tab_focused_title}`, plus the same `{global_*}` placeholders. `tab_*` always describes the tab whose label is being rendered, including inactive tabs. Known `current_*`/`other_*` placeholders are rejected in tab outputs; `tab_*` placeholders are rejected in global outputs.
+
+Visible means live, floating and not suppressed, even on an inactive tab. Hidden means live but not visible (including tiled panes); absent, exited or held panes count as closed. Focus/MRU are supplementary attributes, not lifecycle states.
 
 Item formats support these placeholders:
 
-| Placeholder             | Description                                |
-| ----------------------- | ------------------------------------------ |
-| `{name}`                | Scratchpad config name                     |
-| `{title}`               | Configured title, falling back to the name |
-| `{state}`               | `visible`, `hidden`, or `closed`           |
-| `{icon}`                | Fixed state icon: `●`, `○`, or `×`         |
-| `{pane_id}`, `{tab_id}` | Live pane and native Zellij tab IDs        |
-| `{tab_position}`        | 1-based tab position when available        |
-| `{is_focused}`          | `true` or `false`                          |
+| Placeholder             | Description                                       |
+| ----------------------- | ------------------------------------------------- |
+| `{name}`                | Scratchpad config name                            |
+| `{title}`               | Configured title, falling back to the name        |
+| `{state}`               | `visible`, `hidden`, or `closed`                  |
+| `{icon}`                | Fixed state icon: `●`, `○`, or `×`                |
+| `{pane_id}`, `{tab_id}` | Numeric terminal pane ID and native stable tab ID |
+| `{tab_position}`        | Zero-based API tab position when available        |
+| `{is_focused}`          | `true` or `false`                                 |
 
-Item format fallback order is: `<scope>_item_<state>_format`, `item_<state>_format`, `<scope>_item_format`, then `item_format`. On the active tab, `current_item_focused_format` takes priority, followed by `current_item_mru_format`, then the state-based fallbacks. The MRU is the focused scratchpad, or, when none is focused, the scratchpad that `zellij-tools::scratchpad::toggle` would show using the active tab's focus history. No MRU is selected without a focused scratchpad or focus history. These overrides do not affect global items. Set an item format to an empty string to omit matching items.
+Closed tab-local items retain their target `{tab_id}` and `{tab_position}` but have an empty `{pane_id}`. `{tab_position}` preserves the existing zero-based convention, unlike the CLI's 1-based `focus tab` position argument and the receiver's display index.
 
-Supported zjstatus config keys are: `pipe`, `format`, `empty_format`, `item_format`, `item_visible_format`, `item_hidden_format`, `item_closed_format`, `current_item_format`, `current_item_focused_format`, `current_item_mru_format`, `current_item_visible_format`, `current_item_hidden_format`, `current_item_closed_format`, `global_item_format`, `global_item_visible_format`, `global_item_hidden_format`, `global_item_closed_format`, `item_separator`, `current_item_separator`, `global_item_separator`, `include`, and `exclude`.
+Item format precedence is: scoped focused override, scoped MRU override, `<scope>_item_<state>_format`, `item_<state>_format`, `<scope>_item_format`, then `item_format`. Focused/MRU overrides exist for `current` and `tab`, not `global`. MRU is the focused scratchpad or, when none is focused, the target of an unnamed toggle using that tab's focus history. No MRU is selected without focus or history. An explicit empty override omits the item; a nonempty focused/MRU override can show an item even when `item_hidden_format ""` would otherwise hide it.
+
+Inside each output, supported keys are `enabled`, `format`, `empty_format`, `include`, `exclude`, `item_format`, `item_visible_format`, `item_hidden_format`, `item_closed_format`, and `item_separator`. Scoped overrides are `<scope>_item_format`, `<scope>_item_visible_format`, `<scope>_item_hidden_format`, `<scope>_item_closed_format`, and `<scope>_item_separator`, using `current`/`global` for global outputs and `tab`/`global` for tab outputs. `current_item_focused_format`/`current_item_mru_format` apply only to global outputs; `tab_item_focused_format`/`tab_item_mru_format` only to tab outputs. Formats and separators are strings; unknown options, duplicate options and unsupported scopes are errors.
+
+#### Local Dev Example
+
+`nix run .#dev` builds the `b0o/zjstatus` fork's `feat-tab-pipe` branch from the revision pinned in `flake.lock`. The launcher copies the Nix-store artifact to the gitignored `.cache/zjstatus.wasm`, which `dev.kdl` loads by relative path. Run from this repository's root; each launch refreshes the cached artifact. No installed plugin or production config needs replacing.
+
+```sh
+# Build just the pinned status bar.
+nix build .#zjstatus
+
+# Update the fork pin after changes have been pushed.
+nix flake update zjstatus
+
+# Test uncommitted local fork changes without changing the lock file.
+nix run .#dev --override-input zjstatus path:/home/boo/git/zjstatus/worktree/feat-tab-pipe -- --session tools-tab-pipes-demo
+```
+
+From this repository, build with `nix run .#build`, then launch an isolated session from a terminal outside your active Zellij session with `nix run .#dev -- --session tools-tab-pipes-demo`. The layout starts `dev` and `review`, each with a status bar; scratchpads are not auto-opened.
+
+1. In the first tab's terminal, run `nix run .#run -- scratchpad show dev`, then `nix run .#run -- scratchpad hide dev` from the scratchpad shell. This leaves a hidden `dev` instance.
+2. Switch to tab 2 with `Ctrl Space`, then `2`. Run `nix run .#run -- scratchpad show git` there and leave it visible.
+3. Both bars should show `dev-` beside the first tab and `git+` beside the second. `Ctrl T`, `Ctrl G`, and `Ctrl B` toggle `dev`, `git`, and `monitor` on the invoking tab. The separate monitor field is visible after showing `monitor` with `Ctrl B`.
+4. Hide/show/close these instances and verify their own tab labels change. For the same-name case, also show `dev` on tab 2; it is independent of the hidden `dev` on tab 1.
+
+CLI commands infer the originating pane's tab. Explicit `--tab` values must be native IDs from `tree`, not the layout's first/second positions. These are manual verification instructions, not recorded test outcomes.
 
 ### Scratchpad CLI
 

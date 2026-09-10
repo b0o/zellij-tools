@@ -5,5 +5,7 @@ layout {
             plugin location="zjstatus"
         }
     }
-    tab name="dev"
+    // Scratchpads are opened manually; see README's Local Dev Example.
+    tab name="dev" focus=true
+    tab name="review"
 }

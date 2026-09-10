@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{ScratchpadContext, ScratchpadManager};
 
@@ -58,6 +58,108 @@ struct PaneStatus {
 impl ScratchpadManager {
     pub fn status_snapshot(&self, ctx: &ScratchpadContext<'_>) -> ScratchpadStatusSnapshot {
         let pane_lookup = build_pane_lookup(ctx);
+        self.status_snapshot_with_lookup(ctx, &pane_lookup)
+    }
+
+    /// Build current/global status and alphabetical items for every authoritative tab ID.
+    /// Includes passive observations in a display-only view; legacy status and actions
+    /// remain local-only. Local ownership takes precedence, including in-flight panes.
+    /// Closed tab-local items retain their target tab identity. The caller must wait
+    /// for the first authoritative tab snapshot; an empty tab map stays empty.
+    /// Call `prune_passive_observations` before registry I/O and this projection.
+    pub fn publication_snapshot(
+        &self,
+        ctx: &ScratchpadContext<'_>,
+    ) -> (
+        ScratchpadStatusSnapshot,
+        BTreeMap<usize, Vec<ScratchpadStatusItem>>,
+    ) {
+        let pane_lookup = build_pane_lookup(ctx);
+        let view = self.publication_view();
+        let snapshot = view.status_snapshot_with_lookup(ctx, &pane_lookup);
+        let tab_items = ctx
+            .tab_id_to_position
+            .iter()
+            .map(|(&tab_id, &tab_position)| {
+                let tab_ctx = ScratchpadContext {
+                    current_tab_id: Some(tab_id),
+                    current_tab_position: tab_position,
+                    ..*ctx
+                };
+                let mru = view
+                    .get_focused_scratchpad(&tab_ctx)
+                    .or_else(|| view.get_last_focused_on_current_tab(&tab_ctx));
+                let items = snapshot
+                    .current_items
+                    .iter()
+                    .map(|configured| {
+                        let mut item =
+                            view.current_status_item(&configured.name, &tab_ctx, &pane_lookup);
+                        item.tab_id = Some(tab_id);
+                        item.tab_position = Some(tab_position);
+                        item.is_mru = mru.as_deref() == Some(item.name.as_str());
+                        item
+                    })
+                    .collect();
+                (tab_id, items)
+            })
+            .collect();
+        (snapshot, tab_items)
+    }
+
+    pub(super) fn publication_view(&self) -> Self {
+        let mut view = Self::new(self.configs.clone());
+        view.panes = self.panes.clone();
+        view.focus_times = self.focus_times.clone();
+        view.focus_counter = self.focus_counter;
+        view.just_shown = self.just_shown;
+        let mut pane_ids: HashSet<u32> = self
+            .panes
+            .values()
+            .flat_map(|panes| panes.values().copied())
+            .collect();
+        for (name, panes) in &self.passive_panes {
+            if !self.configs.contains_key(name) {
+                continue;
+            }
+            for (&tab_id, &pane_id) in panes {
+                if view
+                    .panes
+                    .get(name)
+                    .is_some_and(|panes| panes.contains_key(&tab_id))
+                    || !pane_ids.insert(pane_id)
+                {
+                    continue;
+                }
+                view.panes
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(tab_id, pane_id);
+            }
+        }
+        for (&tab_id, (name, pane_id, local_counter)) in &self.passive_mru {
+            if self.configs.contains_key(name)
+                && view.panes.get(name).and_then(|panes| panes.get(&tab_id)) == Some(pane_id)
+                && !self
+                    .focus_times
+                    .values()
+                    .any(|times| times.get(&tab_id).is_some_and(|time| time > local_counter))
+            {
+                // Same-pane adoption does not constitute a new focus event.
+                view.focus_times
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(tab_id, self.focus_counter.saturating_add(1));
+            }
+        }
+        view
+    }
+
+    fn status_snapshot_with_lookup(
+        &self,
+        ctx: &ScratchpadContext<'_>,
+        pane_lookup: &HashMap<(usize, u32), PaneStatus>,
+    ) -> ScratchpadStatusSnapshot {
         let mut names: Vec<&String> = self.configs.keys().collect();
         names.sort();
 
@@ -67,18 +169,18 @@ impl ScratchpadManager {
         let current_items = names
             .iter()
             .map(|name| {
-                let mut item = self.current_status_item(name, ctx, &pane_lookup);
+                let mut item = self.current_status_item(name, ctx, pane_lookup);
                 item.is_mru = mru.as_deref() == Some(name.as_str());
                 item
             })
             .collect();
         let global_count_items = names
             .iter()
-            .flat_map(|name| self.global_count_status_items(name, ctx, &pane_lookup))
+            .flat_map(|name| self.global_count_status_items(name, ctx, pane_lookup))
             .collect();
         let global_items = names
             .iter()
-            .map(|name| self.global_status_item(name, ctx, &pane_lookup))
+            .map(|name| self.global_status_item(name, ctx, pane_lookup))
             .collect();
 
         ScratchpadStatusSnapshot {
@@ -321,6 +423,129 @@ mod tests {
             is_focused: focused,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn publication_keeps_tab_local_state_and_global_semantics_separate() {
+        let mut manager = ScratchpadManager::new(HashMap::from([
+            ("term".to_string(), make_config(None)),
+            ("notes".to_string(), make_config(Some("Notes"))),
+        ]));
+        manager.panes = HashMap::from([
+            ("term".to_string(), HashMap::from([(10, 42), (11, 43)])),
+            ("notes".to_string(), HashMap::from([(11, 44)])),
+        ]);
+        manager.focus_times = HashMap::from([
+            ("term".to_string(), HashMap::from([(10, 1), (11, 2)])),
+            ("notes".to_string(), HashMap::from([(11, 3)])),
+        ]);
+        let manifest = HashMap::from([
+            (0, vec![make_pane(42, false, true)]),
+            (
+                1,
+                vec![make_pane(43, true, false), make_pane(44, true, false)],
+            ),
+        ]);
+        let positions = HashMap::from([(10, 0), (11, 1), (12, 2)]);
+        let ctx = make_context(&manifest, &positions);
+        let (snapshot, tabs) = manager.publication_snapshot(&ctx);
+
+        assert_eq!(snapshot, manager.status_snapshot(&ctx));
+        assert_eq!(tabs.keys().copied().collect::<Vec<_>>(), vec![10, 11, 12]);
+        assert_eq!(tabs[&10][0].name, "notes");
+        assert_eq!(tabs[&10][1].state, ScratchpadDisplayState::Visible);
+        assert_eq!(tabs[&10][1].pane_id, Some(42));
+        assert!(tabs[&10][1].is_mru);
+        assert_eq!(tabs[&11][1].state, ScratchpadDisplayState::Hidden);
+        assert_eq!(tabs[&11][1].pane_id, Some(43));
+        assert!(tabs[&11][0].is_mru);
+        assert!(!tabs[&11][1].is_mru);
+        assert_eq!(snapshot.global_count_items.len(), 3);
+        for item in &tabs[&12] {
+            assert_eq!(item.state, ScratchpadDisplayState::Closed);
+            assert_eq!(item.tab_id, Some(12));
+            assert_eq!(item.tab_position, Some(2));
+            assert_eq!(item.pane_id, None);
+            assert!(!item.is_focused);
+            assert!(!item.is_mru);
+        }
+        assert_eq!(snapshot.current_items[0].tab_id, None);
+
+        let inactive_ctx = ScratchpadContext {
+            current_tab_id: Some(11),
+            current_tab_position: 1,
+            ..ctx
+        };
+        assert_eq!(manager.publication_snapshot(&inactive_ctx).1, tabs);
+    }
+
+    #[test]
+    fn publication_rejects_moved_exited_held_and_plugin_panes() {
+        let mut manager = ScratchpadManager::new(HashMap::from([
+            ("term".to_string(), make_config(None)),
+            ("notes".to_string(), make_config(None)),
+        ]));
+        manager.panes = HashMap::from([
+            ("term".to_string(), HashMap::from([(10, 42), (11, 43)])),
+            ("notes".to_string(), HashMap::from([(10, 44), (11, 45)])),
+        ]);
+        let manifest = HashMap::from([
+            (
+                0,
+                vec![PaneInfo {
+                    id: 44,
+                    is_held: true,
+                    ..Default::default()
+                }],
+            ),
+            (
+                1,
+                vec![
+                    make_pane(42, false, true),
+                    PaneInfo {
+                        id: 43,
+                        exited: true,
+                        ..Default::default()
+                    },
+                    PaneInfo {
+                        id: 45,
+                        is_plugin: true,
+                        ..Default::default()
+                    },
+                ],
+            ),
+        ]);
+        let positions = HashMap::from([(10, 0), (11, 1)]);
+        let (_, tabs) = manager.publication_snapshot(&make_context(&manifest, &positions));
+        for (&tab_id, items) in &tabs {
+            for item in items {
+                assert_eq!(item.state, ScratchpadDisplayState::Closed);
+                assert_eq!(item.tab_id, Some(tab_id));
+                assert_eq!(item.pane_id, None);
+                assert!(!item.is_focused);
+            }
+        }
+    }
+
+    #[test]
+    fn publication_uses_authoritative_tabs_even_when_empty_or_reordered() {
+        let mut manager =
+            ScratchpadManager::new(HashMap::from([("term".to_string(), make_config(None))]));
+        manager.panes = HashMap::from([("term".to_string(), HashMap::from([(10, 42)]))]);
+        let manifest = HashMap::from([(3, vec![make_pane(42, false, false)])]);
+        let positions = HashMap::from([(10, 3)]);
+        let (_, tabs) = manager.publication_snapshot(&make_context(&manifest, &positions));
+        assert_eq!(tabs[&10][0].tab_position, Some(3));
+        assert_eq!(tabs[&10][0].pane_id, Some(42));
+
+        let positions = HashMap::new();
+        let (_, tabs) = manager.publication_snapshot(&make_context(&manifest, &positions));
+        assert!(tabs.is_empty());
+
+        let manager = ScratchpadManager::new(HashMap::new());
+        let positions = HashMap::from([(12, 2)]);
+        let (_, tabs) = manager.publication_snapshot(&make_context(&manifest, &positions));
+        assert_eq!(tabs, BTreeMap::from([(12, Vec::new())]));
     }
 
     #[test]
