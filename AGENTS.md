@@ -50,10 +50,13 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 - `src/message.rs` - Parses payloads and validates plugin prefix/format
 - `src/focus.rs` - `focus-tab` target parsing (`position` and `id` forms)
 - `src/scratchpad/` - Scratchpad actions, config parsing, persistence/reconciliation
+- `src/pane_status.rs` - Ephemeral typed-pane statuses, validation, escaping, tab snapshots
+- `src/zjstatus.rs` - Scratchpad/pane-status output config and rendering
+- `src/zjstatus_runtime.rs` - Session-wide publication, receiver discovery, replay and retirement
 - `src/tree.rs` - Session tree snapshot serialization (tabs/panes/tab IDs)
 - `src/events.rs` - Subscription state machine and pane/tab event diffing
 - `src/config.rs` - WASI-safe env/config path resolution via `/host/proc/self/environ`
-- `cli/src/main.rs` - User CLI (`focus`, `scratchpad`, `subscribe`, `tree`) and heartbeat-driven stream client
+- `cli/src/main.rs` - User CLI (`focus`, `scratchpad`, `pane-status`, `subscribe`, `tree`) and heartbeat-driven stream client
 
 ### Key Features
 
@@ -81,6 +84,7 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 - `scratchpad::show::<name>`
 - `scratchpad::hide::<name>`
 - `scratchpad::close::<name>`
+- `pane-status::<typed_pane_id>::<text>` (empty text clears; preserve embedded `::`; pipe arg `format=plain|zjstatus`, default `plain`)
 - `subscribe` or `subscribe::full` (CLI pipes only)
 - `unsubscribe::<pipe_id>`
 - `tree` (CLI pipes only)
@@ -92,6 +96,17 @@ fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
 3. CLI writes one raw JSON init line to the same pipe stdin
 4. Plugin emits `InitAck` on success or `InitError` on failure
 5. Pane/tab streaming starts only after `InitAck`
+
+## Pane Status Notes
+
+- One status per typed `terminal_N`/`plugin_N`; replace/clear explicitly, prune on authoritative pane closure, lose on plugin/session restart. No persistence, focus clearing, expiry, or tree/event schema changes. Moves follow the actual pane/tab.
+- CLI `pane-status set <text> [--format plain|zjstatus]` and `clear` accept typed `--pane-id`, otherwise normalize originating `ZELLIJ_PANE_ID` (numeric means terminal). Cross-session `--session` requires an explicit ID when it differs from `ZELLIJ_SESSION_NAME` or that variable is unset.
+- CLI success is transport acceptance, not plugin validation acknowledgement. Plugin logs rejection; unknown panes/discovery-not-ready updates are not queued and need retry after discovery. Invalid updates preserve existing state.
+- Input limits: 4096 UTF-8 bytes, 64 formatted style markers. Reject controls/ANSI, bidi and unsafe invisible formatting characters. Plain `#[` becomes `# [`. A space is inserted after every opening `{` in plain/formatted status text and titles (e.g. `{command_x}` becomes `{ command_x}`); closing `}` and config template placeholders are unchanged. The pinned receiver's click handler searches original widget tokens in expanded output, so unchanged `{command_x}` input can shift configured command click hitboxes even without recursive rendering. Formatted styles allow only `fg`/`bg` (eight named colors, `bright_` variants, decimal 0..255, `#RRGGBB`), `bold`, `italic`, `underscore`, and empty resets.
+- `source "pane-status"` on `pipe`/`tab_pipe` opts in; default source remains `"scratchpad"`. Default item is `{status}`, output `{current_items}`/`{tab_items}`, separator `item_separator " "` (not `separator`). Include/exclude match canonical typed IDs exactly; terminals precede plugins, numeric order, scoped to actual tabs. Global pipe means all eligible active-tab statuses, not just focus.
+- Item placeholders: `{title}`, `{status}`, `{pane_id}`, `{tab_id}`, `{is_focused}`. Precedence: scoped focused override, scoped item format, item_format; scopes are current/tab. Counts are `{current_rendered_count}`/`{tab_rendered_count}`. No scratchpad lifecycle/MRU/global aggregation. No rendered items uses literal `empty_format` (default empty), hiding even output prefixes/counts.
+- Receiver MUST use dynamic mode even for plain statuses: producer adds isolation markup and restores trusted template style after interpolation. Producer item/output styles support explicit inheritance; resets are not equivalent inherited defaults in global/tab rendering. Receiver style-wrapper overrides are not guaranteed: recommend receiver format `{output}` and trusted colors in producer `item_format`. Global `{output}` avoids stale decoration; tab spacing wrappers hide on clear. No raw ANSI. Tab output preserves `::`; global replaces it with `: :` for the existing receiver limitation.
+- Pane-status globals and tabs publish empty clears and replay retired keys during publisher lifetime; scratchpad global empty-skip behavior is unchanged. Use one authoritative configured publisher: session-wide, last-writer-wins delivery, not multi-client aggregation or client-private output.
 
 ## Event Streaming Notes
 

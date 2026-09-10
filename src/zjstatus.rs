@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
+use crate::pane_status::PaneStatusSnapshot;
 use crate::scratchpad::{ScratchpadDisplayState, ScratchpadStatusItem, ScratchpadStatusSnapshot};
 
 const DEFAULT_FORMAT: &str = "{current_items}";
@@ -22,6 +23,13 @@ pub enum OutputKey {
     Tab(String),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutputSource {
+    #[default]
+    Scratchpad,
+    PaneStatus,
+}
+
 /// Integration settings finalized after all configuration layers are merged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZjstatusConfig {
@@ -31,6 +39,7 @@ pub struct ZjstatusConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct OutputConfigPatch {
+    source: Option<OutputSource>,
     enabled: Option<bool>,
     format: Option<String>,
     empty_format: Option<String>,
@@ -66,6 +75,7 @@ struct OutputConfigPatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputConfig {
     pub enabled: bool,
+    pub source: OutputSource,
     tab_scoped: bool,
     format: String,
     empty_format: String,
@@ -118,10 +128,11 @@ impl ZjstatusConfigLayers {
                 .outputs
                 .into_iter()
                 .map(|(key, patch)| {
+                    patch.validate_source()?;
                     let config = OutputConfig::from_patch(patch, matches!(key, OutputKey::Tab(_)));
-                    (key, config)
+                    Ok((key, config))
                 })
-                .collect(),
+                .collect::<Result<_, String>>()?,
         }))
     }
 }
@@ -136,8 +147,52 @@ impl ZjstatusConfigPatch {
 }
 
 impl OutputConfigPatch {
+    fn validate_source(&self) -> Result<(), String> {
+        if self.source != Some(OutputSource::PaneStatus) {
+            return Ok(());
+        }
+        for (key, value) in [
+            ("item_visible_format", &self.item_visible_format),
+            ("item_hidden_format", &self.item_hidden_format),
+            ("item_closed_format", &self.item_closed_format),
+            ("current_item_mru_format", &self.current_item_mru_format),
+            (
+                "current_item_visible_format",
+                &self.current_item_visible_format,
+            ),
+            (
+                "current_item_hidden_format",
+                &self.current_item_hidden_format,
+            ),
+            (
+                "current_item_closed_format",
+                &self.current_item_closed_format,
+            ),
+            ("tab_item_mru_format", &self.tab_item_mru_format),
+            ("tab_item_visible_format", &self.tab_item_visible_format),
+            ("tab_item_hidden_format", &self.tab_item_hidden_format),
+            ("tab_item_closed_format", &self.tab_item_closed_format),
+            ("global_item_format", &self.global_item_format),
+            (
+                "global_item_visible_format",
+                &self.global_item_visible_format,
+            ),
+            ("global_item_hidden_format", &self.global_item_hidden_format),
+            ("global_item_closed_format", &self.global_item_closed_format),
+            ("global_item_separator", &self.global_item_separator),
+        ] {
+            if value.is_some() {
+                return Err(format!(
+                    "'{key}' is only supported by source \"scratchpad\""
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn overlay(&mut self, other: Self) {
         overlay_option(&mut self.enabled, other.enabled);
+        overlay_option(&mut self.source, other.source);
         overlay_option(&mut self.tab_item_format, other.tab_item_format);
         overlay_option(
             &mut self.tab_item_focused_format,
@@ -210,8 +265,10 @@ impl OutputConfigPatch {
 
 impl OutputConfig {
     fn from_patch(patch: OutputConfigPatch, tab_scoped: bool) -> Self {
+        let source = patch.source.unwrap_or_default();
         Self {
             enabled: patch.enabled.unwrap_or(true),
+            source,
             tab_scoped,
             tab_item_format: patch.tab_item_format,
             tab_item_focused_format: patch.tab_item_focused_format,
@@ -229,9 +286,10 @@ impl OutputConfig {
                 .to_string()
             }),
             empty_format: patch.empty_format.unwrap_or_default(),
-            item_format: patch
-                .item_format
-                .unwrap_or_else(|| DEFAULT_ITEM_FORMAT.to_string()),
+            item_format: patch.item_format.unwrap_or_else(|| match source {
+                OutputSource::Scratchpad => DEFAULT_ITEM_FORMAT.to_string(),
+                OutputSource::PaneStatus => "{status}".to_string(),
+            }),
             item_visible_format: patch.item_visible_format,
             item_hidden_format: patch.item_hidden_format,
             item_closed_format: patch.item_closed_format,
@@ -452,6 +510,7 @@ fn parse_output_config(
 ) -> Result<OutputConfigPatch, String> {
     let mut seen = HashSet::new();
     let mut enabled = None;
+    let mut source = None;
     for node in doc.nodes() {
         let key = node.name().value();
         validate_node_entries(node)?;
@@ -467,6 +526,21 @@ fn parse_output_config(
                     .then(|| node.entries()[0].value().as_bool())
                     .flatten()
                     .ok_or_else(|| "enabled requires exactly one KDL boolean".to_string())?,
+            );
+            continue;
+        }
+        if key == "source" {
+            source = Some(
+                match (node.entries().len() == 1)
+                    .then(|| node.entries()[0].value().as_string())
+                    .flatten()
+                {
+                    Some("scratchpad") => OutputSource::Scratchpad,
+                    Some("pane-status") => OutputSource::PaneStatus,
+                    _ => {
+                        return Err("source requires \"scratchpad\" or \"pane-status\"".to_string())
+                    }
+                },
             );
             continue;
         }
@@ -549,6 +623,7 @@ fn parse_output_config(
         }
     }
     let patch = OutputConfigPatch {
+        source,
         enabled,
         tab_item_format: parse_string_child(doc, "tab_item_format"),
         tab_item_focused_format: parse_string_child(doc, "tab_item_focused_format"),
@@ -628,9 +703,152 @@ pub fn render(
     }
 }
 
+/// Render only statuses belonging to the selected tab (or the active tab for a pipe).
+pub fn render_pane_status(
+    config: &OutputConfig,
+    snapshot: &PaneStatusSnapshot,
+    tab_id: Option<usize>,
+) -> String {
+    let tab_id = if config.tab_scoped {
+        tab_id
+    } else {
+        snapshot.current_tab_id
+    };
+    let scope = if config.tab_scoped {
+        Scope::Tab
+    } else {
+        Scope::Current
+    };
+    let items = tab_id.and_then(|id| snapshot.tabs.get(&id));
+    let mut rendered = Vec::new();
+    for item in items.into_iter().flatten() {
+        let pane_id = item.pane_id.to_string();
+        if (!config.include.is_empty() && !config.include.contains(&pane_id))
+            || config.exclude.contains(&pane_id)
+        {
+            continue;
+        }
+        let scoped = if config.tab_scoped {
+            (
+                config.tab_item_focused_format.as_deref(),
+                config.tab_item_format.as_deref(),
+            )
+        } else {
+            (
+                config.current_item_focused_format.as_deref(),
+                config.current_item_format.as_deref(),
+            )
+        };
+        let template = scoped
+            .0
+            .filter(|_| item.is_focused)
+            .or(scoped.1)
+            .unwrap_or(&config.item_format);
+        let values = BTreeMap::from([
+            ("{status}".to_string(), item.status.clone()),
+            ("{title}".to_string(), item.title.clone()),
+            ("{pane_id}".to_string(), pane_id),
+            (
+                "{tab_id}".to_string(),
+                tab_id.map(|id| id.to_string()).unwrap_or_default(),
+            ),
+            ("{is_focused}".to_string(), item.is_focused.to_string()),
+        ]);
+        let value = substitute_pane_template(template, "#[]", |key, _| values.get(key).cloned());
+        if !value.is_empty() {
+            rendered.push((template, values));
+        }
+    }
+    let prefix = if config.tab_scoped { "tab" } else { "current" };
+    let items_key = format!("{{{prefix}_items}}");
+    let count_key = format!("{{{prefix}_rendered_count}}");
+    let value = if rendered.is_empty() {
+        substitute_pane_template(&config.empty_format, "#[]", |_, _| None)
+    } else {
+        substitute_pane_template(&config.format, "#[]", |key, style| {
+            if key == items_key {
+                Some(
+                    rendered
+                        .iter()
+                        .map(|(template, values)| {
+                            substitute_pane_template(template, style, |key, _| {
+                                values.get(key).cloned()
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(config.item_separator(scope)),
+                )
+            } else if key == count_key {
+                Some(rendered.len().to_string())
+            } else {
+                None
+            }
+        })
+    };
+    if config.tab_scoped {
+        sanitize_tab_payload(&value)
+    } else {
+        sanitize_pipe_payload(&value)
+    }
+}
+
+fn substitute_pane_template(
+    template: &str,
+    base_style: &str,
+    mut value: impl FnMut(&str, &str) -> Option<String>,
+) -> String {
+    if template.is_empty() {
+        return String::new();
+    }
+    // A leading marker preserves literal ']' in the global dynamic parser.
+    let mut output = String::from(base_style);
+    let mut remaining = template;
+    let mut style = base_style;
+    while let Some(start) = remaining.find('{') {
+        let literal = &remaining[..start];
+        output.push_str(literal);
+        if let Some(marker) = literal.rfind("#[") {
+            if let Some(end) = literal[marker..].find(']') {
+                style = &literal[marker..=marker + end];
+            }
+        }
+        remaining = &remaining[start..];
+        let Some(end) = remaining.find('}') else {
+            break;
+        };
+        let directive = &remaining[..=end];
+        if let Some(value) = value(directive, style) {
+            // Do not reparse inserted values as templates. Style boundaries also
+            // prevent adjacent literal text from forming an injected '#[' marker.
+            output.push_str(style);
+            output.push_str(&value);
+            output.push_str(style);
+        } else {
+            output.push_str(directive);
+        }
+        remaining = &remaining[end + 1..];
+    }
+    output.push_str(remaining);
+    output.push_str(base_style);
+    // Isolation markup alone must not count as a rendered item or prevent clears.
+    let mut text = output.as_str();
+    while let Some(marker) = text.strip_prefix("#[") {
+        let Some((_, rest)) = marker.split_once(']') else {
+            break;
+        };
+        text = rest;
+    }
+    if text.is_empty() {
+        String::new()
+    } else {
+        output
+    }
+}
+
 /// Global-pipe empty-output policy only. Tab outputs must always publish clears.
 pub fn should_publish_empty(config: &OutputConfig) -> bool {
-    !sanitize_pipe_payload(&config.empty_format).is_empty()
+    config.source == OutputSource::PaneStatus
+        || !sanitize_pipe_payload(&config.empty_format).is_empty()
 }
 
 pub fn zjstatus_payload(pipe: &str, rendered_output: &str) -> String {
@@ -967,6 +1185,521 @@ fn is_valid_pipe_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_config_wires_pane_status_producer_and_dynamic_receivers() {
+        let doc: kdl::KdlDocument = include_str!("../dev.kdl").parse().unwrap();
+        let plugins = doc.get("plugins").unwrap().children().unwrap();
+        let producer = plugins.get("zellij-tools").unwrap().children().unwrap();
+        let mut layers = ZjstatusConfigLayers::default();
+        layers.push(
+            parse_zjstatus_config_doc(producer.get("zjstatus").unwrap().children().unwrap())
+                .unwrap(),
+        );
+        let config = layers.into_config().unwrap().unwrap();
+        for key in [
+            OutputKey::Global("pane_status".into()),
+            OutputKey::Tab("pane_status".into()),
+        ] {
+            assert_eq!(config.outputs[&key].source, OutputSource::PaneStatus);
+        }
+        let receiver = plugins.get("zjstatus").unwrap().children().unwrap();
+        for key in [
+            "pipe_pane_status_rendermode",
+            "tab_pipe_pane_status_rendermode",
+        ] {
+            assert_eq!(
+                parse_string_child(receiver, key).as_deref(),
+                Some("dynamic")
+            );
+        }
+        assert_eq!(
+            parse_string_child(receiver, "pipe_pane_status_format").as_deref(),
+            Some("{output}")
+        );
+        assert!(parse_string_child(receiver, "format_right")
+            .unwrap()
+            .contains("{pipe_pane_status}"));
+        for key in [
+            "tab_active",
+            "tab_normal",
+            "tab_normal_bell",
+            "tab_normal_flashing_bell",
+        ] {
+            assert!(parse_string_child(receiver, key)
+                .unwrap()
+                .contains("{tab_pipe_pane_status}"));
+        }
+    }
+    use crate::pane_status::PaneStatuses;
+    use std::collections::HashMap;
+    use zellij_tile::prelude::{PaneId, PaneInfo, TabInfo};
+
+    fn pane_snapshot(
+        rows: &[(usize, &str, &str, bool, &str)],
+        formatted: bool,
+    ) -> PaneStatusSnapshot {
+        let mut manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
+        for &(position, id, title, is_focused, _) in rows {
+            let (id, is_plugin) = match id.parse::<PaneId>().unwrap() {
+                PaneId::Terminal(id) => (id, false),
+                PaneId::Plugin(id) => (id, true),
+            };
+            manifest.entry(position).or_default().push(PaneInfo {
+                id,
+                is_plugin,
+                title: title.into(),
+                is_focused,
+                ..Default::default()
+            });
+        }
+        let tabs: Vec<_> = (0..3)
+            .map(|position| TabInfo {
+                position,
+                tab_id: 42 + position,
+                active: position == 0,
+                ..Default::default()
+            })
+            .collect();
+        let mut statuses = PaneStatuses::default();
+        for &(_, id, _, _, text) in rows {
+            statuses
+                .set(
+                    &[id, text],
+                    Some(if formatted { "zjstatus" } else { "plain" }),
+                    &manifest,
+                )
+                .unwrap();
+        }
+        statuses.snapshot(&manifest, &tabs)
+    }
+
+    // Match the receiver's split-on-marker, then first-closing-bracket parser.
+    // Each marker specifies a fresh style, not a delta on the previous marker.
+    fn pane_fragments(output: &str) -> Vec<(&str, &str)> {
+        output
+            .split("#[")
+            .filter(|part| !part.is_empty())
+            .map(|part| part.split_once(']').unwrap_or(("", part)))
+            .collect()
+    }
+
+    fn pane_visible(output: &str) -> String {
+        pane_fragments(output)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect()
+    }
+
+    fn assert_pane_style(output: &str, token: &str, expected: &str) {
+        let chars: Vec<_> = pane_fragments(output)
+            .into_iter()
+            .flat_map(|(style, text)| text.chars().map(move |ch| (style, ch)))
+            .collect();
+        let visible: String = chars.iter().map(|(_, ch)| ch).collect();
+        let start = visible
+            .find(token)
+            .unwrap_or_else(|| panic!("missing {token:?} in {output:?}"));
+        let start = visible[..start].chars().count();
+        assert!(
+            chars[start..start + token.chars().count()]
+                .iter()
+                .all(|(style, _)| *style == expected),
+            "wrong style for {token:?}, expected {expected:?}: {output:?}"
+        );
+    }
+
+    #[test]
+    fn pane_source_defaults_and_invalid_source_options() {
+        for (kind, scope) in [("pipe", "current"), ("tab_pipe", "tab")] {
+            for (source, expected, item_format) in [
+                ("", OutputSource::Scratchpad, DEFAULT_ITEM_FORMAT),
+                (
+                    "source \"scratchpad\";",
+                    OutputSource::Scratchpad,
+                    DEFAULT_ITEM_FORMAT,
+                ),
+                (
+                    "source \"pane-status\";",
+                    OutputSource::PaneStatus,
+                    "{status}",
+                ),
+            ] {
+                let output = config(&format!("{kind} \"x\" {{ {source} }}"));
+                assert_eq!(output.source, expected);
+                assert_eq!(output.item_format, item_format);
+                assert_eq!(output.format, format!("{{{scope}_items}}"));
+                assert_eq!(output.item_separator, " ");
+                assert_eq!(output.empty_format, "");
+                assert!(output.enabled);
+            }
+            for source in [
+                "source;",
+                "source 1;",
+                "source true;",
+                "source null;",
+                "source \"unknown\";",
+                "source \"pane-status\" \"scratchpad\";",
+                "source \"pane-status\"; source \"pane-status\";",
+            ] {
+                let error =
+                    parse_zjstatus_config_kdl(&format!("{kind} \"x\" {{ {source} }}")).unwrap_err();
+                assert!(error.contains("source"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn pane_source_layer_changes_finalize_defaults_but_keep_explicit_formats() {
+        for kind in ["pipe", "tab_pipe"] {
+            for (initial, external, expected, default_item) in [
+                (
+                    "scratchpad",
+                    "pane-status",
+                    OutputSource::PaneStatus,
+                    "{status}",
+                ),
+                (
+                    "pane-status",
+                    "scratchpad",
+                    OutputSource::Scratchpad,
+                    DEFAULT_ITEM_FORMAT,
+                ),
+            ] {
+                for explicit in ["", "format \"explicit\"; item_format \"custom\";"] {
+                    let mut layers = ZjstatusConfigLayers::default();
+                    for body in [
+                        format!("source {initial:?}; {explicit}"),
+                        format!("source {external:?};"),
+                        "enabled false;".into(),
+                    ] {
+                        layers.push(
+                            parse_zjstatus_config_kdl(&format!("{kind} \"x\" {{ {body} }}"))
+                                .unwrap(),
+                        );
+                    }
+                    let output = layers
+                        .into_config()
+                        .unwrap()
+                        .unwrap()
+                        .outputs
+                        .into_values()
+                        .next()
+                        .unwrap();
+                    assert_eq!(output.source, expected);
+                    assert!(!output.enabled);
+                    assert_eq!(
+                        output.item_format,
+                        if explicit.is_empty() {
+                            default_item
+                        } else {
+                            "custom"
+                        }
+                    );
+                    assert_eq!(
+                        output.format,
+                        if !explicit.is_empty() {
+                            "explicit"
+                        } else if kind == "pipe" {
+                            "{current_items}"
+                        } else {
+                            "{tab_items}"
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pane_source_rejects_scratchpad_options_only_after_layering() {
+        for (kind, scope) in [("pipe", "current"), ("tab_pipe", "tab")] {
+            let options = [
+                "item_visible_format",
+                "item_hidden_format",
+                "item_closed_format",
+                "global_item_format",
+                "global_item_visible_format",
+                "global_item_hidden_format",
+                "global_item_closed_format",
+                "global_item_separator",
+            ];
+            for option in options.into_iter().map(String::from).chain(
+                ["mru", "visible", "hidden", "closed"]
+                    .map(|state| format!("{scope}_item_{state}_format")),
+            ) {
+                let mut layers = ZjstatusConfigLayers::default();
+                layers.push(
+                    parse_zjstatus_config_kdl(&format!(
+                        "{kind} \"x\" {{ source \"pane-status\"; {option} \"\"; }}"
+                    ))
+                    .unwrap(),
+                );
+                let error = layers.clone().into_config().unwrap_err();
+                assert!(
+                    error.contains(&option) && error.contains("scratchpad"),
+                    "{error}"
+                );
+                layers.push(
+                    parse_zjstatus_config_kdl(&format!(
+                        "{kind} \"x\" {{ source \"scratchpad\"; }}"
+                    ))
+                    .unwrap(),
+                );
+                assert!(layers.clone().into_config().is_ok());
+                layers.push(
+                    parse_zjstatus_config_kdl(&format!(
+                        "{kind} \"x\" {{ source \"pane-status\"; }}"
+                    ))
+                    .unwrap(),
+                );
+                assert!(layers.into_config().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn pane_scopes_filters_and_snapshot_order_are_preserved() {
+        let snapshot = pane_snapshot(
+            &[
+                (0, "plugin_10", "", false, "p10"),
+                (0, "terminal_10", "", false, "t10"),
+                (0, "plugin_2", "", false, "p2"),
+                (0, "terminal_2", "", true, "t2"),
+                (1, "terminal_7", "", true, "other"),
+            ],
+            false,
+        );
+        for (kind, scope) in [("pipe", "current"), ("tab_pipe", "tab")] {
+            let mut output = config(&format!(
+                r#"{kind} "x" {{ source "pane-status";
+                format "{{{scope}_rendered_count}}:{{{scope}_items}}";
+                item_format "{{pane_id}}/{{tab_id}}/{{is_focused}}"; item_separator "|"; }}"#
+            ));
+            assert_eq!(
+                pane_visible(&render_pane_status(&output, &snapshot, Some(42))),
+                "4:terminal_2/42/true|terminal_10/42/false|plugin_2/42/false|plugin_10/42/false"
+            );
+            for (include, exclude, expected) in [
+                (
+                    vec!["plugin_10", "terminal_2", "plugin_2"],
+                    vec!["plugin_2"],
+                    "2:terminal_2/42/true|plugin_10/42/false",
+                ),
+                (vec!["2", "terminal_02", "terminal_*"], vec![], ""),
+                (
+                    vec![],
+                    vec!["terminal_2", "terminal_10"],
+                    "2:plugin_2/42/false|plugin_10/42/false",
+                ),
+            ] {
+                output.include = include.into_iter().map(String::from).collect();
+                output.exclude = exclude.into_iter().map(String::from).collect();
+                assert_eq!(
+                    pane_visible(&render_pane_status(&output, &snapshot, Some(42))),
+                    expected
+                );
+            }
+        }
+        let tab = config(r#"tab_pipe "x" { source "pane-status"; }"#);
+        let global = config(r#"pipe "x" { source "pane-status"; }"#);
+        assert_eq!(
+            pane_visible(&render_pane_status(&tab, &snapshot, Some(43))),
+            "other"
+        );
+        for id in [None, Some(44), Some(999)] {
+            assert_eq!(render_pane_status(&tab, &snapshot, id), "");
+            assert_eq!(
+                pane_visible(&render_pane_status(&global, &snapshot, id)),
+                "t2 t10 p2 p10"
+            );
+        }
+        let mut no_active = snapshot;
+        no_active.current_tab_id = None;
+        assert_eq!(render_pane_status(&global, &no_active, Some(43)), "");
+        assert_eq!(
+            pane_visible(&render_pane_status(&tab, &no_active, Some(43))),
+            "other"
+        );
+    }
+
+    #[test]
+    fn pane_focused_precedence_and_counts_skip_hidden_items() {
+        let snapshot = pane_snapshot(
+            &[
+                (0, "terminal_2", "", true, "focused"),
+                (0, "plugin_2", "", false, "unfocused"),
+            ],
+            false,
+        );
+        for (kind, scope) in [("pipe", "current"), ("tab_pipe", "tab")] {
+            for (overrides, expected) in [
+                (String::new(), "2:base|base"),
+                (
+                    format!("{scope}_item_format \"scoped\";"),
+                    "2:scoped|scoped",
+                ),
+                (
+                    format!(
+                        "{scope}_item_format \"scoped\"; {scope}_item_focused_format \"focus\";"
+                    ),
+                    "2:focus|scoped",
+                ),
+                (
+                    format!("{scope}_item_format \"scoped\"; {scope}_item_focused_format \"\";"),
+                    "1:scoped",
+                ),
+                (
+                    format!("{scope}_item_format \"\"; {scope}_item_focused_format \"focus\";"),
+                    "1:focus",
+                ),
+            ] {
+                let output = config(&format!(
+                    r#"{kind} "x" {{ source "pane-status";
+                    format "{{{scope}_rendered_count}}:{{{scope}_items}}"; item_format "base";
+                    item_separator "wrong"; {scope}_item_separator "|"; {overrides} }}"#
+                ));
+                assert_eq!(
+                    pane_visible(&render_pane_status(&output, &snapshot, Some(42))),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pane_empty_title_and_style_only_status_hide_prefixes_and_counts() {
+        for (kind, scope) in [("pipe", "current"), ("tab_pipe", "tab")] {
+            for (item_format, status) in
+                [("{title}", "present"), ("{status}", "#[fg=red]#[bold]#[]")]
+            {
+                let snapshot = pane_snapshot(&[(0, "terminal_2", "", false, status)], true);
+                for format in [
+                    format!("prefix{{{scope}_items}}/{{{scope}_rendered_count}}"),
+                    format!("{{{scope}_rendered_count}}"),
+                ] {
+                    let mut output = config(&format!(
+                        r#"{kind} "x" {{ source "pane-status";
+                        item_format "{item_format}"; format "{format}"; }}"#
+                    ));
+                    assert_eq!(render_pane_status(&output, &snapshot, Some(42)), "");
+                    output.empty_format = format!("none {{{scope}_rendered_count}}]");
+                    assert_eq!(
+                        pane_visible(&render_pane_status(&output, &snapshot, Some(42))),
+                        output.empty_format
+                    );
+                }
+            }
+            let snapshot = pane_snapshot(
+                &[
+                    (0, "terminal_2", "", false, "#[bold]"),
+                    (0, "plugin_2", "", false, "visible"),
+                ],
+                true,
+            );
+            let output = config(&format!(
+                r#"{kind} "x" {{ source "pane-status"; format "{{{scope}_rendered_count}}:{{{scope}_items}}"; }}"#
+            ));
+            assert_eq!(
+                pane_visible(&render_pane_status(&output, &snapshot, Some(42))),
+                "1:visible"
+            );
+        }
+    }
+
+    #[test]
+    fn pane_items_inherit_each_output_style_and_restore_trusted_suffixes() {
+        for (kind, scope) in [("pipe", "current"), ("tab_pipe", "tab")] {
+            for (item_style, expected_item_style) in [
+                ("", "fg=green,bold"),
+                ("#[bg=blue]", "bg=blue"),
+                ("#[]", ""),
+            ] {
+                let snapshot = pane_snapshot(
+                    &[(0, "terminal_2", "TITLE", false, "plain#[fg=red]ALERT")],
+                    true,
+                );
+                let output = config(&format!(
+                    r##"{kind} "x" {{ source "pane-status";
+                    format "#[fg=green,bold]LEFT{{{scope}_items}}RIGHT#[fg=cyan]SECOND{{{scope}_items}}END";
+                    item_format "{item_style}BEFORE{{title}}#[italic]MIDDLE{{status}}AFTER"; }}"##
+                ));
+                let rendered = render_pane_status(&output, &snapshot, Some(42));
+                assert_eq!(pane_visible(&rendered), "LEFTBEFORETITLEMIDDLEplainALERTAFTERRIGHTSECONDBEFORETITLEMIDDLEplainALERTAFTEREND");
+                let (first, second) = rendered.split_once("SECOND").unwrap();
+                for (part, base) in [
+                    (first, expected_item_style),
+                    (
+                        second,
+                        if item_style.is_empty() {
+                            "fg=cyan"
+                        } else {
+                            expected_item_style
+                        },
+                    ),
+                ] {
+                    for token in ["BEFORE", "TITLE"] {
+                        assert_pane_style(part, token, base);
+                    }
+                    for token in ["MIDDLE", "AFTER"] {
+                        assert_pane_style(part, token, "italic");
+                    }
+                    assert_pane_style(part, "plain", "");
+                    assert_pane_style(part, "ALERT", "fg=red");
+                }
+                assert_pane_style(&rendered, "LEFT", "fg=green,bold");
+                assert_pane_style(&rendered, "RIGHT", "fg=green,bold");
+                assert_pane_style(&rendered, "SECOND", "fg=cyan");
+                assert_pane_style(&rendered, "END", "fg=cyan");
+            }
+        }
+    }
+
+    #[test]
+    fn pane_safe_values_are_nonrecursive_preserve_brackets_and_neutralize_click_tokens() {
+        let raw = substitute_pane_template("{title}", "#[]", |key, _| match key {
+            "{title}" => Some("{status}".into()),
+            "{status}" => panic!("inserted values must not be expanded"),
+            _ => None,
+        });
+        assert_eq!(pane_visible(&raw), "{status}");
+        let snapshot = pane_snapshot(
+            &[(
+                0,
+                "terminal_2",
+                "#[fg=red]{status}{command_bad}]",
+                false,
+                "{title}::{current_items}]",
+            )],
+            false,
+        );
+        for (kind, scope, separator) in [("pipe", "current", ": :"), ("tab_pipe", "tab", "::")] {
+            let output = config(&format!(
+                r##"{kind} "x" {{ source "pane-status";
+                format "]{{{scope}_items}}]{{unknown}}"; item_format "#[fg=green]{{title}}/{{status}}]"; }}"##
+            ));
+            let rendered = render_pane_status(&output, &snapshot, Some(42));
+            assert_eq!(pane_visible(&rendered), format!("]# [fg=red]{{ status}}{{ command_bad}}]/{{ title}}{separator}{{ current_items}}]]]{{unknown}}"));
+            assert_pane_style(&rendered, "# [fg=red]{ status}{ command_bad}]", "fg=green");
+            assert_pane_style(&rendered, "{ title}", "fg=green");
+            assert!(!rendered.contains("{command_bad}"));
+        }
+    }
+
+    #[test]
+    fn pane_substitution_boundaries_cannot_create_style_markers() {
+        let snapshot = pane_snapshot(&[(0, "terminal_2", "#", false, "[fg=red]TEXT]")], false);
+        for (kind, scope) in [("pipe", "current"), ("tab_pipe", "tab")] {
+            let output = config(&format!(
+                r##"{kind} "x" {{ source "pane-status";
+                format "#[fg=green]{{{scope}_items}}"; item_format "{{title}}{{status}}"; }}"##
+            ));
+            let rendered = render_pane_status(&output, &snapshot, Some(42));
+            assert_eq!(pane_visible(&rendered), "#[fg=red]TEXT]");
+            assert!(!rendered.contains("#[fg=red]"));
+            assert_pane_style(&rendered, "#[fg=red]TEXT]", "fg=green");
+        }
+    }
 
     fn integration(input: &str) -> ZjstatusConfig {
         let mut layers = ZjstatusConfigLayers::default();

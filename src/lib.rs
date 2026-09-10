@@ -2,6 +2,7 @@ pub mod config;
 pub mod events;
 pub mod focus;
 pub mod message;
+pub mod pane_status;
 pub mod scratchpad;
 pub mod tree;
 pub mod zjstatus;

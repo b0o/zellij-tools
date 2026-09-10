@@ -56,6 +56,9 @@ pub fn parse_message(payload: &str) -> Result<Message<'_>, ParseError> {
 
     let args: Vec<&str> = if args_str.is_empty() {
         Vec::new()
+    } else if event == "pane-status" {
+        // A status is free-form text, including any further protocol separators.
+        args_str.splitn(2, "::").collect()
     } else {
         args_str.split("::").collect()
     };
@@ -80,6 +83,16 @@ pub fn parse_tree_tab_filter(args: &[&str]) -> Result<TreeTabFilter, ParseError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_status_preserves_text_and_empty_clear() {
+        let msg = parse_message("zellij-tools::pane-status::terminal_2::a::b::").unwrap();
+        assert_eq!(msg.args, ["terminal_2", "a::b::"]);
+        let msg = parse_message("zellij-tools::pane-status::plugin_2::").unwrap();
+        assert_eq!(msg.args, ["plugin_2", ""]);
+        let msg = parse_message("zellij-tools::pane-status::terminal_2").unwrap();
+        assert_eq!(msg.args, ["terminal_2"]);
+    }
 
     #[test]
     fn parse_message_with_no_args() {

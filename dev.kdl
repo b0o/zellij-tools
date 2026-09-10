@@ -237,8 +237,22 @@ plugins {
         item_hidden_format "#[fg=gray]{title}-"
         item_closed_format ""
       }
-      // Empty tab output clears its field, unlike empty global output (skip).
+      // Scratchpad tab empties clear; scratchpad global empties skip publication.
       // Retired tab keys replay clears even if all outputs are disabled.
+
+      // All active-tab pane statuses in the main bar; both status outputs clear on empty.
+      pipe "pane_status" {
+        source "pane-status"
+        format "{current_items} "
+        item_format "#[fg=#f9e2af]{title}: {status}"
+        item_separator " | "
+      }
+      // Each tab label shows only that tab's statuses, including inactive tabs.
+      tab_pipe "pane_status" {
+        source "pane-status"
+        item_format "#[fg=#f9e2af]{status}"
+        item_separator " / "
+      }
     }
   }
   // nix run .#dev copies the source-built fork artifact here from the Nix store.
@@ -249,10 +263,15 @@ plugins {
     tab_pipe_scratchpads_rendermode "static"
     tab_pipe_monitor_format " {output}"
     tab_pipe_monitor_rendermode "dynamic"
+    // Pane statuses require dynamic mode even for plain CLI messages.
+    pipe_pane_status_format "{output}"
+    pipe_pane_status_rendermode "dynamic"
+    tab_pipe_pane_status_format " [{output}]"
+    tab_pipe_pane_status_rendermode "dynamic"
     datetime "#[fg=#888888,bold] {format} "
     datetime_format "%H:%M:%S"
     format_left "{mode} {tabs}"
-    format_right "{pipe_scratchpads} {datetime}#[bg=#444444,fg=#ffffff,bold] {session} "
+    format_right "{pipe_pane_status}{pipe_scratchpads} {datetime}#[bg=#444444,fg=#ffffff,bold] {session} "
     format_space ""
     hide_frame_for_single_pane "false"
     mode_locked "#[bg=#444444,fg=#ffffff,bold] LOCKED "
@@ -264,13 +283,13 @@ plugins {
     mode_entersearch "#[bg=blue,fg=#222222,bold] ENTERSEARCH "
     mode_renametab "#[bg=red,fg=#222222,bold] RENAMETAB "
     mode_session "#[bg=cyan,fg=#222222,bold] SESSION "
-    tab_active "#[bg=#555555,fg=#ffffff,bold] {index} {name}{tab_pipe_scratchpads}{tab_pipe_monitor} "
-    tab_normal "#[fg=#888888,bold] {index} {name}{tab_pipe_scratchpads}{tab_pipe_monitor} {bell_indicator}"
+    tab_active "#[bg=#555555,fg=#ffffff,bold] {index} {name}{tab_pipe_scratchpads}{tab_pipe_monitor}{tab_pipe_pane_status} "
+    tab_normal "#[fg=#888888,bold] {index} {name}{tab_pipe_scratchpads}{tab_pipe_monitor}{tab_pipe_pane_status} {bell_indicator}"
     tab_separator " "
     tab_bell_indicator "!"
     tab_flashing_bell_indicator "!!"
-    tab_normal_bell "#[fg=#f38ba8,bg=$bg,bold] {index} {name}{tab_pipe_scratchpads}{tab_pipe_monitor} {bell_indicator} "
-    tab_normal_flashing_bell "#[fg=$bg,bg=#f38ba8,bold] {index} {name}{tab_pipe_scratchpads}{tab_pipe_monitor} {bell_indicator} "
+    tab_normal_bell "#[fg=#f38ba8,bg=$bg,bold] {index} {name}{tab_pipe_scratchpads}{tab_pipe_monitor}{tab_pipe_pane_status} {bell_indicator} "
+    tab_normal_flashing_bell "#[fg=$bg,bg=#f38ba8,bold] {index} {name}{tab_pipe_scratchpads}{tab_pipe_monitor}{tab_pipe_pane_status} {bell_indicator} "
   }
 }
 

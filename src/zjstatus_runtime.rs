@@ -12,9 +12,11 @@ use std::time::Duration;
 
 use zellij_tile::prelude::PaneInfo;
 
+use crate::pane_status::PaneStatusSnapshot;
 use crate::scratchpad::{ScratchpadStatusItem, ScratchpadStatusSnapshot};
 use crate::zjstatus::{
-    render, should_publish_empty, zjstatus_payload, zjstatus_tab_payload, OutputKey, ZjstatusConfig,
+    render, render_pane_status, should_publish_empty, zjstatus_payload, zjstatus_tab_payload,
+    OutputKey, OutputSource, ZjstatusConfig,
 };
 
 /// Update receiver discovery state. A changed set needs an immediate full
@@ -62,10 +64,12 @@ impl PublishedKey {
 /// Removed tab fields remain retired for this producer's lifetime while their tab
 /// stays live. History is bounded to owned fields on live IDs, not closed tabs;
 /// repeated field renames on a long-lived tab can still grow that history. Restart
-/// loses ownership history. Global removal deliberately does not attempt a clear.
+/// loses ownership history. Pane-status global clears survive for the producer's
+/// lifetime; scratchpad global removal deliberately does not attempt a clear.
 #[derive(Debug, Default)]
 pub struct Publisher {
     published: BTreeMap<PublishedKey, String>,
+    pane_status_globals: BTreeSet<PublishedKey>,
     retired: BTreeSet<PublishedKey>,
 }
 
@@ -79,10 +83,12 @@ impl Publisher {
         config: Option<&ZjstatusConfig>,
         snapshot: &ScratchpadStatusSnapshot,
         tab_items: &BTreeMap<usize, Vec<ScratchpadStatusItem>>,
+        pane_statuses: &PaneStatusSnapshot,
         force: bool,
     ) -> Vec<String> {
         let mut desired = BTreeMap::new();
         let mut skipped = BTreeSet::new();
+        let mut pane_status_globals = BTreeSet::new();
         if let Some(config) = config {
             for (key, output) in &config.outputs {
                 if !output.enabled {
@@ -91,8 +97,18 @@ impl Publisher {
                 match key {
                     OutputKey::Global(name) => {
                         let key = PublishedKey::Global(name.clone());
-                        let value = render(output, snapshot, None);
+                        let value = match output.source {
+                            OutputSource::Scratchpad => render(output, snapshot, None),
+                            OutputSource::PaneStatus => {
+                                pane_status_globals.insert(key.clone());
+                                render_pane_status(output, pane_statuses, None)
+                            }
+                        };
                         if value.is_empty() && !should_publish_empty(output) {
+                            // Retire the old status instead of retaining it across a source switch.
+                            if self.pane_status_globals.contains(&key) {
+                                continue;
+                            }
                             // A skipped global empty must not forget the last submission.
                             if let Some(previous) = self.published.get(&key) {
                                 skipped.insert(key.clone());
@@ -106,7 +122,14 @@ impl Publisher {
                         for (&id, items) in tab_items {
                             desired.insert(
                                 PublishedKey::Tab(id, field.clone()),
-                                render(output, snapshot, Some(items)),
+                                match output.source {
+                                    OutputSource::Scratchpad => {
+                                        render(output, snapshot, Some(items))
+                                    }
+                                    OutputSource::PaneStatus => {
+                                        render_pane_status(output, pane_statuses, Some(id))
+                                    }
+                                },
                             );
                         }
                     }
@@ -116,18 +139,19 @@ impl Publisher {
 
         let mut commands = Vec::new();
         self.retired.retain(|key| {
-            matches!(key, PublishedKey::Tab(id, _) if tab_items.contains_key(id))
-                && !desired.contains_key(key)
+            let live = match key {
+                PublishedKey::Global(_) => true,
+                PublishedKey::Tab(id, _) => tab_items.contains_key(id),
+            };
+            live && !desired.contains_key(key)
         });
         for key in self.published.keys() {
-            if let PublishedKey::Tab(id, _) = key {
-                if tab_items.contains_key(id)
-                    && !desired.contains_key(key)
-                    && self.retired.insert(key.clone())
-                    && !force
-                {
-                    commands.push(key.command(""));
-                }
+            let clear = match key {
+                PublishedKey::Global(_) => self.pane_status_globals.contains(key),
+                PublishedKey::Tab(id, _) => tab_items.contains_key(id),
+            };
+            if clear && !desired.contains_key(key) && self.retired.insert(key.clone()) && !force {
+                commands.push(key.command(""));
             }
         }
         if force {
@@ -140,13 +164,15 @@ impl Publisher {
             }
         }
         self.published = desired;
+        self.pane_status_globals = pane_status_globals;
         commands
     }
 
     /// Retired clears need periodic replay even when every output is disabled.
     /// This is the exception to "no active outputs means no replay work". Main
     /// should retain the previous refresh interval (or use 2000 ms if absent) until
-    /// these tabs close, then disable replay when no enabled outputs remain.
+    /// these tabs close (global clears persist), then disable replay when no
+    /// enabled outputs remain.
     pub fn has_retired(&self) -> bool {
         !self.retired.is_empty()
     }
@@ -281,8 +307,10 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pane_status::{PaneStatusItem, PaneStatuses};
     use crate::scratchpad::ScratchpadDisplayState;
     use crate::zjstatus::{parse_zjstatus_config_kdl, ZjstatusConfigLayers};
+    use zellij_tile::prelude::{PaneId, TabInfo};
 
     fn config(input: &str) -> ZjstatusConfig {
         let mut layers = ZjstatusConfigLayers::default();
@@ -316,6 +344,327 @@ mod tests {
         }
     }
 
+    fn pane_statuses() -> PaneStatusSnapshot {
+        PaneStatusSnapshot {
+            current_tab_id: Some(42),
+            tabs: BTreeMap::from([
+                (
+                    42,
+                    vec![
+                        PaneStatusItem {
+                            pane_id: PaneId::Terminal(7),
+                            title: "build".into(),
+                            status: "building".into(),
+                            is_focused: true,
+                        },
+                        PaneStatusItem {
+                            pane_id: PaneId::Plugin(8),
+                            title: "tests".into(),
+                            status: "testing".into(),
+                            is_focused: false,
+                        },
+                    ],
+                ),
+                (57, vec![]),
+            ]),
+        }
+    }
+
+    #[test]
+    fn pane_status_and_scratchpad_outputs_coexist_and_replay_for_new_receivers() {
+        let config = config(
+            "pipe \"scratch\" { format \"global\"; }\n\
+             pipe \"status\" { source \"pane-status\"; }\n\
+             tab_pipe \"scratch\" { item_format \"{state}\"; }\n\
+             tab_pipe \"status\" { source \"pane-status\"; }",
+        );
+        let snapshot = ScratchpadStatusSnapshot::default();
+        let tabs = BTreeMap::from([
+            (42, vec![item(42, ScratchpadDisplayState::Visible)]),
+            (57, vec![]),
+            (99, vec![]),
+        ]);
+        let mut statuses = pane_statuses();
+        // Status snapshots do not define the live tab set.
+        statuses.tabs.insert(123, statuses.tabs[&42].clone());
+        let global = render_pane_status(
+            &config.outputs[&OutputKey::Global("status".into())],
+            &statuses,
+            None,
+        );
+        let tab = render_pane_status(
+            &config.outputs[&OutputKey::Tab("status".into())],
+            &statuses,
+            Some(42),
+        );
+        assert!(global.contains("building") && global.contains("testing"));
+        assert!(tab.contains("building") && tab.contains("testing"));
+        let expected = vec![
+            "zjstatus::pipe::pipe_scratch::global".into(),
+            zjstatus_payload("status", &global),
+            "zjstatus::tab_pipe::42::scratch::visible".into(),
+            zjstatus_tab_payload(42, "status", &tab),
+            "zjstatus::tab_pipe::57::scratch::".into(),
+            "zjstatus::tab_pipe::57::status::".into(),
+            "zjstatus::tab_pipe::99::scratch::".into(),
+            "zjstatus::tab_pipe::99::status::".into(),
+        ];
+        let mut publisher = Publisher::default();
+        assert_eq!(
+            publisher.commands(Some(&config), &snapshot, &tabs, &statuses, false),
+            expected
+        );
+        assert!(publisher
+            .commands(Some(&config), &snapshot, &tabs, &statuses, false)
+            .is_empty());
+        let mut receivers = HashSet::new();
+        let mut manifest = HashMap::from([(0, vec![receiver(1)])]);
+        for position in [0, 1] {
+            manifest.insert(position, vec![receiver(position as u32 + 1)]);
+            let changed = update_zjstatus_plugin_panes(&mut receivers, &manifest);
+            assert!(changed);
+            assert_eq!(
+                publisher.commands(Some(&config), &snapshot, &tabs, &statuses, changed),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn active_tab_switches_clear_global_status_even_without_active_tab() {
+        let config = config("pipe \"status\" { source \"pane-status\"; }");
+        let snapshot = ScratchpadStatusSnapshot::default();
+        let tabs = BTreeMap::from([(42, vec![]), (57, vec![])]);
+        let mut statuses = pane_statuses();
+        let mut publisher = Publisher::default();
+        let initial = publisher.commands(Some(&config), &snapshot, &tabs, &statuses, false);
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].contains("building"));
+        for active in [Some(57), None] {
+            statuses.current_tab_id = active;
+            assert_eq!(
+                publisher.commands(Some(&config), &snapshot, &tabs, &statuses, false),
+                ["zjstatus::pipe::pipe_status::"]
+            );
+            assert!(publisher
+                .commands(Some(&config), &snapshot, &tabs, &statuses, false)
+                .is_empty());
+            assert_eq!(
+                publisher.commands(Some(&config), &snapshot, &tabs, &statuses, true),
+                ["zjstatus::pipe::pipe_status::"]
+            );
+            statuses.current_tab_id = Some(42);
+            assert_eq!(
+                publisher.commands(Some(&config), &snapshot, &tabs, &statuses, false),
+                initial
+            );
+        }
+    }
+
+    #[test]
+    fn moving_and_clearing_pane_status_updates_old_and_new_native_tabs() {
+        let config = config("tab_pipe \"status\" { source \"pane-status\"; }");
+        let snapshot = ScratchpadStatusSnapshot::default();
+        let tabs = BTreeMap::from([(42, vec![]), (57, vec![])]);
+        let tab_info = [
+            TabInfo {
+                tab_id: 42,
+                position: 0,
+                active: true,
+                ..Default::default()
+            },
+            TabInfo {
+                tab_id: 57,
+                position: 1,
+                ..Default::default()
+            },
+        ];
+        let mut manifest = HashMap::from([(
+            0,
+            vec![PaneInfo {
+                id: 7,
+                ..Default::default()
+            }],
+        )]);
+        let mut statuses = PaneStatuses::default();
+        statuses
+            .set(&["terminal_7", "building"], None, &manifest)
+            .unwrap();
+        let mut publisher = Publisher::default();
+        publisher.commands(
+            Some(&config),
+            &snapshot,
+            &tabs,
+            &statuses.snapshot(&manifest, &tab_info),
+            false,
+        );
+        let moved = manifest.remove(&0).unwrap();
+        manifest.insert(1, moved);
+        statuses.reconcile(&manifest);
+        let moved = statuses.snapshot(&manifest, &tab_info);
+        let rendered = render_pane_status(
+            &config.outputs[&OutputKey::Tab("status".into())],
+            &moved,
+            Some(57),
+        );
+        assert!(rendered.contains("building"));
+        assert_eq!(
+            publisher.commands(Some(&config), &snapshot, &tabs, &moved, false),
+            [
+                "zjstatus::tab_pipe::42::status::".to_string(),
+                zjstatus_tab_payload(57, "status", &rendered),
+            ]
+        );
+        statuses.set(&["terminal_7", ""], None, &manifest).unwrap();
+        assert_eq!(
+            publisher.commands(
+                Some(&config),
+                &snapshot,
+                &tabs,
+                &statuses.snapshot(&manifest, &tab_info),
+                false
+            ),
+            ["zjstatus::tab_pipe::57::status::"]
+        );
+    }
+
+    #[test]
+    fn pane_status_global_removal_disable_and_rename_retire_with_lifetime_replay() {
+        let original = config("pipe \"old\" { source \"pane-status\"; }");
+        let snapshot = ScratchpadStatusSnapshot::default();
+        let statuses = pane_statuses();
+        let tabs = BTreeMap::from([(42, vec![])]);
+        for replacement in [
+            None,
+            Some(config(
+                "pipe \"old\" { source \"pane-status\"; enabled false; }",
+            )),
+            Some(config("pipe \"new\" { source \"pane-status\"; }")),
+        ] {
+            for force in [false, true] {
+                let mut publisher = Publisher::default();
+                let initial =
+                    publisher.commands(Some(&original), &snapshot, &tabs, &statuses, false);
+                let removed =
+                    publisher.commands(replacement.as_ref(), &snapshot, &tabs, &statuses, force);
+                assert_eq!(
+                    removed
+                        .iter()
+                        .filter(|command| *command == "zjstatus::pipe::pipe_old::")
+                        .count(),
+                    1
+                );
+                assert!(publisher.has_retired());
+                assert!(publisher
+                    .commands(replacement.as_ref(), &snapshot, &tabs, &statuses, false)
+                    .is_empty());
+                assert_eq!(
+                    publisher.commands(replacement.as_ref(), &snapshot, &tabs, &statuses, true),
+                    removed
+                );
+                // Removing all configuration and closing every tab cannot prune global clears.
+                publisher.commands(
+                    None,
+                    &snapshot,
+                    &BTreeMap::new(),
+                    &PaneStatusSnapshot::default(),
+                    false,
+                );
+                let replay = publisher.commands(
+                    None,
+                    &snapshot,
+                    &BTreeMap::new(),
+                    &PaneStatusSnapshot::default(),
+                    true,
+                );
+                assert!(replay.contains(&"zjstatus::pipe::pipe_old::".into()));
+                assert_eq!(replay.len(), publisher.retired.len());
+                let reactivated =
+                    publisher.commands(Some(&original), &snapshot, &tabs, &statuses, true);
+                assert!(reactivated.contains(&initial[0]));
+                assert!(!reactivated.contains(&"zjstatus::pipe::pipe_old::".into()));
+            }
+        }
+    }
+
+    #[test]
+    fn source_switch_to_empty_scratchpad_clears_once_and_replays_until_replaced() {
+        let status_config = config("pipe \"badge\" { source \"pane-status\"; }");
+        let scratch_config = config("pipe \"badge\" { item_format \"{name}\"; }");
+        let statuses = pane_statuses();
+        let tabs = BTreeMap::from([(42, vec![])]);
+        for force in [false, true] {
+            let mut snapshot = ScratchpadStatusSnapshot::default();
+            let mut publisher = Publisher::default();
+            publisher.commands(Some(&status_config), &snapshot, &tabs, &statuses, false);
+            assert_eq!(
+                publisher.commands(Some(&scratch_config), &snapshot, &tabs, &statuses, force),
+                ["zjstatus::pipe::pipe_badge::"]
+            );
+            assert!(publisher
+                .commands(Some(&scratch_config), &snapshot, &tabs, &statuses, false)
+                .is_empty());
+            assert_eq!(
+                publisher.commands(Some(&scratch_config), &snapshot, &tabs, &statuses, true),
+                ["zjstatus::pipe::pipe_badge::"]
+            );
+            snapshot
+                .current_items
+                .push(item(42, ScratchpadDisplayState::Visible));
+            assert_eq!(
+                publisher.commands(Some(&scratch_config), &snapshot, &tabs, &statuses, true),
+                ["zjstatus::pipe::pipe_badge::term"]
+            );
+            assert!(!publisher.has_retired());
+            assert!(publisher
+                .commands(None, &snapshot, &tabs, &statuses, true)
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn source_switch_to_nonempty_scratchpad_never_emits_a_clear() {
+        let status_config = config("pipe \"badge\" { source \"pane-status\"; }");
+        let scratch_config = config("pipe \"badge\" { item_format \"{name}\"; }");
+        let statuses = pane_statuses();
+        let tabs = BTreeMap::from([(42, vec![])]);
+        let mut snapshot = ScratchpadStatusSnapshot {
+            current_items: vec![item(42, ScratchpadDisplayState::Visible)],
+            ..Default::default()
+        };
+        for force in [false, true] {
+            let mut publisher = Publisher::default();
+            publisher.commands(Some(&status_config), &snapshot, &tabs, &statuses, false);
+            assert_eq!(
+                publisher.commands(Some(&scratch_config), &snapshot, &tabs, &statuses, force),
+                ["zjstatus::pipe::pipe_badge::term"]
+            );
+            assert!(!publisher.has_retired());
+            assert!(publisher
+                .commands(None, &snapshot, &tabs, &statuses, true)
+                .is_empty());
+        }
+        // Switching back must restore pane-status empty publication and removal policy.
+        let mut publisher = Publisher::default();
+        publisher.commands(Some(&scratch_config), &snapshot, &tabs, &statuses, false);
+        snapshot.current_items.clear();
+        assert_eq!(
+            publisher.commands(
+                Some(&status_config),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                false
+            ),
+            ["zjstatus::pipe::pipe_badge::"]
+        );
+        assert_eq!(
+            publisher.commands(None, &snapshot, &tabs, &statuses, false),
+            ["zjstatus::pipe::pipe_badge::"]
+        );
+        assert!(publisher.has_retired());
+    }
+
     #[test]
     fn receiver_discovery_replays_unchanged_values_and_keeps_delayed_fallback() {
         let config = config(
@@ -343,7 +692,13 @@ mod tests {
             let changed = update_zjstatus_plugin_panes(&mut receivers, &manifest);
             assert!(changed);
             assert_eq!(
-                publisher.commands(Some(&config), &snapshot, &tabs, changed),
+                publisher.commands(
+                    Some(&config),
+                    &snapshot,
+                    &tabs,
+                    &PaneStatusSnapshot::default(),
+                    changed
+                ),
                 expected
             );
             if changed {
@@ -359,7 +714,13 @@ mod tests {
             let changed = update_zjstatus_plugin_panes(&mut receivers, &manifest);
             assert!(!changed);
             assert!(publisher
-                .commands(Some(&config), &snapshot, &tabs, changed)
+                .commands(
+                    Some(&config),
+                    &snapshot,
+                    &tabs,
+                    &PaneStatusSnapshot::default(),
+                    changed
+                )
                 .is_empty());
             assert_eq!(scheduler.take_due(ms(now + 249)), DueTasks::default());
             assert_eq!(
@@ -394,8 +755,20 @@ mod tests {
         let mut receivers = HashSet::new();
         let mut manifest = HashMap::from([(0, vec![receiver(7)])]);
         let changed = update_zjstatus_plugin_panes(&mut receivers, &manifest);
-        publisher.commands(Some(&original), &snapshot, &tabs, changed);
-        publisher.commands(Some(&replacement), &snapshot, &tabs, false);
+        publisher.commands(
+            Some(&original),
+            &snapshot,
+            &tabs,
+            &PaneStatusSnapshot::default(),
+            changed,
+        );
+        publisher.commands(
+            Some(&replacement),
+            &snapshot,
+            &tabs,
+            &PaneStatusSnapshot::default(),
+            false,
+        );
         assert!(publisher.has_retired());
 
         snapshot.current_items.clear();
@@ -405,7 +778,13 @@ mod tests {
         let changed = update_zjstatus_plugin_panes(&mut receivers, &manifest);
         assert!(changed);
         assert_eq!(
-            publisher.commands(Some(&replacement), &snapshot, &tabs, changed),
+            publisher.commands(
+                Some(&replacement),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                changed
+            ),
             [
                 "zjstatus::tab_pipe::42::old::",
                 "zjstatus::tab_pipe::42::badge::"
@@ -418,7 +797,13 @@ mod tests {
         let changed = update_zjstatus_plugin_panes(&mut receivers, &manifest);
         assert!(!changed);
         assert!(publisher
-            .commands(Some(&replacement), &snapshot, &tabs, changed)
+            .commands(
+                Some(&replacement),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                changed
+            )
             .is_empty());
         assert!(!publisher
             .published
@@ -451,14 +836,32 @@ mod tests {
             "zjstatus::tab_pipe::99::count::0",
         ];
         assert_eq!(
-            publisher.commands(Some(&config), &snapshot, &tabs, false),
+            publisher.commands(
+                Some(&config),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                false
+            ),
             expected
         );
         assert!(publisher
-            .commands(Some(&config), &snapshot, &tabs, false)
+            .commands(
+                Some(&config),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                false
+            )
             .is_empty());
         assert_eq!(
-            publisher.commands(Some(&config), &snapshot, &tabs, true),
+            publisher.commands(
+                Some(&config),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                true
+            ),
             expected
         );
     }
@@ -472,18 +875,36 @@ mod tests {
         let snapshot = ScratchpadStatusSnapshot::default();
         let mut publisher = Publisher::default();
         assert_eq!(
-            publisher.commands(Some(&output_config), &snapshot, &tabs, false),
+            publisher.commands(
+                Some(&output_config),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                false
+            ),
             ["zjstatus::tab_pipe::42::badge::a::b visible "]
         );
         tabs.get_mut(&42).unwrap()[0].state = ScratchpadDisplayState::Closed;
         assert_eq!(
-            publisher.commands(Some(&output_config), &snapshot, &tabs, false),
+            publisher.commands(
+                Some(&output_config),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                false
+            ),
             ["zjstatus::tab_pipe::42::badge::"]
         );
         assert!(!publisher.has_retired());
         let spaces = config("tab_pipe \"badge\" { format \"  \"; }");
         assert_eq!(
-            publisher.commands(Some(&spaces), &snapshot, &tabs, false),
+            publisher.commands(
+                Some(&spaces),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                false
+            ),
             ["zjstatus::tab_pipe::42::badge::  "]
         );
     }
@@ -499,16 +920,46 @@ mod tests {
             let snapshot = ScratchpadStatusSnapshot::default();
             let tabs = BTreeMap::from([(42, vec![])]);
             let mut publisher = Publisher::default();
-            publisher.commands(Some(&original), &snapshot, &tabs, false);
-            let removed = publisher.commands(replacement.as_ref(), &snapshot, &tabs, false);
+            publisher.commands(
+                Some(&original),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                false,
+            );
+            let removed = publisher.commands(
+                replacement.as_ref(),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                false,
+            );
             assert_eq!(removed[0], "zjstatus::tab_pipe::42::old::");
             assert!(publisher.has_retired());
             assert!(publisher
-                .commands(replacement.as_ref(), &snapshot, &tabs, false)
+                .commands(
+                    replacement.as_ref(),
+                    &snapshot,
+                    &tabs,
+                    &PaneStatusSnapshot::default(),
+                    false
+                )
                 .is_empty());
-            let replay = publisher.commands(replacement.as_ref(), &snapshot, &tabs, true);
+            let replay = publisher.commands(
+                replacement.as_ref(),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                true,
+            );
             assert_eq!(replay[0], "zjstatus::tab_pipe::42::old::");
-            let reactivated = publisher.commands(Some(&original), &snapshot, &tabs, true);
+            let reactivated = publisher.commands(
+                Some(&original),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                true,
+            );
             assert!(reactivated.contains(&"zjstatus::tab_pipe::42::old::old".into()));
             assert!(!reactivated.contains(&"zjstatus::tab_pipe::42::old::".into()));
             assert!(!publisher
@@ -524,19 +975,45 @@ mod tests {
         for retire in [false, true] {
             let mut publisher = Publisher::default();
             let tabs = BTreeMap::from([(42, vec![])]);
-            publisher.commands(Some(&config), &snapshot, &tabs, false);
+            publisher.commands(
+                Some(&config),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                false,
+            );
             if retire {
-                publisher.commands(None, &snapshot, &tabs, false);
+                publisher.commands(
+                    None,
+                    &snapshot,
+                    &tabs,
+                    &PaneStatusSnapshot::default(),
+                    false,
+                );
             }
             assert!(publisher
-                .commands(None, &snapshot, &BTreeMap::new(), true)
+                .commands(
+                    None,
+                    &snapshot,
+                    &BTreeMap::new(),
+                    &PaneStatusSnapshot::default(),
+                    true
+                )
                 .is_empty());
             assert!(publisher.published.is_empty());
             assert!(!publisher.has_retired());
-            assert!(publisher.commands(None, &snapshot, &tabs, true).is_empty());
+            assert!(publisher
+                .commands(None, &snapshot, &tabs, &PaneStatusSnapshot::default(), true)
+                .is_empty());
             assert_eq!(
                 publisher
-                    .commands(Some(&config), &snapshot, &tabs, false)
+                    .commands(
+                        Some(&config),
+                        &snapshot,
+                        &tabs,
+                        &PaneStatusSnapshot::default(),
+                        false
+                    )
                     .len(),
                 1
             );
@@ -550,36 +1027,74 @@ mod tests {
         let tabs = BTreeMap::new();
         let mut publisher = Publisher::default();
         assert!(publisher
-            .commands(Some(&config), &snapshot, &tabs, true)
+            .commands(
+                Some(&config),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                true
+            )
             .is_empty());
         snapshot
             .current_items
             .push(item(42, ScratchpadDisplayState::Visible));
         assert_eq!(
-            publisher.commands(Some(&config), &snapshot, &tabs, false),
+            publisher.commands(
+                Some(&config),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                false
+            ),
             ["zjstatus::pipe::pipe_badge::term"]
         );
         snapshot.current_items.clear();
         assert!(publisher
-            .commands(Some(&config), &snapshot, &tabs, true)
+            .commands(
+                Some(&config),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                true
+            )
             .is_empty());
         snapshot
             .current_items
             .push(item(42, ScratchpadDisplayState::Visible));
         assert!(publisher
-            .commands(Some(&config), &snapshot, &tabs, false)
+            .commands(
+                Some(&config),
+                &snapshot,
+                &tabs,
+                &PaneStatusSnapshot::default(),
+                false
+            )
             .is_empty());
         assert_eq!(
             publisher
-                .commands(Some(&config), &snapshot, &tabs, true)
+                .commands(
+                    Some(&config),
+                    &snapshot,
+                    &tabs,
+                    &PaneStatusSnapshot::default(),
+                    true
+                )
                 .len(),
             1
         );
-        assert!(publisher.commands(None, &snapshot, &tabs, true).is_empty());
+        assert!(publisher
+            .commands(None, &snapshot, &tabs, &PaneStatusSnapshot::default(), true)
+            .is_empty());
         assert!(!publisher.has_retired());
         assert_eq!(
             publisher
-                .commands(Some(&config), &snapshot, &tabs, false)
+                .commands(
+                    Some(&config),
+                    &snapshot,
+                    &tabs,
+                    &PaneStatusSnapshot::default(),
+                    false
+                )
                 .len(),
             1
         );
@@ -598,6 +1113,7 @@ mod tests {
                         Some(&config),
                         &snapshot,
                         &BTreeMap::from([(42, vec![])]),
+                        &PaneStatusSnapshot::default(),
                         false
                     ),
                     ["zjstatus::tab_pipe::42::badge::"]
@@ -605,15 +1121,33 @@ mod tests {
             }
             let mut tabs = BTreeMap::from([(42, vec![item(42, ScratchpadDisplayState::Visible)])]);
             assert_eq!(
-                publisher.commands(Some(&config), &snapshot, &tabs, false),
+                publisher.commands(
+                    Some(&config),
+                    &snapshot,
+                    &tabs,
+                    &PaneStatusSnapshot::default(),
+                    false
+                ),
                 ["zjstatus::tab_pipe::42::badge::visible"]
             );
             tabs.get_mut(&42).unwrap()[0].tab_position = Some(5);
             assert!(publisher
-                .commands(Some(&config), &snapshot, &tabs, false)
+                .commands(
+                    Some(&config),
+                    &snapshot,
+                    &tabs,
+                    &PaneStatusSnapshot::default(),
+                    false
+                )
                 .is_empty());
             assert!(publisher
-                .commands(Some(&config), &snapshot, &BTreeMap::new(), true)
+                .commands(
+                    Some(&config),
+                    &snapshot,
+                    &BTreeMap::new(),
+                    &PaneStatusSnapshot::default(),
+                    true
+                )
                 .is_empty());
         }
     }
@@ -716,8 +1250,20 @@ mod tests {
         let snapshot = ScratchpadStatusSnapshot::default();
         let tabs = BTreeMap::from([(42, vec![])]);
         let mut publisher = Publisher::default();
-        publisher.commands(Some(&config), &snapshot, &tabs, false);
-        publisher.commands(None, &snapshot, &tabs, false);
+        publisher.commands(
+            Some(&config),
+            &snapshot,
+            &tabs,
+            &PaneStatusSnapshot::default(),
+            false,
+        );
+        publisher.commands(
+            None,
+            &snapshot,
+            &tabs,
+            &PaneStatusSnapshot::default(),
+            false,
+        );
         let mut scheduler = Scheduler::default();
         scheduler.configure(
             ms(0),
@@ -729,10 +1275,16 @@ mod tests {
         assert_eq!(scheduler.arm(ms(0)), Some(ms(2000)));
         assert!(scheduler.take_due(ms(2000)).full_replay);
         assert_eq!(
-            publisher.commands(None, &snapshot, &tabs, true),
+            publisher.commands(None, &snapshot, &tabs, &PaneStatusSnapshot::default(), true),
             ["zjstatus::tab_pipe::42::badge::"]
         );
-        publisher.commands(None, &snapshot, &BTreeMap::new(), false);
+        publisher.commands(
+            None,
+            &snapshot,
+            &BTreeMap::new(),
+            &PaneStatusSnapshot::default(),
+            false,
+        );
         scheduler.configure(
             ms(2000),
             None,

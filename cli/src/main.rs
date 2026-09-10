@@ -35,6 +35,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Set or clear a pane's status
+    PaneStatus {
+        #[command(subcommand)]
+        action: PaneStatusAction,
+    },
     /// Focus a pane or tab
     Focus {
         #[command(subcommand)]
@@ -72,6 +77,32 @@ enum Commands {
         #[arg(long = "current-tab", conflicts_with = "tab_id")]
         current_tab: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum PaneStatusAction {
+    /// Set status text for the invoking pane or an explicit target
+    Set {
+        message: String,
+        /// Typed pane ID (terminal_N or plugin_N) [default: ZELLIJ_PANE_ID]
+        #[arg(long, value_parser = parse_status_pane_id)]
+        pane_id: Option<String>,
+        /// Status text format (style validation is performed by the plugin)
+        #[arg(long, value_enum, default_value = "plain")]
+        format: PaneStatusFormat,
+    },
+    /// Clear status text for the invoking pane or an explicit target
+    Clear {
+        /// Typed pane ID (terminal_N or plugin_N) [default: ZELLIJ_PANE_ID]
+        #[arg(long, value_parser = parse_status_pane_id)]
+        pane_id: Option<String>,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneStatusFormat {
+    Plain,
+    Zjstatus,
 }
 
 #[derive(Subcommand)]
@@ -241,10 +272,28 @@ fn zellij_cmd(session: Option<&str>) -> Command {
     cmd
 }
 
-fn send_pipe_message(plugin: &str, msg: &str, session: Option<&str>) -> std::io::Result<()> {
-    let status = zellij_cmd(session)
-        .args(["pipe", "--plugin", plugin, "--", msg])
-        .status()?;
+fn pipe_command(
+    plugin: &str,
+    msg: &str,
+    session: Option<&str>,
+    pipe_args: Option<&str>,
+) -> Command {
+    let mut cmd = zellij_cmd(session);
+    cmd.args(["pipe", "--plugin", plugin]);
+    if let Some(args) = pipe_args {
+        cmd.args(["--args", args]);
+    }
+    cmd.args(["--", msg]);
+    cmd
+}
+
+fn send_pipe_message(
+    plugin: &str,
+    msg: &str,
+    session: Option<&str>,
+    pipe_args: Option<&str>,
+) -> std::io::Result<()> {
+    let status = pipe_command(plugin, msg, session, pipe_args).status()?;
 
     if status.success() {
         Ok(())
@@ -258,6 +307,10 @@ fn send_pipe_message(plugin: &str, msg: &str, session: Option<&str>) -> std::io:
 
 fn source_pane_from_env() -> Option<String> {
     let pane_id = std::env::var("ZELLIJ_PANE_ID").ok()?;
+    normalize_source_pane(&pane_id)
+}
+
+fn normalize_source_pane(pane_id: &str) -> Option<String> {
     let pane_id = pane_id.trim();
     if pane_id.is_empty() {
         None
@@ -266,6 +319,81 @@ fn source_pane_from_env() -> Option<String> {
     } else {
         Some(format!("terminal_{pane_id}"))
     }
+}
+
+fn parse_status_pane_id(value: &str) -> Result<String, String> {
+    if let Some((kind @ ("terminal" | "plugin"), number)) = value.split_once('_') {
+        if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(id) = number.parse::<u32>() {
+                return Ok(format!("{kind}_{id}"));
+            }
+        }
+    }
+    Err("expected terminal_N or plugin_N, where N is an unsigned 32-bit integer".to_string())
+}
+
+fn build_pane_status_message(
+    action: PaneStatusAction,
+    session: Option<&str>,
+    env_pane: Option<&str>,
+    env_session: Option<&str>,
+) -> std::io::Result<(String, Option<&'static str>)> {
+    let (pane_id, message, format) = match action {
+        PaneStatusAction::Set {
+            pane_id,
+            message,
+            format,
+        } => (pane_id, message, format),
+        PaneStatusAction::Clear { pane_id } => (pane_id, String::new(), PaneStatusFormat::Plain),
+    };
+    let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+    let pane_id = if let Some(pane_id) = pane_id {
+        parse_status_pane_id(&pane_id).map_err(invalid)?
+    } else {
+        if session.is_some() && session != env_session {
+            return Err(invalid(
+                "--pane-id is required when --session differs from ZELLIJ_SESSION_NAME (or it is unset)"
+                    .to_string(),
+            ));
+        }
+        let source = env_pane.and_then(normalize_source_pane).ok_or_else(|| {
+            invalid(
+                "ZELLIJ_PANE_ID is missing or empty; specify --pane-id terminal_N or plugin_N"
+                    .to_string(),
+            )
+        })?;
+        parse_status_pane_id(&source)
+            .map_err(|err| invalid(format!("invalid ZELLIJ_PANE_ID: {err}; specify --pane-id")))?
+    };
+    if message.len() > 4096 {
+        return Err(invalid(
+            "pane status text must not exceed 4096 bytes".to_string(),
+        ));
+    }
+    if message.chars().any(char::is_control) {
+        return Err(invalid(
+            "pane status text must not contain control characters".to_string(),
+        ));
+    }
+    let args = (format == PaneStatusFormat::Zjstatus).then_some("format=zjstatus");
+    Ok((
+        format!("zellij-tools::pane-status::{pane_id}::{message}"),
+        args,
+    ))
+}
+
+fn pane_status(
+    plugin: &str,
+    action: PaneStatusAction,
+    session: Option<&str>,
+) -> std::io::Result<()> {
+    let (msg, args) = build_pane_status_message(
+        action,
+        session,
+        std::env::var("ZELLIJ_PANE_ID").ok().as_deref(),
+        std::env::var("ZELLIJ_SESSION_NAME").ok().as_deref(),
+    )?;
+    send_pipe_message(plugin, &msg, session, args)
 }
 
 fn append_scratchpad_target(mut msg: String, tab_id: Option<usize>, current_tab: bool) -> String {
@@ -333,7 +461,7 @@ fn scratchpad(
         ScratchpadAction::List { .. } => unreachable!("list is handled separately"),
     };
 
-    send_pipe_message(plugin, &msg, session)
+    send_pipe_message(plugin, &msg, session, None)
 }
 
 fn focus(plugin: &str, target: FocusTarget, session: Option<&str>) -> std::io::Result<()> {
@@ -359,7 +487,7 @@ fn focus(plugin: &str, target: FocusTarget, session: Option<&str>) -> std::io::R
         }
     };
 
-    send_pipe_message(plugin, &msg, session)
+    send_pipe_message(plugin, &msg, session, None)
 }
 
 fn subscribe(
@@ -692,6 +820,7 @@ fn main() {
     let session = cli.session.as_deref();
 
     let result = match cli.command {
+        Commands::PaneStatus { action } => pane_status(&plugin, action, session),
         Commands::Focus { target } => focus(&plugin, target, session),
         Commands::Scratchpad {
             action:
@@ -733,6 +862,215 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_pane_status_defaults_and_explicit_options() {
+        let cli =
+            Cli::try_parse_from(["zellij-tools", "pane-status", "set", "Permission Requested"])
+                .unwrap();
+        match cli.command {
+            Commands::PaneStatus {
+                action:
+                    PaneStatusAction::Set {
+                        message,
+                        pane_id,
+                        format,
+                    },
+            } => {
+                assert_eq!(message, "Permission Requested");
+                assert_eq!(pane_id, None);
+                assert_eq!(format, PaneStatusFormat::Plain);
+            }
+            _ => panic!("expected pane-status set"),
+        }
+        for action in ["set", "clear"] {
+            for target in [None, Some("terminal_0002"), Some("plugin_0002")] {
+                let mut args = vec!["zellij-tools", "pane-status", action];
+                if action == "set" {
+                    args.extend(["Permission Requested", "--format", "zjstatus"]);
+                }
+                if let Some(target) = target {
+                    args.extend(["--pane-id", target]);
+                }
+                args.extend([
+                    "--session",
+                    "other",
+                    "--zellij-plugin",
+                    "file:/tmp/plugin.wasm",
+                ]);
+                let cli = Cli::try_parse_from(args).unwrap();
+                assert_eq!(cli.session.as_deref(), Some("other"));
+                assert_eq!(cli.plugin.as_deref(), Some("file:/tmp/plugin.wasm"));
+                match cli.command {
+                    Commands::PaneStatus { action } => {
+                        let pane_id = match action {
+                            PaneStatusAction::Set {
+                                pane_id, format, ..
+                            } => {
+                                assert_eq!(format, PaneStatusFormat::Zjstatus);
+                                pane_id
+                            }
+                            PaneStatusAction::Clear { pane_id } => pane_id,
+                        };
+                        assert_eq!(pane_id, target.map(|s| s.replace("0002", "2")));
+                    }
+                    _ => panic!("expected pane-status"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_pane_status_formats_and_targets() {
+        assert!(Cli::try_parse_from([
+            "zellij-tools",
+            "pane-status",
+            "set",
+            "text",
+            "--format",
+            "ansi",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["zellij-tools", "pane-status", "set"]).is_err());
+        for target in [
+            "",
+            "2",
+            "focused",
+            "terminal_",
+            "terminal_+1",
+            "terminal_-1",
+            "terminal_4294967296",
+            "terminal_1::text",
+            "plugin_1_2",
+            "pane_1",
+            " terminal_1",
+            "plugin_1 ",
+            "terminal_\u{0661}",
+        ] {
+            for action in ["set", "clear"] {
+                let mut args = vec!["zellij-tools", "pane-status", action];
+                if action == "set" {
+                    args.push("text");
+                }
+                args.extend(["--pane-id", target]);
+                assert!(Cli::try_parse_from(args).is_err(), "{action}: {target:?}");
+            }
+        }
+        assert_eq!(
+            parse_status_pane_id("plugin_4294967295").unwrap(),
+            "plugin_4294967295"
+        );
+    }
+
+    #[test]
+    fn pane_status_env_target_normalization_and_session_safety() {
+        let clear = || PaneStatusAction::Clear { pane_id: None };
+        for (env, expected) in [
+            ("42", "terminal_42"),
+            (" 002 ", "terminal_2"),
+            ("terminal_03", "terminal_3"),
+            ("plugin_7", "plugin_7"),
+        ] {
+            for session in [None, Some("current")] {
+                let (msg, args) =
+                    build_pane_status_message(clear(), session, Some(env), Some("current"))
+                        .unwrap();
+                assert_eq!(msg, format!("zellij-tools::pane-status::{expected}::"));
+                assert_eq!(args, None);
+            }
+        }
+        for env in [
+            None,
+            Some(""),
+            Some(" "),
+            Some("bad"),
+            Some("+1"),
+            Some("4294967296"),
+            Some("plugin_x"),
+        ] {
+            let err = build_pane_status_message(clear(), None, env, None).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("ZELLIJ_PANE_ID"));
+            assert!(err.to_string().contains("--pane-id"));
+        }
+        for current in [None, Some("current")] {
+            let err =
+                build_pane_status_message(clear(), Some("other"), Some("2"), current).unwrap_err();
+            assert!(err.to_string().contains("--pane-id"));
+            let explicit = PaneStatusAction::Clear {
+                pane_id: Some("plugin_9".to_string()),
+            };
+            assert_eq!(
+                build_pane_status_message(explicit, Some("other"), Some("bad"), current)
+                    .unwrap()
+                    .0,
+                "zellij-tools::pane-status::plugin_9::"
+            );
+        }
+    }
+
+    #[test]
+    fn pane_status_payload_and_command_preserve_freeform_text() {
+        let message = "#[fg=red]Permission::Requested:: $(touch /tmp/nope) 'quoted'";
+        for format in [PaneStatusFormat::Plain, PaneStatusFormat::Zjstatus] {
+            let action = PaneStatusAction::Set {
+                pane_id: Some("terminal_2".to_string()),
+                message: message.to_string(),
+                format,
+            };
+            let (msg, args) = build_pane_status_message(action, None, None, None).unwrap();
+            assert_eq!(
+                msg,
+                format!("zellij-tools::pane-status::terminal_2::{message}")
+            );
+            let cmd = pipe_command("file:/tmp/my plugin.wasm", &msg, Some("other"), args);
+            assert_eq!(cmd.get_program(), "zellij");
+            let mut expected = vec!["pipe", "--plugin", "file:/tmp/my plugin.wasm"];
+            if format == PaneStatusFormat::Zjstatus {
+                assert_eq!(args, Some("format=zjstatus"));
+                expected.extend(["--args", "format=zjstatus"]);
+            } else {
+                assert_eq!(args, None);
+            }
+            expected.extend(["--", &msg]);
+            assert_eq!(cmd.get_args().collect::<Vec<_>>(), expected);
+            assert!(cmd
+                .get_envs()
+                .any(|(key, value)| key == "ZELLIJ_SESSION_NAME"
+                    && value == Some(std::ffi::OsStr::new("other"))));
+        }
+    }
+
+    #[test]
+    fn pane_status_rejects_oversized_text_and_control_characters() {
+        let build = |message: String| {
+            build_pane_status_message(
+                PaneStatusAction::Set {
+                    pane_id: Some("terminal_1".to_string()),
+                    message,
+                    format: PaneStatusFormat::Plain,
+                },
+                None,
+                None,
+                None,
+            )
+        };
+        assert!(build("x".repeat(4096)).is_ok());
+        assert!(build("\u{00e9}".repeat(2048)).is_ok());
+        for message in ["x".repeat(4097), "\u{00e9}".repeat(2049)] {
+            assert!(build(message)
+                .unwrap_err()
+                .to_string()
+                .contains("4096 bytes"));
+        }
+        for control in (0..=31).chain(127..=159) {
+            let message = format!("text{}more", char::from_u32(control).unwrap());
+            assert!(build(message)
+                .unwrap_err()
+                .to_string()
+                .contains("control characters"));
+        }
+    }
 
     fn parsed_scratchpad_tab_id(args: &[&str]) -> Option<usize> {
         let cli = Cli::try_parse_from(args.iter().copied()).unwrap();

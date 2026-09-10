@@ -1,6 +1,6 @@
 # zellij-tools
 
-A [Zellij](https://github.com/zellij-org/zellij) plugin and companion CLI that add scratchpads, focus helpers, event streaming, and session tree utilities.
+A [Zellij](https://github.com/zellij-org/zellij) plugin and companion CLI that add scratchpads, pane status, focus helpers, event streaming, and session tree utilities.
 
 ## Installation
 
@@ -154,13 +154,13 @@ The config directory is determined by (in order):
 
 ### Configuration Options
 
-| Option        | Description                                               | Default       | Inline Config | External Config File |
-| ------------- | --------------------------------------------------------- | ------------- | :-----------: | :------------------: |
-| `include`     | Path to external config file                              | -             |      Yes      |          No          |
-| `config_dir`  | Override base directory for relative includes             | Auto-detected |      Yes      |          No          |
-| `watch_ms`    | Polling interval in ms. `"false"` or `"0"` to disable.    | `2000`        |      Yes      |          No          |
-| `scratchpads` | Scratchpad definitions                                    | -             |      Yes      |         Yes          |
-| `zjstatus`    | Optional scratchpad status output for the zjstatus plugin | -             |      Yes      |         Yes          |
+| Option        | Description                                            | Default       | Inline Config | External Config File |
+| ------------- | ------------------------------------------------------ | ------------- | :-----------: | :------------------: |
+| `include`     | Path to external config file                           | -             |      Yes      |          No          |
+| `config_dir`  | Override base directory for relative includes          | Auto-detected |      Yes      |          No          |
+| `watch_ms`    | Polling interval in ms. `"false"` or `"0"` to disable. | `2000`        |      Yes      |          No          |
+| `scratchpads` | Scratchpad definitions                                 | -             |      Yes      |         Yes          |
+| `zjstatus`    | Optional scratchpad or pane status output for zjstatus | -             |      Yes      |         Yes          |
 
 ### Scratchpad Options
 
@@ -320,6 +320,7 @@ Tab placeholders belong in tab label formats, including any explicit bell/fullsc
 
 #### Schema and Layering
 
+- `source "scratchpad"` is the default on both output kinds. Use `source "pane-status"` for [pane status outputs](#pane-status-outputs); the scratchpad-specific defaults and options below do not apply to that source.
 - Repeat either output kind as needed. Identity is `(kind, name)`, so global `scratchpads` and tab `scratchpads` coexist; duplicate identities within one layer are errors.
 - Global names match `[A-Za-z0-9_-]+`; tab field names match `[a-z0-9_]+`. Use the bare name, without `pipe_` or `tab_pipe_`.
 - `enabled true` is the default. `enabled false` disables an output; it is a KDL boolean, not a string.
@@ -343,7 +344,7 @@ Use **one authoritative producer per global name or tab field**. Delivery is ses
 
 Updates follow scratchpad actions, pane/tab changes and configuration changes. New receivers also trigger delayed replay. `zellij-tools::zjstatus::refresh` forces replay; periodic full replay recovers new/restarted receivers and startup races even without state changes. `refresh_ms` is an unquoted positive KDL integer in `1..=4294967295` (`u32`), default `2000` milliseconds. Zero, negatives, overflow, strings and booleans are rejected. Replay is independent of `watch_ms` and requires no external include file.
 
-An empty rendered result uses the literal `empty_format` fallback after sanitization. If the result is still empty, a **tab output sends a clear**, including on its first publication; a **global output skips the write**, retaining the receiver's previous value. Whitespace is nonempty. A count-only format such as `"{tab_live_count}"` renders `0`, not an empty value, so its wrapper remains visible. Disabling/removing global outputs does not guarantee clearing their old receiver values.
+For the default scratchpad source, an empty rendered result uses the literal `empty_format` fallback after sanitization. If the result is still empty, a **tab output sends a clear**, including on its first publication; a **global output skips the write**, retaining the receiver's previous value. Whitespace is nonempty. A count-only format such as `"{tab_live_count}"` renders `0`, not an empty value, so its wrapper remains visible. Disabling/removing scratchpad global outputs does not guarantee clearing their old receiver values. Pane-status outputs instead publish clears for both kinds, as described below.
 
 Disabling, removing or renaming a tab output clears its previously owned fields on live tabs. Retired tab keys keep replaying clears during the producer's lifetime, **even with all outputs disabled**. Replay stops when there are neither enabled outputs nor retired keys needing clears. Retired keys are dropped when their tab closes or the key is reactivated. Receiver state and producer retirement history are transient: there is no acknowledgement, TTL, persistent ownership history or automatic cleanup after a producer crash/restart.
 
@@ -359,7 +360,7 @@ The second command clears tab ID `42`'s field; its trailing `::` is required. ID
 
 #### zjstatus Placeholders
 
-Global pipe `format` supports these placeholders:
+For the default scratchpad source, global pipe `format` supports these placeholders:
 
 | Placeholder                                                                           | Description                                                   |
 | ------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
@@ -397,6 +398,58 @@ Item format precedence is: scoped focused override, scoped MRU override, `<scope
 
 Inside each output, supported keys are `enabled`, `format`, `empty_format`, `include`, `exclude`, `item_format`, `item_visible_format`, `item_hidden_format`, `item_closed_format`, and `item_separator`. Scoped overrides are `<scope>_item_format`, `<scope>_item_visible_format`, `<scope>_item_hidden_format`, `<scope>_item_closed_format`, and `<scope>_item_separator`, using `current`/`global` for global outputs and `tab`/`global` for tab outputs. `current_item_focused_format`/`current_item_mru_format` apply only to global outputs; `tab_item_focused_format`/`tab_item_mru_format` only to tab outputs. Formats and separators are strings; unknown options, duplicate options and unsupported scopes are errors.
 
+#### Pane Status Outputs
+
+Add separate outputs to the same `zjstatus` block to display [pane statuses](#pane-status) without changing scratchpad items:
+
+```kdl
+zjstatus {
+    pipe "pane_status" {
+        source "pane-status"
+        format "Status: {current_items} "
+        item_format "{title}: {status}"
+        current_item_focused_format "#[bold]{title}: {status}"
+        item_separator " | "
+    }
+    tab_pipe "pane_status" {
+        source "pane-status"
+        // Defaults: format "{tab_items}" and item_format "{status}".
+        item_separator " / "
+        // Optional exact typed IDs, not scratchpad names or bare numbers:
+        // include "terminal_2" "plugin_7"
+        // exclude "terminal_3"
+    }
+}
+```
+
+The global pipe shows all eligible statuses in the producer's **active tab**, not just the focused pane. Each tab field shows only statuses belonging to that actual tab, including inactive tabs. Items are sorted by terminal IDs first, then plugin IDs, numerically within each type. Statuses follow panes moved between tabs, unlike scratchpad identities.
+
+Pane-status source options and placeholders:
+
+- `format` defaults to `"{current_items}"` for `pipe` and `"{tab_items}"` for `tab_pipe`. The corresponding count is `{current_rendered_count}` or `{tab_rendered_count}`. There are no session-wide `{global_*}`, `{other_*}`, scratchpad lifecycle counts, or MRU placeholders for this source.
+- `item_format` defaults to `"{status}"`. Item placeholders are `{status}`, `{title}` (current pane title), `{pane_id}` (typed canonical ID), `{tab_id}` (native tab ID), and `{is_focused}` (`true`/`false`). Status text and titles are not recursively expanded; a space is inserted after every opening `{` in this untrusted text, while closing `}` is unchanged. Config template placeholders remain unchanged.
+- Item precedence is `current_item_focused_format`, `current_item_format`, then `item_format` for global pipes; use `tab_item_focused_format` and `tab_item_format` for tab pipes. The focused override applies only to focused items. An explicitly empty selected item format omits that item.
+- `item_separator` defaults to `" "`; `current_item_separator` or `tab_item_separator` overrides it for the matching scope. The option is **not** `separator`.
+- `include`/`exclude` match exact canonical typed IDs such as `terminal_2` and `plugin_7`, not `2` or `terminal_02`. Exclude wins. Empty include means all IDs; filtering does not change sort order.
+- With no eligible rendered items, the producer uses literal `empty_format` (default `""`) instead of evaluating `format`. Even a prefix or count-only format is hidden by default, rather than displaying a stale label or `0`.
+
+Configure matching receiver fields with **dynamic mode, even when every status uses plain format**: the producer inserts style-isolation markup around interpolations and output. Static mode is not suitable for this source. Merge these settings and placeholders into the existing receiver configuration, retaining existing scratchpad widgets:
+
+```kdl
+pipe_pane_status_format "{output}"
+pipe_pane_status_rendermode "dynamic"
+tab_pipe_pane_status_format " {output}"
+tab_pipe_pane_status_rendermode "dynamic"
+// Append {pipe_pane_status} to an outer bar format, for example format_right.
+// Append {tab_pipe_pane_status} to tab_normal, tab_active, and any variants.
+```
+
+Use exactly `"{output}"` for the global receiver format and put decoration/spacing in the producer's `format`, so clearing does not leave stale receiver decoration. Tab fields may use a spacing wrapper as above because cleared tab values hide their wrappers. Tab fields still require the tab-pipe-capable zjstatus build described above.
+
+Dynamic style resets do not mean the same inherited defaults in global and tab rendering; do not rely on the surrounding bar/tab style. Producer item/output templates support styles with explicit inheritance, and the producer restores the trusted template style after each interpolation. Receiver style-wrapper overrides are not guaranteed: prefer receiver format `"{output}"` and place trusted colors in the producer's `item_format`. No raw ANSI is supported. Embedded `::` survives tab delivery but becomes `: :` in global output due to the existing global receiver protocol limitation.
+
+Both empty global and tab pane-status outputs send clears. Disabling, removing, or renaming a previously published pane-status output also retires its old keys and replays clears during the publisher's lifetime. This does not provide persistent cleanup after a crash. Use a **single authoritative configured publisher**: delivery remains session-wide, last-writer-wins, with the publisher's active-tab/focus view. This feature does not add multi-client aggregation or client-private status widgets.
+
 #### Local Dev Example
 
 `nix run .#dev` builds the `b0o/zjstatus` fork's `feat-tab-pipe` branch from the revision pinned in `flake.lock`. The launcher copies the Nix-store artifact to the gitignored `.cache/zjstatus.wasm`, which `dev.kdl` loads by relative path. Run from this repository's root; each launch refreshes the cached artifact. No installed plugin or production config needs replacing.
@@ -421,6 +474,16 @@ From this repository, build with `nix run .#build`, then launch an isolated sess
 
 CLI commands infer the originating pane's tab. Explicit `--tab` values must be native IDs from `tree`, not the layout's first/second positions. These are manual verification instructions, not recorded test outcomes.
 
+The dev configuration also displays pane statuses in the main bar and every tab-label variant. In a dev-session terminal, try:
+
+```sh
+nix run .#run -- pane-status set 'Building'
+nix run .#run -- pane-status set --format zjstatus '#[fg=yellow,bold]Permission Requested'
+nix run .#run -- pane-status clear
+```
+
+Before clearing, switch tabs: the original tab's badge should remain, but its status should leave the main bar. Set another status in a second pane to check aggregation. Main-bar items include pane titles; tab badges show only messages. Clearing the last status removes the output and its decoration.
+
 ### Scratchpad CLI
 
 Control scratchpads from the command line:
@@ -440,6 +503,40 @@ zellij-tools scratchpad list --full  # Include full pane info for live instances
 If `ZELLIJ_PANE_ID` is set in your environment (automatic inside Zellij) and no `--tab` or `--current-tab` is provided, the CLI infers the target tab from the calling pane. Otherwise, the receiving plugin instance's current tab is used (may be ambiguous in multi-client sessions). Use `--current-tab` to explicitly target the focused tab. `--tab-id` is accepted as an alias for `--tab`.
 
 `scratchpad list` accepts optional scratchpad names and the same `--tab`, `--tab-id`, and `--current-tab` filters as the control commands. It returns JSON sorted by scratchpad name and includes orphaned scratchpads that still have panes after being removed from config.
+
+## Pane Status
+
+Each typed pane ID (`terminal_N` or `plugin_N`) can own one ephemeral status. Setting replaces its previous value; clearing or setting an empty string removes it. It survives focus changes without expiry, follows pane moves, and is removed when the pane closes or the plugin/session restarts. Statuses are not persisted and do not change the tree or event-stream schemas.
+
+```sh
+zellij-tools pane-status set 'Building'
+zellij-tools pane-status set --format zjstatus '#[fg=yellow,bold]Permission requested'
+zellij-tools pane-status clear
+zellij-tools pane-status set --pane-id terminal_2 'Testing'
+zellij-tools pane-status clear --pane-id plugin_7
+zellij-tools --session other pane-status set --pane-id terminal_2 'Remote build'
+```
+
+Both commands accept `--pane-id`, defaulting to the originating pane from `ZELLIJ_PANE_ID`, not whichever pane is focused. A numeric environment value is normalized to `terminal_N`; explicit `--pane-id` must be typed. Missing/invalid environment values require an explicit target. If `--session` differs from `ZELLIJ_SESSION_NAME`, or that environment variable is unset, an explicit typed `--pane-id` is required. IDs are local to the target session; use `zellij-tools tree` to discover them.
+
+`set --format plain|zjstatus` defaults to `plain`. Plain text neutralizes `#[` to `# [`. In both plain and formatted status text, and in pane titles, a space is inserted after every opening `{`; closing `}` is unchanged. For example, `{command_x}` becomes `{ command_x}`. The pinned receiver's click handler searches for original widget tokens in already-expanded output, so widget-looking input cannot safely pass through unchanged: even without recursive rendering, it can shift configured command click hitboxes. This neutralization does not change config template placeholders. `zjstatus` format accepts only this safe markup subset:
+
+- `#[fg=COLOR,bg=COLOR,bold,italic,underscore]`, with any supported directives combined using commas without spaces, plus `#[]` to reset.
+- Colors: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, their `bright_` variants, decimal indices `0..255`, or six-digit `#RRGGBB`. Aliases, `default`, other style directives, and malformed markers are rejected.
+- Maximum input size: 4096 UTF-8 bytes; formatted input may contain at most 64 style markers, excluding producer-generated isolation markers.
+- Control characters (including newlines, tabs, and ANSI escapes), bidi controls, zero-width formatting characters, soft hyphens, and other unsafe invisible formatting characters are rejected in both formats. Invalid updates leave the existing status unchanged.
+
+The CLI checks arguments, byte length, and control characters locally; the plugin performs authoritative pane and style validation. **CLI success means transport acceptance, not a plugin validation acknowledgement.** Plugin errors are logged by the plugin. Unknown panes and updates sent before pane discovery is ready are rejected, not queued; verify the target and retry after discovery.
+
+Direct pipe equivalents (replace illustrative IDs with live pane IDs):
+
+```sh
+zellij pipe --plugin zellij-tools -- 'zellij-tools::pane-status::terminal_2::text'
+zellij pipe --plugin zellij-tools --args format=zjstatus -- 'zellij-tools::pane-status::terminal_2::#[fg=green]Ready'
+zellij pipe --plugin zellij-tools -- 'zellij-tools::pane-status::terminal_2::'
+```
+
+The empty final `::` clears the status and is required. The message is everything after the typed pane ID, so embedded `::` is preserved on input. Pipe argument `format` defaults to `plain`; only `plain` and `zjstatus` are accepted. To display statuses, configure [pane status outputs](#pane-status-outputs).
 
 ## Other Actions
 
@@ -497,7 +594,7 @@ The plugin requires the following permissions:
 - `ReadCliPipes` - Stream events and tree data to CLI pipes
 - `FullHdAccess` - Read external config files
 - `Reconfigure` - Install scratchpad keybinds at runtime
-- `MessageAndLaunchOtherPlugins` - Publish scratchpad status to zjstatus
+- `MessageAndLaunchOtherPlugins` - Publish scratchpad and pane status to zjstatus
 
 ## License
 

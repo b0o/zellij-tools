@@ -11,6 +11,7 @@ use zellij_tools::events::{
 };
 use zellij_tools::focus::{parse_focus_tab_target, FocusTabTarget};
 use zellij_tools::message::{parse_message, parse_tree_tab_filter, ParseError, TreeTabFilter};
+use zellij_tools::pane_status::PaneStatuses;
 use zellij_tools::scratchpad::{
     acquire_registry_lock, build_scratchpad_keybind_reconfigure, parse_scratchpad_action,
     parse_scratchpads_kdl, registry_file_path, registry_lock_path, registry_temp_file_path,
@@ -48,6 +49,7 @@ struct State {
     // Managers
     scratchpad: Option<ScratchpadManager>,
     event_stream: EventStream,
+    pane_statuses: PaneStatuses,
 
     // Zellij runtime identity and permissions
     zellij_pid: Option<u32>,
@@ -474,10 +476,16 @@ impl State {
                     .collect(),
             )
         };
-        for payload in
-            self.zjstatus_publisher
-                .commands(self.zjstatus_config.as_ref(), &snapshot, &tabs, force)
-        {
+        let pane_statuses = self
+            .pane_statuses
+            .snapshot(&self.pane_manifest, &self.tab_infos);
+        for payload in self.zjstatus_publisher.commands(
+            self.zjstatus_config.as_ref(),
+            &snapshot,
+            &tabs,
+            &pane_statuses,
+            force,
+        ) {
             pipe_message_to_plugin(MessageToPlugin::new("zjstatus").with_payload(payload));
         }
         self.configure_scheduler();
@@ -619,6 +627,22 @@ impl State {
         let message = parse_message(payload)?;
 
         match message.event {
+            "pane-status" => {
+                if !self.has_pane_snapshot {
+                    return Err(ParseError::InvalidArgs(
+                        "pane discovery is not ready; retry the status update".to_string(),
+                    ));
+                }
+                self.pane_statuses
+                    .set(
+                        &message.args,
+                        pipe_message.args.get("format").map(String::as_str),
+                        &self.pane_manifest,
+                    )
+                    .map_err(ParseError::InvalidArgs)?;
+                self.publish_zjstatus(false);
+                Ok(())
+            }
             "focus-pane" => {
                 if message.args.len() != 1 {
                     return Err(ParseError::InvalidArgs(format!(
@@ -863,6 +887,7 @@ impl ZellijPlugin for State {
             Event::PaneUpdate(pane_manifest) => {
                 self.has_pane_snapshot = true;
                 self.pane_manifest = pane_manifest.panes;
+                self.pane_statuses.reconcile(&self.pane_manifest);
 
                 if self.event_stream.has_subscribers() {
                     // Convert pane manifest into EventStream's PaneInfo format
