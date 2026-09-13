@@ -278,11 +278,7 @@ impl ScratchpadManager {
     }
 
     /// Called on PaneUpdate to sync state and clean up
-    pub fn on_pane_update(
-        &mut self,
-        ctx: &ScratchpadContext,
-        orphaned_tabs: &HashSet<usize>,
-    ) -> Vec<ScratchpadCommand> {
+    pub fn on_pane_update(&mut self, ctx: &ScratchpadContext) -> Vec<ScratchpadCommand> {
         let mut commands = Vec::new();
 
         // Track focus changes that happen outside of our actions
@@ -291,10 +287,12 @@ impl ScratchpadManager {
         // Close exited scratchpads and clean up closed panes in a single pass
         commands.extend(self.cleanup_panes(ctx));
 
-        // Close scratchpads for orphaned tabs
-        commands.extend(self.close_orphaned_scratchpads(orphaned_tabs));
-
         commands
+    }
+
+    /// Called on TabUpdate to close scratchpads whose stable tab IDs disappeared.
+    pub fn on_tab_update(&mut self, closed_tabs: &HashSet<usize>) -> Vec<ScratchpadCommand> {
+        self.close_tab_scratchpads(closed_tabs)
     }
 
     fn handle_toggle(
@@ -797,11 +795,8 @@ impl ScratchpadManager {
         commands
     }
 
-    fn close_orphaned_scratchpads(
-        &mut self,
-        orphaned_tabs: &HashSet<usize>,
-    ) -> Vec<ScratchpadCommand> {
-        let orphaned_tab_panes: Vec<(String, usize, u32)> = self
+    fn close_tab_scratchpads(&mut self, closed_tabs: &HashSet<usize>) -> Vec<ScratchpadCommand> {
+        let closed_tab_panes: Vec<(String, usize, u32)> = self
             .panes
             .iter()
             .flat_map(|(name, inner)| {
@@ -809,11 +804,11 @@ impl ScratchpadManager {
                     .iter()
                     .map(move |(&tab_id, &pane_id)| (name.clone(), tab_id, pane_id))
             })
-            .filter(|(_, tab_id, _)| orphaned_tabs.contains(tab_id))
+            .filter(|(_, tab_id, _)| closed_tabs.contains(tab_id))
             .collect();
 
         let mut commands = Vec::new();
-        for (name, tab_id, pane_id) in orphaned_tab_panes {
+        for (name, tab_id, pane_id) in closed_tab_panes {
             commands.push(ScratchpadCommand::ClosePane { pane_id });
             if let Some(inner) = self.panes.get_mut(&name) {
                 inner.remove(&tab_id);
@@ -1161,10 +1156,8 @@ mod tests {
             [ScratchpadCommand::OpenFloating { .. }]
         ));
 
-        // A stale position-derived orphan set must never close another client's pane.
-        assert!(manager
-            .on_pane_update(&ctx, &HashSet::from([10]))
-            .is_empty());
+        // Closed-tab cleanup must never close another client's passive pane.
+        assert!(manager.on_tab_update(&HashSet::from([10])).is_empty());
         assert!(manager.focus_times.is_empty());
         assert_eq!(manager.focus_counter, 0);
         assert!(manager.reconcile_config(HashMap::new()).is_empty());
@@ -1609,7 +1602,7 @@ mod tests {
         manifest.insert(0, vec![exited_pane]);
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        let commands = manager.on_pane_update(&ctx, &HashSet::new());
+        let commands = manager.on_pane_update(&ctx);
 
         assert!(commands
             .iter()
@@ -1617,26 +1610,26 @@ mod tests {
     }
 
     #[test]
-    fn on_pane_update_closes_orphaned_tab_scratchpads() {
+    fn on_tab_update_closes_closed_tab_scratchpads() {
         let mut manager = ScratchpadManager::new(make_configs(&["term"]));
-
-        let mut manifest = HashMap::new();
-        manifest.insert(0, vec![make_floating_pane(42, true)]);
-        let mut positions = HashMap::new();
-        positions.insert(0, 0);
-        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
-
         manager.register_pane("term", 0, 42);
 
-        // Tab 0 is now orphaned
-        let mut orphaned = HashSet::new();
-        orphaned.insert(0);
-
-        let commands = manager.on_pane_update(&ctx, &orphaned);
+        let commands = manager.on_tab_update(&HashSet::from([0]));
 
         assert!(commands
             .iter()
             .any(|c| matches!(c, ScratchpadCommand::ClosePane { pane_id: 42 })));
+    }
+
+    #[test]
+    fn on_tab_update_preserves_scratchpad_when_an_earlier_tab_closes() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+        manager.register_pane("term", 12, 42);
+
+        let commands = manager.on_tab_update(&HashSet::from([11]));
+
+        assert!(commands.is_empty());
+        assert_eq!(manager.panes["term"][&12], 42);
     }
 
     #[test]
@@ -1781,7 +1774,7 @@ mod tests {
         let empty_manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
         let ctx = make_context(&empty_manifest, 0, Some(0), true, &positions);
 
-        let commands = manager.on_pane_update(&ctx, &HashSet::new());
+        let commands = manager.on_pane_update(&ctx);
 
         // No ClosePane command should be emitted (pane is already gone)
         assert!(
@@ -1816,7 +1809,7 @@ mod tests {
         manifest.insert(0, vec![held_pane]);
         let ctx = make_context(&manifest, 0, Some(0), true, &positions);
 
-        let commands = manager.on_pane_update(&ctx, &HashSet::new());
+        let commands = manager.on_pane_update(&ctx);
 
         assert!(
             commands

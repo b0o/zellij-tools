@@ -309,6 +309,15 @@ impl State {
         (live_tabs, live_panes)
     }
 
+    fn closed_tab_ids(&self, tab_infos: &[TabInfo]) -> HashSet<usize> {
+        let live_tab_ids: HashSet<usize> = tab_infos.iter().map(|tab| tab.tab_id).collect();
+        self.tab_id_to_position
+            .keys()
+            .filter(|tab_id| !live_tab_ids.contains(tab_id))
+            .copied()
+            .collect()
+    }
+
     fn with_scratchpad_registry<T>(
         &self,
         f: impl FnOnce(&mut ScratchpadRegistry, u32, u64) -> T,
@@ -940,22 +949,11 @@ impl ZellijPlugin for State {
                         .update_pane_state(&cheap_panes, self.current_tab_position);
                 }
 
-                // Detect orphaned tabs by comparing current tab_id set with pane manifest keys
-                // Tabs that exist in tab_id_to_position but not in pane_manifest are orphaned
-                let current_tab_positions: std::collections::HashSet<usize> =
-                    self.pane_manifest.keys().copied().collect();
-                let orphaned_tabs: std::collections::HashSet<usize> = self
-                    .tab_id_to_position
-                    .iter()
-                    .filter(|(_, pos)| !current_tab_positions.contains(pos))
-                    .map(|(tab_id, _)| *tab_id)
-                    .collect();
-
                 // Update scratchpad manager
                 if let Some(mut scratchpad) = self.scratchpad.take() {
                     scratchpad.clear_just_shown();
                     let ctx = self.build_scratchpad_context();
-                    let commands = scratchpad.on_pane_update(&ctx, &orphaned_tabs);
+                    let commands = scratchpad.on_pane_update(&ctx);
                     self.scratchpad = Some(scratchpad);
                     self.execute_scratchpad_commands(commands);
                 }
@@ -971,6 +969,7 @@ impl ZellijPlugin for State {
             }
             Event::TabUpdate(tab_infos) => {
                 self.has_tab_snapshot = true;
+                let closed_tab_ids = self.closed_tab_ids(&tab_infos);
                 if let Some(active_tab) = tab_infos.iter().find(|t| t.active) {
                     self.current_tab_position = active_tab.position;
                     self.are_floating_panes_visible = active_tab.are_floating_panes_visible;
@@ -1015,6 +1014,11 @@ impl ZellijPlugin for State {
                 }
 
                 self.tab_infos = tab_infos;
+                if let Some(mut scratchpad) = self.scratchpad.take() {
+                    let commands = scratchpad.on_tab_update(&closed_tab_ids);
+                    self.scratchpad = Some(scratchpad);
+                    self.execute_scratchpad_commands(commands);
+                }
                 self.publish_zjstatus(false);
             }
             Event::HostFolderChanged(_new_path) => {
@@ -1145,5 +1149,30 @@ impl ZellijPlugin for State {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tab(tab_id: usize, position: usize) -> TabInfo {
+        TabInfo {
+            tab_id,
+            position,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn closing_an_earlier_tab_only_reports_that_tab_as_closed() {
+        let state = State {
+            tab_id_to_position: HashMap::from([(10, 0), (11, 1), (12, 2)]),
+            ..Default::default()
+        };
+
+        let closed = state.closed_tab_ids(&[tab(10, 0), tab(12, 1)]);
+
+        assert_eq!(closed, HashSet::from([11]));
     }
 }
