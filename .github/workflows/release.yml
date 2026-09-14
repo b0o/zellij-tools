@@ -18,7 +18,7 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@v22
 
       - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@v8
+        uses: DeterminateSystems/magic-nix-cache-action@v15
 
       - name: Build plugin
         run: nix build .#default
