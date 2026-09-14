@@ -73,7 +73,12 @@
         rust = rustToolchain pkgs;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        src = craneLib.cleanCargoSource ./.;
+        src = lib.cleanSourceWith {
+          src = craneLib.path ./.;
+          filter = path: type:
+            craneLib.filterCargoSources path type
+            || lib.hasSuffix "/dev.kdl" path;
+        };
 
         nativeBuildInputs = [pkgs.pkg-config];
         buildInputs = [pkgs.openssl];
@@ -131,6 +136,22 @@
             cargoArtifacts = cliCargoArtifacts;
           });
 
+        testArgs =
+          commonArgs
+          // {
+            pname = "${pluginPackage}-workspace-tests";
+            version = cargoToml.package.version;
+            cargoExtraArgs = "--locked";
+          };
+
+        testCargoArtifacts = craneLib.buildDepsOnly testArgs;
+
+        workspaceTests = craneLib.cargoTest (testArgs
+          // {
+            cargoArtifacts = testCargoArtifacts;
+            cargoTestExtraArgs = "--workspace";
+          });
+
         pluginClippy = craneLib.cargoClippy (pluginArgs
           // {
             cargoArtifacts = pluginCargoArtifacts;
@@ -150,7 +171,7 @@
         };
 
         checks = {
-          inherit plugin cli pluginClippy cliClippy;
+          inherit plugin cli workspaceTests pluginClippy cliClippy;
         };
 
         appRuntimeInputs = [
@@ -255,11 +276,11 @@
           };
 
           test = {
-            description = "Run library tests";
+            description = "Run workspace tests";
             command =
               # sh
               ''
-                cargo test --lib
+                cargo test --locked --workspace
               '';
           };
 
