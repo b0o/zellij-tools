@@ -33,6 +33,6 @@ jobs:
           components: clippy
 
       - name: Run Clippy
-        uses: clechasseur/rs-clippy-check@v6.0.4
+        uses: clechasseur/rs-clippy-check@v6.0.7
         with:
           args: --all-features --target=wasm32-wasip1
