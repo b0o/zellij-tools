@@ -19,6 +19,7 @@ pub use registry::{
 };
 pub use status::{ScratchpadDisplayState, ScratchpadStatusItem, ScratchpadStatusSnapshot};
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use zellij_tile::prelude::{CommandToRun, PaneInfo};
 
@@ -50,8 +51,10 @@ pub enum ScratchpadCommand {
 }
 
 /// Context needed by ScratchpadManager to make decisions
+#[derive(Clone)]
 pub struct ScratchpadContext<'a> {
-    pub pane_manifest: &'a HashMap<usize, Vec<PaneInfo>>,
+    /// Complete pane metadata keyed by stable native tab ID.
+    pub panes_by_tab_id: Cow<'a, HashMap<usize, Vec<PaneInfo>>>,
     pub current_tab_position: usize,
     pub current_tab_id: Option<usize>,
     pub are_floating_panes_visible: bool,
@@ -295,6 +298,20 @@ impl ScratchpadManager {
         self.close_tab_scratchpads(closed_tabs)
     }
 
+    /// Close scratchpads on removed tabs unless their pane moved to a live tab.
+    pub fn on_tab_update_with_context(
+        &mut self,
+        closed_tabs: &HashSet<usize>,
+        ctx: &ScratchpadContext,
+    ) -> Vec<ScratchpadCommand> {
+        self.close_tab_scratchpads_with_context(closed_tabs, Some(ctx))
+    }
+
+    /// Reconcile stable pane ownership after either event stream updates topology.
+    pub fn on_topology_update(&mut self, ctx: &ScratchpadContext) -> Vec<ScratchpadCommand> {
+        self.cleanup_panes(ctx)
+    }
+
     fn handle_toggle(
         &mut self,
         name: Option<String>,
@@ -439,19 +456,16 @@ impl ScratchpadManager {
     /// snapshots are available. Pane liveness ignores positions to tolerate reorder lag.
     /// Local action ownership and focus history are never changed.
     pub fn prune_passive_observations(&mut self, ctx: &ScratchpadContext<'_>) {
-        let live_panes: HashSet<u32> = ctx
-            .pane_manifest
-            .values()
-            .flatten()
-            .filter(|pane| !pane.is_plugin && !pane.exited && !pane.is_held)
-            .map(|pane| pane.id)
-            .collect();
         self.passive_panes.retain(|name, panes| {
             if !self.configs.contains_key(name) {
                 return false;
             }
             panes.retain(|tab_id, pane_id| {
-                ctx.tab_id_to_position.contains_key(tab_id) && live_panes.contains(pane_id)
+                ctx.panes_by_tab_id.get(tab_id).is_some_and(|panes| {
+                    panes.iter().any(|pane| {
+                        !pane.is_plugin && pane.id == *pane_id && !pane.exited && !pane.is_held
+                    })
+                })
             });
             !panes.is_empty()
         });
@@ -473,13 +487,13 @@ impl ScratchpadManager {
         ctx: &ScratchpadContext<'_>,
     ) {
         let observed: HashSet<(usize, u32)> = ctx
-            .pane_manifest
+            .panes_by_tab_id
             .iter()
-            .flat_map(|(&position, panes)| {
+            .flat_map(|(&tab_id, panes)| {
                 panes
                     .iter()
                     .filter(|pane| !pane.is_plugin && !pane.exited && !pane.is_held)
-                    .map(move |pane| (position, pane.id))
+                    .map(move |pane| (tab_id, pane.id))
             })
             .collect();
         let mut known_panes: HashSet<u32> = self
@@ -498,10 +512,7 @@ impl ScratchpadManager {
                     .panes
                     .get(&record.name)
                     .is_some_and(|panes| panes.contains_key(&record.tab_id))
-                || !ctx
-                    .tab_id_to_position
-                    .get(&record.tab_id)
-                    .is_some_and(|&position| observed.contains(&(position, pane_id)))
+                || !observed.contains(&(record.tab_id, pane_id))
                 || !known_panes.insert(pane_id)
             {
                 continue;
@@ -517,7 +528,7 @@ impl ScratchpadManager {
             let tab_ctx = ScratchpadContext {
                 current_tab_id: Some(tab_id),
                 current_tab_position: position,
-                ..*ctx
+                ..ctx.clone()
             };
             let Some(name) = view.get_focused_scratchpad(&tab_ctx) else {
                 continue;
@@ -637,10 +648,10 @@ impl ScratchpadManager {
     }
 
     fn get_hidden_floating_pane_ids(&self, ctx: &ScratchpadContext) -> HashSet<u32> {
-        ctx.pane_manifest
+        ctx.panes_by_tab_id
             .values()
             .flatten()
-            .filter(|p| p.is_floating && p.is_suppressed)
+            .filter(|p| !p.is_plugin && p.is_floating && p.is_suppressed)
             .map(|p| p.id)
             .collect()
     }
@@ -656,8 +667,13 @@ impl ScratchpadManager {
         // separately-delivered tab-level `are_floating_panes_visible` flag.
         // That flag arrives via a different event (TabUpdate) and can be stale
         // relative to the manifest, which produced wrong toggle decisions.
-        ctx.pane_manifest.values().flatten().any(|p| {
-            p.id == pane_id && p.is_floating && !p.is_suppressed && !p.exited && !p.is_held
+        ctx.panes_by_tab_id.values().flatten().any(|p| {
+            !p.is_plugin
+                && p.id == pane_id
+                && p.is_floating
+                && !p.is_suppressed
+                && !p.exited
+                && !p.is_held
         })
     }
 
@@ -674,10 +690,10 @@ impl ScratchpadManager {
         // layer is visible (hiding it unfocuses all floating panes), so the
         // manifest alone is a coherent signal. We deliberately avoid the stale
         // tab-level `are_floating_panes_visible` flag here.
-        ctx.pane_manifest
+        ctx.panes_by_tab_id
             .values()
             .flatten()
-            .find(|p| p.id == pane_id && p.is_floating)
+            .find(|p| !p.is_plugin && p.id == pane_id && p.is_floating)
             .map(|p| p.is_focused)
             .unwrap_or(false)
     }
@@ -697,8 +713,8 @@ impl ScratchpadManager {
         // A focused floating pane in the manifest already implies the floating
         // layer is visible. Other tabs can retain focused panes in the manifest.
         let focused_pane_id = ctx
-            .pane_manifest
-            .get(&ctx.current_tab_position)?
+            .panes_by_tab_id
+            .get(&tab_id)?
             .iter()
             .find(|p| {
                 !p.is_plugin
@@ -740,15 +756,19 @@ impl ScratchpadManager {
     }
 
     /// Single-pass cleanup: close exited/held panes and remove panes missing from manifest.
-    /// Builds one HashSet of all pane IDs and one of exited/held IDs from a single scan.
+    /// Builds one HashSet of all terminal pane IDs and one of exited/held IDs from a single scan.
     fn cleanup_panes(&mut self, ctx: &ScratchpadContext) -> Vec<ScratchpadCommand> {
         let mut all_pane_ids: HashSet<u32> = HashSet::new();
         let mut exited_pane_ids: HashSet<u32> = HashSet::new();
 
-        for pane in ctx.pane_manifest.values().flatten() {
-            all_pane_ids.insert(pane.id);
-            if pane.exited || pane.is_held {
-                exited_pane_ids.insert(pane.id);
+        let mut live_pane_tabs: HashSet<(usize, u32)> = HashSet::new();
+        for (&tab_id, panes) in ctx.panes_by_tab_id.iter() {
+            for pane in panes.iter().filter(|pane| !pane.is_plugin) {
+                all_pane_ids.insert(pane.id);
+                live_pane_tabs.insert((tab_id, pane.id));
+                if pane.exited || pane.is_held {
+                    exited_pane_ids.insert(pane.id);
+                }
             }
         }
 
@@ -761,9 +781,11 @@ impl ScratchpadManager {
                     .iter()
                     .map(move |(&tab_id, &pane_id)| (name.clone(), tab_id, pane_id))
             })
-            .filter(|(_, _, pane_id)| {
+            .filter(|(_, tab_id, pane_id)| {
                 // Remove if exited/held OR not in manifest at all
-                exited_pane_ids.contains(pane_id) || !all_pane_ids.contains(pane_id)
+                exited_pane_ids.contains(pane_id)
+                    || !all_pane_ids.contains(pane_id)
+                    || !live_pane_tabs.contains(&(*tab_id, *pane_id))
             })
             .collect();
 
@@ -796,6 +818,14 @@ impl ScratchpadManager {
     }
 
     fn close_tab_scratchpads(&mut self, closed_tabs: &HashSet<usize>) -> Vec<ScratchpadCommand> {
+        self.close_tab_scratchpads_with_context(closed_tabs, None)
+    }
+
+    fn close_tab_scratchpads_with_context(
+        &mut self,
+        closed_tabs: &HashSet<usize>,
+        ctx: Option<&ScratchpadContext>,
+    ) -> Vec<ScratchpadCommand> {
         let closed_tab_panes: Vec<(String, usize, u32)> = self
             .panes
             .iter()
@@ -809,7 +839,17 @@ impl ScratchpadManager {
 
         let mut commands = Vec::new();
         for (name, tab_id, pane_id) in closed_tab_panes {
-            commands.push(ScratchpadCommand::ClosePane { pane_id });
+            let moved_to_live_tab = ctx.is_some_and(|ctx| {
+                ctx.panes_by_tab_id.iter().any(|(&live_tab_id, panes)| {
+                    live_tab_id != tab_id
+                        && panes
+                            .iter()
+                            .any(|pane| !pane.is_plugin && pane.id == pane_id)
+                })
+            });
+            if !moved_to_live_tab {
+                commands.push(ScratchpadCommand::ClosePane { pane_id });
+            }
             if let Some(inner) = self.panes.get_mut(&name) {
                 inner.remove(&tab_id);
                 if inner.is_empty() {
@@ -878,8 +918,20 @@ mod tests {
         floating_visible: bool,
         tab_id_to_position: &'a HashMap<usize, usize>,
     ) -> ScratchpadContext<'a> {
+        let position_to_tab_id: HashMap<usize, usize> = tab_id_to_position
+            .iter()
+            .map(|(&tab_id, &position)| (position, tab_id))
+            .collect();
+        let panes_by_tab_id = pane_manifest
+            .iter()
+            .filter_map(|(&position, panes)| {
+                position_to_tab_id
+                    .get(&position)
+                    .map(|&tab_id| (tab_id, panes.clone()))
+            })
+            .collect();
         ScratchpadContext {
-            pane_manifest,
+            panes_by_tab_id: Cow::Owned(panes_by_tab_id),
             current_tab_position: current_tab,
             current_tab_id: tab_id,
             are_floating_panes_visible: floating_visible,
@@ -941,7 +993,7 @@ mod tests {
             (12, ("notes".to_string(), 44, 0)),
         ]);
         let manifest = HashMap::from([(
-            0,
+            7,
             vec![
                 make_floating_pane(42, false),
                 make_floating_pane(43, false),
@@ -1633,6 +1685,28 @@ mod tests {
     }
 
     #[test]
+    fn on_tab_update_detaches_scratchpad_moved_out_of_closed_tab() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+        manager.register_pane("term", 10, 42);
+        let panes_by_tab_id = HashMap::from([(11, vec![make_floating_pane(42, false)])]);
+        let positions = HashMap::from([(11, 0)]);
+        let ctx = ScratchpadContext {
+            panes_by_tab_id: Cow::Borrowed(&panes_by_tab_id),
+            current_tab_position: 0,
+            current_tab_id: Some(11),
+            are_floating_panes_visible: true,
+            tab_id_to_position: &positions,
+            viewport_cols: 200,
+            viewport_rows: 50,
+        };
+
+        let commands = manager.on_tab_update_with_context(&HashSet::from([10]), &ctx);
+
+        assert!(commands.is_empty());
+        assert!(manager.panes.is_empty());
+    }
+
+    #[test]
     fn persisted_state_roundtrip() {
         let mut manager = ScratchpadManager::new(make_configs(&["term", "htop"]));
 
@@ -1822,6 +1896,142 @@ mod tests {
         assert!(
             manager.get_pane("term", &ctx).is_none(),
             "Held pane should be removed from tracking"
+        );
+    }
+
+    #[test]
+    fn on_pane_update_drops_scratchpad_moved_to_another_native_tab() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+        manager.register_pane("term", 10, 42);
+        let panes_by_tab_id = HashMap::from([(11, vec![make_floating_pane(42, false)])]);
+        let positions = HashMap::from([(10, 0), (11, 1)]);
+        let ctx = ScratchpadContext {
+            panes_by_tab_id: Cow::Borrowed(&panes_by_tab_id),
+            current_tab_position: 1,
+            current_tab_id: Some(11),
+            are_floating_panes_visible: true,
+            tab_id_to_position: &positions,
+            viewport_cols: 200,
+            viewport_rows: 50,
+        };
+
+        assert!(manager.on_pane_update(&ctx).is_empty());
+        assert!(manager.panes.is_empty());
+    }
+
+    #[test]
+    fn cleanup_ignores_plugin_with_same_numeric_id_as_terminal_scratchpad() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+        manager.register_pane("term", 0, 42);
+
+        let manifest = HashMap::from([(
+            0,
+            vec![PaneInfo {
+                id: 42,
+                is_plugin: true,
+                ..Default::default()
+            }],
+        )]);
+        let positions = HashMap::from([(0, 0)]);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        assert!(manager.on_pane_update(&ctx).is_empty());
+        assert!(manager.get_pane("term", &ctx).is_none());
+    }
+
+    #[test]
+    fn visibility_ignores_plugin_with_same_numeric_id_as_terminal_scratchpad() {
+        let mut manager = ScratchpadManager::new(make_configs(&["term"]));
+        manager.register_pane("term", 0, 42);
+        manager.clear_just_shown();
+
+        let manifest = HashMap::from([(
+            0,
+            vec![PaneInfo {
+                id: 42,
+                is_plugin: true,
+                is_floating: true,
+                is_focused: true,
+                ..Default::default()
+            }],
+        )]);
+        let positions = HashMap::from([(0, 0)]);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        assert!(!manager.is_visible("term", &ctx));
+        assert!(!manager.is_focused("term", &ctx));
+        assert!(matches!(
+            manager
+                .handle_action(
+                    ScratchpadAction::Toggle {
+                        name: Some("term".to_string()),
+                        target: Default::default(),
+                    },
+                    &ctx,
+                )
+                .as_slice(),
+            [ScratchpadCommand::ShowPane { pane_id: 42, .. }]
+        ));
+    }
+
+    #[test]
+    fn hidden_rehide_ignores_plugin_with_same_numeric_id_as_terminal_scratchpad() {
+        let mut manager = ScratchpadManager::new(make_configs(&["current", "target"]));
+        manager.register_pane("current", 0, 42);
+        manager.register_pane("target", 0, 99);
+        manager.clear_just_shown();
+
+        let manifest = HashMap::from([(
+            0,
+            vec![
+                make_floating_pane(42, false),
+                PaneInfo {
+                    id: 42,
+                    is_plugin: true,
+                    is_floating: true,
+                    is_suppressed: true,
+                    ..Default::default()
+                },
+                PaneInfo {
+                    id: 7,
+                    is_floating: true,
+                    is_suppressed: true,
+                    ..Default::default()
+                },
+                PaneInfo {
+                    id: 99,
+                    is_floating: true,
+                    is_suppressed: true,
+                    ..Default::default()
+                },
+            ],
+        )]);
+        let positions = HashMap::from([(0, 0)]);
+        let ctx = make_context(&manifest, 0, Some(0), true, &positions);
+
+        let commands = manager.handle_action(
+            ScratchpadAction::Show {
+                name: "target".to_string(),
+                target: Default::default(),
+            },
+            &ctx,
+        );
+
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, ScratchpadCommand::ShowPane { pane_id: 99, .. })));
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, ScratchpadCommand::HidePane { pane_id: 7 })));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, ScratchpadCommand::HidePane { pane_id: 42 })));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ScratchpadCommand::HidePane { .. }))
+                .count(),
+            1
         );
     }
 

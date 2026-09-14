@@ -64,14 +64,14 @@ pub struct PaneNode {
 /// Build a session tree from the current plugin state.
 pub fn build_tree(
     tab_infos: &[zellij_tile::prelude::TabInfo],
-    pane_manifest: &HashMap<usize, Vec<zellij_tile::prelude::PaneInfo>>,
+    panes_by_tab_id: &HashMap<usize, Vec<zellij_tile::prelude::PaneInfo>>,
     tab_id_filter: Option<usize>,
 ) -> SessionTree {
     let mut tabs: Vec<TabNode> = tab_infos
         .iter()
         .filter(|tab| tab_id_filter.is_none_or(|tab_id| tab.tab_id == tab_id))
         .map(|tab| {
-            let panes = pane_manifest.get(&tab.position);
+            let panes = panes_by_tab_id.get(&tab.tab_id);
 
             let mut tiled_panes = Vec::new();
             let mut floating_panes = Vec::new();
@@ -239,5 +239,33 @@ mod tests {
 
         assert_eq!(tree.tabs.len(), 1);
         assert_eq!(tree.tabs[0].tab_id, 42);
+    }
+
+    #[test]
+    fn build_tree_uses_native_tab_id_instead_of_position() {
+        let tabs = vec![tab_info(7, 1), tab_info(42, 0)];
+        let panes = HashMap::from([
+            (
+                7,
+                vec![zellij_tile::prelude::PaneInfo {
+                    id: 70,
+                    ..Default::default()
+                }],
+            ),
+            (
+                42,
+                vec![zellij_tile::prelude::PaneInfo {
+                    id: 420,
+                    ..Default::default()
+                }],
+            ),
+        ]);
+
+        let tree = build_tree(&tabs, &panes, None);
+
+        assert_eq!(tree.tabs[0].tab_id, 42);
+        assert_eq!(tree.tabs[0].tiled_panes[0].id, 420);
+        assert_eq!(tree.tabs[1].tab_id, 7);
+        assert_eq!(tree.tabs[1].tiled_panes[0].id, 70);
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
-use zellij_tile::prelude::PaneInfo;
+use zellij_tile::prelude::{PaneId, PaneInfo};
 
 use super::ScratchpadManager;
 
@@ -87,14 +87,18 @@ impl ScratchpadManager {
     pub fn list(
         &self,
         query: &ScratchpadListQuery,
-        pane_manifest: &HashMap<usize, Vec<PaneInfo>>,
+        panes_by_tab_id: &HashMap<usize, Vec<PaneInfo>>,
         tab_id_to_position: &HashMap<usize, usize>,
     ) -> Vec<ScratchpadListEntry> {
-        // Build a lookup: pane_id -> &PaneInfo (across all tabs)
-        let pane_lookup: HashMap<u32, &PaneInfo> = pane_manifest
-            .values()
-            .flatten()
-            .map(|p| (p.id, p))
+        // Scratchpad IDs are terminal IDs; keep plugin IDs distinct in mixed manifests.
+        let pane_lookup: HashMap<(usize, PaneId), &PaneInfo> = panes_by_tab_id
+            .iter()
+            .flat_map(|(&tab_id, panes)| {
+                panes
+                    .iter()
+                    .filter(|pane| !pane.is_plugin)
+                    .map(move |pane| ((tab_id, PaneId::Terminal(pane.id)), pane))
+            })
             .collect();
 
         // Build reverse lookup: tab_id -> tab_position
@@ -170,7 +174,7 @@ impl ScratchpadManager {
         name: &str,
         tab_filter: Option<usize>,
         full: bool,
-        pane_lookup: &HashMap<u32, &PaneInfo>,
+        pane_lookup: &HashMap<(usize, PaneId), &PaneInfo>,
         position_lookup: &HashMap<usize, usize>,
     ) -> Vec<ScratchpadInstanceInfo> {
         let Some(tab_panes) = self.panes.get(name) else {
@@ -181,7 +185,7 @@ impl ScratchpadManager {
             .iter()
             .filter(|(&tab_id, _)| tab_filter.is_none() || tab_filter == Some(tab_id))
             .map(|(&tab_id, &pane_id)| {
-                let pane_info = pane_lookup.get(&pane_id);
+                let pane_info = pane_lookup.get(&(tab_id, PaneId::Terminal(pane_id)));
                 let visible = pane_info
                     .map(|p| p.is_floating && !p.is_suppressed && !p.exited && !p.is_held)
                     .unwrap_or(false);
@@ -207,7 +211,7 @@ impl ScratchpadManager {
         _orphaned_tabs: &std::collections::HashSet<usize>,
         tab_filter: Option<usize>,
         full: bool,
-        pane_lookup: &HashMap<u32, &PaneInfo>,
+        pane_lookup: &HashMap<(usize, PaneId), &PaneInfo>,
         position_lookup: &HashMap<usize, usize>,
     ) -> Vec<ScratchpadInstanceInfo> {
         // Orphaned scratchpads still have entries in self.panes
@@ -290,7 +294,7 @@ mod tests {
             .insert(1, 42);
 
         let mut manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
-        manifest.insert(0, vec![make_pane_info(42, true, false)]);
+        manifest.insert(1, vec![make_pane_info(42, true, false)]);
         let positions = HashMap::from([(1_usize, 0_usize)]);
 
         let query = ScratchpadListQuery {
@@ -318,7 +322,7 @@ mod tests {
             .insert(1, 42);
 
         let mut manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
-        manifest.insert(0, vec![make_pane_info(42, true, true)]); // suppressed
+        manifest.insert(1, vec![make_pane_info(42, true, true)]); // suppressed
         let positions = HashMap::from([(1_usize, 0_usize)]);
 
         let query = ScratchpadListQuery {
@@ -365,8 +369,8 @@ mod tests {
             .insert(2, 99);
 
         let mut manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
-        manifest.insert(0, vec![make_pane_info(42, true, false)]);
-        manifest.insert(1, vec![make_pane_info(99, true, false)]);
+        manifest.insert(1, vec![make_pane_info(42, true, false)]);
+        manifest.insert(2, vec![make_pane_info(99, true, false)]);
         let positions = HashMap::from([(1_usize, 0_usize), (2_usize, 1_usize)]);
 
         let query = ScratchpadListQuery {
@@ -392,7 +396,7 @@ mod tests {
         let mut pane = make_pane_info(42, true, false);
         pane.title = "my terminal".to_string();
         let mut manifest: HashMap<usize, Vec<PaneInfo>> = HashMap::new();
-        manifest.insert(0, vec![pane]);
+        manifest.insert(1, vec![pane]);
         let positions = HashMap::from([(1_usize, 0_usize)]);
 
         let query = ScratchpadListQuery {
@@ -404,6 +408,80 @@ mod tests {
         let pane_node = entries[0].instances[0].pane.as_ref().unwrap();
         assert_eq!(pane_node.title, "my terminal");
         assert!(pane_node.is_floating);
+    }
+
+    #[test]
+    fn list_full_uses_terminal_metadata_when_plugin_shares_numeric_id() {
+        let configs = HashMap::from([("term".to_string(), make_config("nu"))]);
+        let mut manager = ScratchpadManager::new(configs);
+        manager
+            .panes
+            .entry("term".to_string())
+            .or_default()
+            .insert(1, 42);
+
+        let terminal = PaneInfo {
+            id: 42,
+            is_focused: true,
+            is_fullscreen: true,
+            is_floating: true,
+            title: "terminal metadata".to_string(),
+            exit_status: Some(7),
+            pane_x: 1,
+            pane_y: 2,
+            pane_rows: 3,
+            pane_columns: 4,
+            terminal_command: Some("bash -l".to_string()),
+            is_selectable: true,
+            ..Default::default()
+        };
+        let plugin = PaneInfo {
+            id: 42,
+            is_plugin: true,
+            is_focused: false,
+            is_fullscreen: false,
+            is_floating: false,
+            is_suppressed: true,
+            title: "plugin metadata".to_string(),
+            exited: true,
+            exit_status: Some(99),
+            is_held: true,
+            pane_x: 10,
+            pane_y: 20,
+            pane_rows: 30,
+            pane_columns: 40,
+            plugin_url: Some("zellij:plugin".to_string()),
+            is_selectable: false,
+            ..Default::default()
+        };
+        let manifest = HashMap::from([(1, vec![terminal, plugin])]);
+        let positions = HashMap::from([(1_usize, 0_usize)]);
+        let query = ScratchpadListQuery {
+            names: vec![],
+            tab_id: None,
+            full: true,
+        };
+
+        let entries = manager.list(&query, &manifest, &positions);
+        let instance = &entries[0].instances[0];
+        let pane = instance.pane.as_ref().unwrap();
+        assert!(instance.visible);
+        assert!(!pane.is_plugin);
+        assert!(pane.is_focused);
+        assert!(pane.is_fullscreen);
+        assert!(pane.is_floating);
+        assert!(!pane.is_suppressed);
+        assert_eq!(pane.title, "terminal metadata");
+        assert!(!pane.exited);
+        assert_eq!(pane.exit_status, Some(7));
+        assert!(!pane.is_held);
+        assert_eq!(pane.pane_x, 1);
+        assert_eq!(pane.pane_y, 2);
+        assert_eq!(pane.pane_rows, 3);
+        assert_eq!(pane.pane_columns, 4);
+        assert_eq!(pane.terminal_command.as_deref(), Some("bash -l"));
+        assert_eq!(pane.plugin_url, None);
+        assert!(pane.is_selectable);
     }
 
     #[test]

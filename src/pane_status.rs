@@ -86,12 +86,12 @@ impl PaneStatuses {
 
     /// Read current metadata without pruning state during partial event updates.
     ///
-    /// Manifest keys are tab positions, not tab IDs. Panes without a status and
-    /// manifest positions without a matching tab are omitted. Within each tab,
+    /// Pane groups are keyed by stable native tab IDs. Panes without a status and
+    /// groups without a matching tab are omitted. Within each tab,
     /// terminals precede plugins, each ordered by numeric pane ID.
     pub fn snapshot(
         &self,
-        manifest: &HashMap<usize, Vec<PaneInfo>>,
+        panes_by_tab_id: &HashMap<usize, Vec<PaneInfo>>,
         tabs: &[TabInfo],
     ) -> PaneStatusSnapshot {
         let mut snapshot = PaneStatusSnapshot {
@@ -99,8 +99,8 @@ impl PaneStatuses {
             ..Default::default()
         };
         for tab in tabs {
-            let mut items: Vec<_> = manifest
-                .get(&tab.position)
+            let mut items: Vec<_> = panes_by_tab_id
+                .get(&tab.tab_id)
                 .into_iter()
                 .flatten()
                 .filter_map(|pane| {
@@ -245,7 +245,7 @@ mod tests {
     }
 
     fn manifest() -> HashMap<usize, Vec<PaneInfo>> {
-        HashMap::from([(0, vec![pane(2, false), pane(2, true)])])
+        HashMap::from([(42, vec![pane(2, false), pane(2, true)])])
     }
 
     #[test]
@@ -380,7 +380,7 @@ mod tests {
         ] {
             for format in [None, Some("plain"), Some("zjstatus")] {
                 let mut manifest = manifest();
-                manifest.get_mut(&0).unwrap()[0].title = text.into();
+                manifest.get_mut(&42).unwrap()[0].title = text.into();
                 let mut statuses = PaneStatuses::default();
                 statuses
                     .set(&["terminal_2", text], format, &manifest)
@@ -565,14 +565,14 @@ mod tests {
         statuses
             .set(&["plugin_2", "plugin"], None, &manifest)
             .unwrap();
-        let mut moved = manifest.get_mut(&0).unwrap().remove(0);
+        let mut moved = manifest.get_mut(&42).unwrap().remove(0);
         moved.is_focused = true;
         moved.is_suppressed = true;
         moved.is_floating = true;
         moved.exited = true;
         moved.is_held = true;
         moved.title = "new\n#[bold]title".into();
-        manifest.insert(1, vec![moved]);
+        manifest.insert(9, vec![moved]);
         statuses.reconcile(&manifest);
         let tabs = [tab(42, 0, false), tab(9, 1, true), tab(77, 2, false)];
         let snapshot = statuses.snapshot(&manifest, &tabs);
@@ -586,14 +586,14 @@ mod tests {
         assert!(item.is_focused);
         assert!(snapshot.tabs[&77].is_empty());
 
-        let reordered = HashMap::from([(0, manifest[&1].clone()), (1, manifest[&0].clone())]);
+        let reordered = HashMap::from([(9, manifest[&9].clone()), (42, manifest[&42].clone())]);
         let tabs = [tab(9, 0, false), tab(42, 1, true)];
         let snapshot = statuses.snapshot(&reordered, &tabs);
         assert_eq!(snapshot.current_tab_id, Some(42));
         assert_eq!(snapshot.tabs[&9][0].pane_id, PaneId::Terminal(2));
         assert_eq!(snapshot.tabs[&42][0].pane_id, PaneId::Plugin(2));
 
-        let closed = HashMap::from([(1, vec![pane(2, true)])]);
+        let closed = HashMap::from([(42, vec![pane(2, true)])]);
         statuses.reconcile(&closed);
         assert_eq!(statuses.statuses.len(), 1);
         assert!(statuses.snapshot(&closed, &tabs).tabs[&9].is_empty());
@@ -627,7 +627,7 @@ mod tests {
             pane(2, false),
             pane(1, false),
         ];
-        let mut manifest = HashMap::from([(4, panes)]);
+        let mut manifest = HashMap::from([(99, panes)]);
         let mut statuses = PaneStatuses::default();
         for id in ["plugin_10", "terminal_10", "plugin_2", "terminal_2"] {
             statuses.set(&[id, "x"], None, &manifest).unwrap();
@@ -644,7 +644,28 @@ mod tests {
                     PaneId::Plugin(10)
                 ]
             );
-            manifest.get_mut(&4).unwrap().rotate_left(1);
+            manifest.get_mut(&99).unwrap().rotate_left(1);
         }
+    }
+
+    #[test]
+    fn snapshot_keeps_status_with_native_tab_across_position_reorder() {
+        let raw = HashMap::from([(
+            0,
+            vec![PaneInfo {
+                id: 7,
+                ..Default::default()
+            }],
+        )]);
+        let mut statuses = PaneStatuses::default();
+        statuses
+            .set(&["terminal_7", "building"], None, &raw)
+            .unwrap();
+        let panes_by_tab_id = HashMap::from([(42, raw[&0].clone())]);
+
+        let snapshot = statuses.snapshot(&panes_by_tab_id, &[tab(9, 0, false), tab(42, 1, true)]);
+
+        assert!(snapshot.tabs[&9].is_empty());
+        assert_eq!(snapshot.tabs[&42][0].status, "building");
     }
 }

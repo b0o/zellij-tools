@@ -23,17 +23,17 @@ use crate::zjstatus::{
 /// publication plus a delayed replay for receivers that are still initializing.
 pub fn update_zjstatus_plugin_panes(
     previous: &mut HashSet<(usize, u32)>,
-    pane_manifest: &HashMap<usize, Vec<PaneInfo>>,
+    panes_by_tab_id: &HashMap<usize, Vec<PaneInfo>>,
 ) -> bool {
-    let panes = pane_manifest
+    let panes = panes_by_tab_id
         .iter()
-        .flat_map(|(&tab_position, panes)| {
+        .flat_map(|(&tab_id, panes)| {
             panes.iter().filter_map(move |pane| {
                 let is_zjstatus = pane
                     .plugin_url
                     .as_deref()
                     .is_some_and(|url| url == "zjstatus" || url.contains("zjstatus"));
-                (pane.is_plugin && is_zjstatus).then_some((tab_position, pane.id))
+                (pane.is_plugin && is_zjstatus).then_some((tab_id, pane.id))
             })
         })
         .collect();
@@ -344,6 +344,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn receiver_discovery_is_stable_across_tab_position_reorder() {
+        let mut known = HashSet::new();
+        let panes = HashMap::from([(42, vec![receiver(1)]), (57, vec![receiver(2)])]);
+
+        assert!(update_zjstatus_plugin_panes(&mut known, &panes));
+        assert!(!update_zjstatus_plugin_panes(
+            &mut known,
+            &HashMap::from([(57, vec![receiver(2)]), (42, vec![receiver(1)])]),
+        ));
+        assert_eq!(known, HashSet::from([(42, 1), (57, 2)]));
+    }
+
     fn pane_statuses() -> PaneStatusSnapshot {
         PaneStatusSnapshot {
             current_tab_id: Some(42),
@@ -480,7 +493,7 @@ mod tests {
             },
         ];
         let mut manifest = HashMap::from([(
-            0,
+            42,
             vec![PaneInfo {
                 id: 7,
                 ..Default::default()
@@ -498,8 +511,8 @@ mod tests {
             &statuses.snapshot(&manifest, &tab_info),
             false,
         );
-        let moved = manifest.remove(&0).unwrap();
-        manifest.insert(1, moved);
+        let moved = manifest.remove(&42).unwrap();
+        manifest.insert(57, moved);
         statuses.reconcile(&manifest);
         let moved = statuses.snapshot(&manifest, &tab_info);
         let rendered = render_pane_status(

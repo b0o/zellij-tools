@@ -4,6 +4,7 @@ pub mod focus;
 pub mod message;
 pub mod pane_status;
 pub mod scratchpad;
+pub mod topology;
 pub mod tree;
 pub mod zjstatus;
 pub mod zjstatus_runtime;

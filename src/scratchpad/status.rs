@@ -84,7 +84,7 @@ impl ScratchpadManager {
                 let tab_ctx = ScratchpadContext {
                     current_tab_id: Some(tab_id),
                     current_tab_position: tab_position,
-                    ..*ctx
+                    ..ctx.clone()
                 };
                 let mru = view
                     .get_focused_scratchpad(&tab_ctx)
@@ -287,8 +287,7 @@ impl ScratchpadManager {
         pane_lookup: &HashMap<(usize, u32), PaneStatus>,
     ) -> Option<LiveScratchpadInstance> {
         let tab_position = ctx.tab_id_to_position.get(&tab_id).copied();
-        let pane =
-            tab_position.and_then(|position| pane_lookup.get(&(position, pane_id)).copied())?;
+        let pane = pane_lookup.get(&(tab_id, pane_id)).copied()?;
 
         if pane.exited || pane.is_held {
             return None;
@@ -347,12 +346,12 @@ impl ScratchpadStatusItem {
 }
 
 fn build_pane_lookup(ctx: &ScratchpadContext<'_>) -> HashMap<(usize, u32), PaneStatus> {
-    ctx.pane_manifest
+    ctx.panes_by_tab_id
         .iter()
-        .flat_map(|(&tab_position, panes)| {
+        .flat_map(|(&tab_id, panes)| {
             panes.iter().filter_map(move |pane| {
                 (!pane.is_plugin).then_some((
-                    (tab_position, pane.id),
+                    (tab_id, pane.id),
                     PaneStatus {
                         is_floating: pane.is_floating,
                         is_suppressed: pane.is_suppressed,
@@ -404,8 +403,20 @@ mod tests {
         pane_manifest: &'a HashMap<usize, Vec<PaneInfo>>,
         tab_id_to_position: &'a HashMap<usize, usize>,
     ) -> ScratchpadContext<'a> {
+        let position_to_tab_id: HashMap<usize, usize> = tab_id_to_position
+            .iter()
+            .map(|(&tab_id, &position)| (position, tab_id))
+            .collect();
+        let panes_by_tab_id = pane_manifest
+            .iter()
+            .filter_map(|(&position, panes)| {
+                position_to_tab_id
+                    .get(&position)
+                    .map(|&tab_id| (tab_id, panes.clone()))
+            })
+            .collect();
         ScratchpadContext {
-            pane_manifest,
+            panes_by_tab_id: std::borrow::Cow::Owned(panes_by_tab_id),
             current_tab_position: 0,
             current_tab_id: Some(10),
             are_floating_panes_visible: true,

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ use zellij_tools::scratchpad::{
     ScratchpadKeybindUnbind, ScratchpadListQuery, ScratchpadManager, ScratchpadRegistry,
     ScratchpadStatusSnapshot,
 };
+use zellij_tools::topology::PaneTopology;
 use zellij_tools::tree;
 use zellij_tools::zjstatus::{
     parse_zjstatus_config_doc, parse_zjstatus_config_kdl, ZjstatusConfig, ZjstatusConfigLayers,
@@ -34,6 +36,8 @@ const REGISTRY_PENDING_TIMEOUT_MS: u64 = 2_000;
 struct State {
     // Pane tracking (from PaneUpdate events)
     pane_manifest: HashMap<usize, Vec<PaneInfo>>,
+    panes_by_tab_id: HashMap<usize, Vec<PaneInfo>>,
+    pane_topology: PaneTopology,
     has_pane_snapshot: bool,
 
     // Tab tracking (from TabUpdate events)
@@ -102,16 +106,16 @@ register_plugin!(State);
 impl State {
     fn current_event_context(&self) -> (Vec<EventPaneInfo>, Vec<EventTabInfo>) {
         let event_panes: Vec<EventPaneInfo> = self
-            .pane_manifest
+            .panes_by_tab_id
             .iter()
-            .flat_map(|(&tab_pos, panes)| {
+            .flat_map(|(&tab_id, panes)| {
                 panes.iter().map(move |p| EventPaneInfo {
                     id: p.id,
                     is_focused: p.is_focused,
                     is_floating: p.is_floating,
                     is_suppressed: p.is_suppressed,
                     is_plugin: p.is_plugin,
-                    tab_position: tab_pos,
+                    tab_id,
                     title: p.title.clone(),
                     terminal_command: p.terminal_command.clone(),
                     plugin_url: p.plugin_url.clone(),
@@ -241,7 +245,7 @@ impl State {
             .unwrap_or((0, 0));
 
         ScratchpadContext {
-            pane_manifest: &self.pane_manifest,
+            panes_by_tab_id: Cow::Borrowed(&self.panes_by_tab_id),
             current_tab_position,
             current_tab_id,
             are_floating_panes_visible: self.are_floating_panes_visible,
@@ -252,13 +256,22 @@ impl State {
     }
 
     fn tab_id_for_source_pane(&self, pane_id: PaneId) -> Option<usize> {
-        self.pane_manifest.iter().find_map(|(tab_position, panes)| {
+        self.panes_by_tab_id.iter().find_map(|(tab_id, panes)| {
             let found = panes.iter().any(|pane| match pane_id {
                 PaneId::Terminal(id) => !pane.is_plugin && pane.id == id,
                 PaneId::Plugin(id) => pane.is_plugin && pane.id == id,
             });
-            found.then(|| self.position_to_tab_id.get(tab_position).copied())?
+            found.then_some(*tab_id)
         })
+    }
+
+    fn live_tab_ids(&self) -> HashSet<usize> {
+        self.tab_infos.iter().map(|tab| tab.tab_id).collect()
+    }
+
+    fn refresh_panes_by_tab_id(&mut self) {
+        let live_tab_ids = self.live_tab_ids();
+        self.panes_by_tab_id = self.pane_topology.panes_by_tab_id(&live_tab_ids);
     }
 
     fn target_tab_id(&self, target: &ScratchpadActionTarget) -> Option<usize> {
@@ -291,17 +304,12 @@ impl State {
     fn live_registry_state(&self) -> (HashSet<usize>, HashMap<u32, usize>) {
         let live_tabs = self.tab_infos.iter().map(|tab| tab.tab_id).collect();
         let live_panes = self
-            .pane_manifest
+            .panes_by_tab_id
             .iter()
-            .filter_map(|(tab_position, panes)| {
-                self.position_to_tab_id
-                    .get(tab_position)
-                    .map(|tab_id| (*tab_id, panes))
-            })
-            .flat_map(|(tab_id, panes)| {
+            .flat_map(|(&tab_id, panes)| {
                 panes
                     .iter()
-                    .filter(|pane| !pane.is_plugin)
+                    .filter(|pane| !pane.is_plugin && !pane.exited && !pane.is_held)
                     .map(move |pane| (pane.id, tab_id))
             })
             .collect();
@@ -322,6 +330,9 @@ impl State {
         &self,
         f: impl FnOnce(&mut ScratchpadRegistry, u32, u64) -> T,
     ) -> Option<T> {
+        if !self.has_tab_snapshot || !self.has_pane_snapshot || self.pane_topology.has_pending() {
+            return None;
+        }
         let zellij_pid = self.zellij_pid?;
         let own_plugin_id = self.own_plugin_id?;
         let now_ms = Self::current_time_ms();
@@ -487,7 +498,7 @@ impl State {
         };
         let pane_statuses = self
             .pane_statuses
-            .snapshot(&self.pane_manifest, &self.tab_infos);
+            .snapshot(&self.panes_by_tab_id, &self.tab_infos);
         for payload in self.zjstatus_publisher.commands(
             self.zjstatus_config.as_ref(),
             &snapshot,
@@ -568,8 +579,8 @@ impl State {
                             show_pane_with_id(PaneId::Terminal(pane_id), true, true);
                             continue;
                         }
-                        Some(OpenDecision::Pending) => continue,
-                        Some(OpenDecision::Open) | None => (),
+                        Some(OpenDecision::Pending) | None => continue,
+                        Some(OpenDecision::Open) => (),
                     }
 
                     self.go_to_tab_id(tab_id);
@@ -748,7 +759,7 @@ impl State {
                 };
 
                 let entries = if let Some(ref scratchpad) = self.scratchpad {
-                    scratchpad.list(&query, &self.pane_manifest, &self.tab_id_to_position)
+                    scratchpad.list(&query, &self.panes_by_tab_id, &self.tab_id_to_position)
                 } else {
                     Vec::new()
                 };
@@ -827,7 +838,7 @@ impl State {
                 };
 
                 let session_tree =
-                    tree::build_tree(&self.tab_infos, &self.pane_manifest, tab_id_filter);
+                    tree::build_tree(&self.tab_infos, &self.panes_by_tab_id, tab_id_filter);
                 let json = serde_json::to_string(&session_tree).unwrap_or_default();
                 self.emit_event(&cli_pipe_id, &json);
                 Ok(())
@@ -896,22 +907,29 @@ impl ZellijPlugin for State {
             Event::PaneUpdate(pane_manifest) => {
                 self.has_pane_snapshot = true;
                 self.pane_manifest = pane_manifest.panes;
+                let live_tab_ids = self.live_tab_ids();
+                self.pane_topology.ingest(
+                    &self.pane_manifest,
+                    &self.position_to_tab_id,
+                    &live_tab_ids,
+                );
+                self.refresh_panes_by_tab_id();
                 self.pane_statuses.reconcile(&self.pane_manifest);
 
                 if self.event_stream.has_subscribers() {
                     // Convert pane manifest into EventStream's PaneInfo format
                     // and emit any detected changes (focus, open, close).
                     let event_panes: Vec<EventPaneInfo> = self
-                        .pane_manifest
+                        .panes_by_tab_id
                         .iter()
-                        .flat_map(|(&tab_pos, panes)| {
+                        .flat_map(|(&tab_id, panes)| {
                             panes.iter().map(move |p| EventPaneInfo {
                                 id: p.id,
                                 is_focused: p.is_focused,
                                 is_floating: p.is_floating,
                                 is_suppressed: p.is_suppressed,
                                 is_plugin: p.is_plugin,
-                                tab_position: tab_pos,
+                                tab_id,
                                 title: p.title.clone(),
                                 terminal_command: p.terminal_command.clone(),
                                 plugin_url: p.plugin_url.clone(),
@@ -921,7 +939,7 @@ impl ZellijPlugin for State {
 
                     let events = self
                         .event_stream
-                        .on_pane_update(&event_panes, self.current_tab_position);
+                        .on_pane_update(&event_panes, self.current_tab_id());
                     for (pipe_id, json) in &events {
                         self.emit_event(pipe_id, json);
                     }
@@ -929,16 +947,16 @@ impl ZellijPlugin for State {
                     // No subscribers — still update internal state (focus, known panes)
                     // but skip expensive String clones for title/command/url fields.
                     let cheap_panes: Vec<EventPaneInfo> = self
-                        .pane_manifest
+                        .panes_by_tab_id
                         .iter()
-                        .flat_map(|(&tab_pos, panes)| {
+                        .flat_map(|(&tab_id, panes)| {
                             panes.iter().map(move |p| EventPaneInfo {
                                 id: p.id,
                                 is_focused: p.is_focused,
                                 is_floating: p.is_floating,
                                 is_suppressed: p.is_suppressed,
                                 is_plugin: p.is_plugin,
-                                tab_position: tab_pos,
+                                tab_id,
                                 title: String::new(),
                                 terminal_command: None,
                                 plugin_url: None,
@@ -946,7 +964,7 @@ impl ZellijPlugin for State {
                         })
                         .collect();
                     self.event_stream
-                        .update_pane_state(&cheap_panes, self.current_tab_position);
+                        .update_pane_state(&cheap_panes, self.current_tab_id());
                 }
 
                 // Update scratchpad manager
@@ -959,7 +977,7 @@ impl ZellijPlugin for State {
                 }
                 let zjstatus_panes_changed = update_zjstatus_plugin_panes(
                     &mut self.zjstatus_plugin_panes,
-                    &self.pane_manifest,
+                    &self.panes_by_tab_id,
                 );
                 // New receivers have not seen unchanged values submitted to older ones.
                 self.publish_zjstatus(zjstatus_panes_changed);
@@ -975,36 +993,6 @@ impl ZellijPlugin for State {
                     self.are_floating_panes_visible = active_tab.are_floating_panes_visible;
                 }
 
-                if self.event_stream.has_subscribers() {
-                    // Emit tab events (focus, create, close, move)
-                    let event_tabs: Vec<EventTabInfo> = tab_infos
-                        .iter()
-                        .map(|t| EventTabInfo {
-                            tab_id: t.tab_id,
-                            position: t.position,
-                            name: t.name.clone(),
-                            active: t.active,
-                        })
-                        .collect();
-                    let events = self.event_stream.on_tab_update(&event_tabs);
-                    for (pipe_id, json) in &events {
-                        self.emit_event(pipe_id, json);
-                    }
-                } else {
-                    // No subscribers — still update internal state (active tab, known tabs)
-                    // but skip expensive String clones for tab names.
-                    let cheap_tabs: Vec<EventTabInfo> = tab_infos
-                        .iter()
-                        .map(|t| EventTabInfo {
-                            tab_id: t.tab_id,
-                            position: t.position,
-                            name: String::new(),
-                            active: t.active,
-                        })
-                        .collect();
-                    self.event_stream.update_tab_state(&cheap_tabs);
-                }
-
                 // Rebuild tab ID maps
                 self.tab_id_to_position.clear();
                 self.position_to_tab_id.clear();
@@ -1014,12 +1002,77 @@ impl ZellijPlugin for State {
                 }
 
                 self.tab_infos = tab_infos;
+                let live_tab_ids = self.live_tab_ids();
+                self.pane_topology
+                    .apply_tab_update(&self.position_to_tab_id, &live_tab_ids);
+                self.refresh_panes_by_tab_id();
+
+                let event_panes: Vec<EventPaneInfo> = self
+                    .panes_by_tab_id
+                    .iter()
+                    .flat_map(|(&tab_id, panes)| {
+                        panes.iter().map(move |p| EventPaneInfo {
+                            id: p.id,
+                            is_focused: p.is_focused,
+                            is_floating: p.is_floating,
+                            is_suppressed: p.is_suppressed,
+                            is_plugin: p.is_plugin,
+                            tab_id,
+                            title: p.title.clone(),
+                            terminal_command: p.terminal_command.clone(),
+                            plugin_url: p.plugin_url.clone(),
+                        })
+                    })
+                    .collect();
+                if self.event_stream.has_subscribers() {
+                    let event_tabs: Vec<EventTabInfo> = self
+                        .tab_infos
+                        .iter()
+                        .map(|t| EventTabInfo {
+                            tab_id: t.tab_id,
+                            position: t.position,
+                            name: t.name.clone(),
+                            active: t.active,
+                        })
+                        .collect();
+                    let events = self
+                        .event_stream
+                        .on_tab_update_with_panes(&event_tabs, &event_panes);
+                    for (pipe_id, json) in &events {
+                        self.emit_event(pipe_id, json);
+                    }
+                } else {
+                    let cheap_tabs: Vec<EventTabInfo> = self
+                        .tab_infos
+                        .iter()
+                        .map(|t| EventTabInfo {
+                            tab_id: t.tab_id,
+                            position: t.position,
+                            name: String::new(),
+                            active: t.active,
+                        })
+                        .collect();
+                    self.event_stream
+                        .on_tab_update_with_panes(&cheap_tabs, &event_panes);
+                }
                 if let Some(mut scratchpad) = self.scratchpad.take() {
-                    let commands = scratchpad.on_tab_update(&closed_tab_ids);
+                    let mut commands = scratchpad.on_tab_update_with_context(
+                        &closed_tab_ids,
+                        &self.build_scratchpad_context(),
+                    );
+                    commands
+                        .extend(scratchpad.on_topology_update(&self.build_scratchpad_context()));
                     self.scratchpad = Some(scratchpad);
                     self.execute_scratchpad_commands(commands);
                 }
-                self.publish_zjstatus(false);
+                let zjstatus_panes_changed = update_zjstatus_plugin_panes(
+                    &mut self.zjstatus_plugin_panes,
+                    &self.panes_by_tab_id,
+                );
+                self.publish_zjstatus(zjstatus_panes_changed);
+                if zjstatus_panes_changed {
+                    self.schedule_zjstatus_publish();
+                }
             }
             Event::HostFolderChanged(_new_path) => {
                 // Resolve include path now that /host is mounted to /
@@ -1174,5 +1227,25 @@ mod tests {
         let closed = state.closed_tab_ids(&[tab(10, 0), tab(12, 1)]);
 
         assert_eq!(closed, HashSet::from([11]));
+    }
+
+    #[test]
+    fn registry_liveness_uses_native_tab_ownership() {
+        let state = State {
+            tab_infos: vec![tab(10, 0), tab(12, 1)],
+            panes_by_tab_id: HashMap::from([(
+                12,
+                vec![PaneInfo {
+                    id: 42,
+                    ..Default::default()
+                }],
+            )]),
+            ..Default::default()
+        };
+
+        let (tabs, panes) = state.live_registry_state();
+
+        assert_eq!(tabs, HashSet::from([10, 12]));
+        assert_eq!(panes, HashMap::from([(42, 12)]));
     }
 }

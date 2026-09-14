@@ -1245,7 +1245,7 @@ mod tests {
                 PaneId::Terminal(id) => (id, false),
                 PaneId::Plugin(id) => (id, true),
             };
-            manifest.entry(position).or_default().push(PaneInfo {
+            manifest.entry(42 + position).or_default().push(PaneInfo {
                 id,
                 is_plugin,
                 title: title.into(),
